@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/goldfix/totalcmd_restic_plugin/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="https://github.com/goldfix/Restic_WFX_Plugin/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX64-orange.svg" alt="Total Commander WFX64" />
@@ -73,7 +73,7 @@ This plugin uses the official **Restic** command-line binary (`restic.exe`) unde
 
 ### Option A: Automatic Installation (Recommended)
 
-1. Download `wfx_restic_<version>_x64.zip` from the [GitHub Releases](https://github.com/goldfix/totalcmd_restic_plugin/releases) page.
+1. Download `wfx_restic_<version>_x64.zip` from the [GitHub Releases](https://github.com/goldfix/Restic_WFX_Plugin/releases) page.
 2. In Total Commander, navigate to the ZIP file and **double-click it** (or press `Enter`).
 3. Total Commander reads the bundled `pluginst.inf`, asks where to install the plugin (default: `plugins\wfx\restic`) and registers it automatically as **`Restic Backups`** in Network Neighborhood.
 4. Edit `restic_plugin.ini` (extracted next to `restic.wfx64`) and add your repositories (see below).
@@ -228,7 +228,7 @@ Build artifacts are generated in `build\`:
 
 ## Project Links & License
 
-- **GitHub Repository:** [https://github.com/goldfix/totalcmd_restic_plugin](https://github.com/goldfix/totalcmd_restic_plugin)
-- **Issue Tracker:** [https://github.com/goldfix/totalcmd_restic_plugin/issues](https://github.com/goldfix/totalcmd_restic_plugin/issues)
+- **GitHub Repository:** [https://github.com/goldfix/Restic_WFX_Plugin](https://github.com/goldfix/Restic_WFX_Plugin)
+- **Issue Tracker:** [https://github.com/goldfix/Restic_WFX_Plugin/issues](https://github.com/goldfix/Restic_WFX_Plugin/issues)
 - **Architecture & Developer Specification:** [`AGENT.md`](AGENT.md)
 - **License:** Licensed under the **[MIT License](LICENSE)** — Copyright (c) 2026 Pietro Partescano.
