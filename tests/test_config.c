@@ -91,7 +91,7 @@ static void test_plugin_and_fallback_dirs(void) {
     );
 }
 
-/* Test 2: INI path resolution (primary plugin dir vs fallback dir + auto-creation) */
+/* Test 2: INI path resolution (primary plugin dir vs fallback dir) */
 static void test_ini_path_resolution_priority(void) {
     WCHAR plugin_dir[MAX_PATH]   = {0};
     WCHAR fallback_dir[MAX_PATH] = {0};
@@ -109,40 +109,24 @@ static void test_ini_path_resolution_priority(void) {
     config_set_plugin_dir(plugin_dir);
     config_set_fallback_dir(fallback_dir);
 
-    /* Case A: Neither exists, create_if_missing = FALSE */
+    /* Case A: Neither exists -> returns FALSE and does not create any file on disk */
     WCHAR resolved[MAX_PATH] = {0};
-    BOOL ok = config_resolve_ini_path(resolved, MAX_PATH, FALSE);
-    EXPECT_TRUE(!ok, "Should return FALSE when no INI exists and create_if_missing is FALSE");
+    BOOL ok = config_resolve_ini_path(resolved, MAX_PATH);
+    EXPECT_TRUE(!ok, "Should return FALSE when no INI file exists");
     EXPECT_WSTR_EQ(resolved, primary_ini, "Preferred candidate path points to <plugin_dir>\\restic_plugin.ini");
+    EXPECT_TRUE(GetFileAttributesW(primary_ini) == INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesW(fallback_ini) == INVALID_FILE_ATTRIBUTES,
+                "No INI file is auto-created when missing");
 
-    /* Case B: FsInitW auto-creates the sample INI in <plugin_dir> with all settings commented out */
-    EXPECT_TRUE(FsInitW(1, NULL, NULL, NULL) == 0, "FsInitW succeeds");
-    EXPECT_TRUE(GetFileAttributesW(primary_ini) != INVALID_FILE_ATTRIBUTES,
-                "FsInitW creates restic_plugin.ini in the plugin directory when missing");
-    EXPECT_TRUE(GetFileAttributesW(fallback_ini) == INVALID_FILE_ATTRIBUTES,
-                "Fallback INI is not created when plugin_dir is writable");
-    WCHAR raw_setting[64] = {0};
-    GetPrivateProfileStringW(L"Settings", L"ResticPath", L"<commented>", raw_setting, _countof(raw_setting), primary_ini);
-    EXPECT_WSTR_EQ(raw_setting, L"<commented>", "ResticPath is commented out in the generated sample INI");
-    ResticConfig sample_cfg;
-    EXPECT_TRUE(config_load(&sample_cfg) && sample_cfg.repo_count == 0,
-                "Generated sample INI has all repository entries commented out");
-    config_free(&sample_cfg);
-
-    /* Case C: If <plugin_dir> is not writable, create_if_missing falls back to <fallback_dir> */
-    DeleteFileW(primary_ini);
-    WCHAR unwritable_plug[MAX_PATH] = {0};
-    swprintf_s(unwritable_plug, MAX_PATH, L"%ls\\non_existent_subdir", plugin_dir);
-    config_set_plugin_dir(unwritable_plug);
-    ok = config_resolve_ini_path(resolved, MAX_PATH, TRUE);
-    EXPECT_TRUE(ok, "Falls back to fallback_dir when plugin_dir cannot be written");
+    /* Case B: Only fallback INI exists -> resolves to fallback INI */
+    write_text_file(fallback_ini, "[Settings]\r\nResticPath=restic.exe\r\n");
+    ok = config_resolve_ini_path(resolved, MAX_PATH);
+    EXPECT_TRUE(ok, "Should resolve fallback INI when primary is missing");
     EXPECT_WSTR_EQ(resolved, fallback_ini, "Resolved path is fallback INI");
-    EXPECT_TRUE(GetFileAttributesW(fallback_ini) != INVALID_FILE_ATTRIBUTES, "Fallback INI file exists on disk");
 
-    /* Case D: Primary INI in plugin_dir takes priority over an existing fallback INI */
-    config_set_plugin_dir(plugin_dir);
+    /* Case C: Both exist -> primary INI in plugin_dir takes priority over fallback INI */
     write_text_file(primary_ini, "[Settings]\r\nResticPath=restic.exe\r\n");
-    ok = config_resolve_ini_path(resolved, MAX_PATH, FALSE);
+    ok = config_resolve_ini_path(resolved, MAX_PATH);
     EXPECT_TRUE(ok, "Should resolve primary INI when present");
     EXPECT_WSTR_EQ(resolved, primary_ini, "Primary INI in plugin_dir must take precedence over fallback_dir");
 
@@ -445,6 +429,51 @@ static BOOL __stdcall mock_request_proc(
     return FALSE;
 }
 
+/* Test 8: with no restic_plugin.ini anywhere the plugin stays inert and never writes to disk */
+static void test_missing_ini_is_harmless(void) {
+    WCHAR plugin_dir[MAX_PATH] = {0}, fallback_dir[MAX_PATH] = {0}, local[MAX_PATH] = {0};
+    make_temp_dir(L"restic_noini_plug", plugin_dir, MAX_PATH);
+    make_temp_dir(L"restic_noini_fb", fallback_dir, MAX_PATH);
+    swprintf_s(local, MAX_PATH, L"%ls\\extracted.txt", plugin_dir);
+    config_set_plugin_dir(plugin_dir);
+    config_set_fallback_dir(fallback_dir);
+
+    FsDefaultParamStruct dps;
+    memset(&dps, 0, sizeof(dps));
+    dps.size = (int)sizeof(dps);
+    WideCharToMultiByte(CP_ACP, 0, fallback_dir, -1, dps.DefaultIniName, (int)sizeof(dps.DefaultIniName), NULL, NULL);
+    strcat_s(dps.DefaultIniName, sizeof(dps.DefaultIniName), "\\wincmd.ini");
+
+    g_mock_pwd_calls = g_mock_msgok_calls = g_mock_log_calls = 0;
+    EXPECT_TRUE(FsInitW(9, NULL, mock_log_proc, mock_request_proc) == 0, "FsInitW succeeds without INI");
+    FsSetDefaultParams(&dps);
+
+    ResticConfig cfg;
+    EXPECT_TRUE(!config_load(&cfg) && cfg.repos == NULL && cfg.repo_count == 0,
+                "config_load reports failure and no repositories when no INI exists");
+    EXPECT_TRUE(cfg.restic_path[0] != L'\0', "restic.exe path is still resolved (bare name when not found)");
+    config_free(&cfg);
+
+    WIN32_FIND_DATAW fd;
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\", &fd) == INVALID_HANDLE_VALUE && GetLastError() == ERROR_NO_MORE_FILES,
+                "Root is an empty folder without INI");
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\MyRepo", &fd) == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND,
+                "Repository level -> ERROR_PATH_NOT_FOUND without INI");
+    RemoteInfoStruct ri = {5, 0, {0, 0}, 0};
+    WCHAR remote[] = L"\\MyRepo\\2026-10-18_12-00-00_[abcd1234]\\C\\x.txt";
+    EXPECT_TRUE(FsGetFileW(remote, local, 0, &ri) == FS_FILE_NOTFOUND &&
+                GetFileAttributesW(local) == INVALID_FILE_ATTRIBUTES,
+                "FsGetFileW -> FS_FILE_NOTFOUND without INI and no local file is created");
+    EXPECT_TRUE(g_mock_pwd_calls == 0 && g_mock_msgok_calls == 0, "No password prompt or popup without INI");
+
+    /* RemoveDirectoryW only succeeds on empty directories: nothing was written anywhere */
+    EXPECT_TRUE(RemoveDirectoryW(plugin_dir), "Plugin directory is still empty (no INI auto-created)");
+    EXPECT_TRUE(RemoveDirectoryW(fallback_dir), "Fallback directory is still empty (no INI auto-created)");
+    FsInitW(0, NULL, NULL, NULL);
+}
+
 /* Test 7: WFX virtual path validation, missing restic.exe diagnostic, and user password cancel */
 static void test_wfx_routing_and_callbacks(void) {
     WCHAR plugin_dir[MAX_PATH] = {0};
@@ -536,6 +565,7 @@ int main(void) {
     test_restic_lookup_ignores_current_directory();
     test_large_repository_list();
     test_wfx_routing_and_callbacks();
+    test_missing_ini_is_harmless();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     EXPECT_TRUE(_CrtCheckMemory(), "CRT heap integrity check must pass");

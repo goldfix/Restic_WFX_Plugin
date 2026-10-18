@@ -7,7 +7,7 @@
   - Environment-agnostic incremental NMake `Makefile` + `build.sh` wrapper for MSVC x64 (`cl.exe`, `link.exe`, `nmake.exe`).
   - Strict pure C11 flags (`/TC /std:c11 /permissive- /W4 /WX /we4013`, strictly no C++), static CRT (`/MT` Release, `/MTd` Debug), binary hardening (`/GS`, `/DYNAMICBASE`, `/NXCOMPAT`), CRT Debug Heap leak checking (`<crtdbg.h>`), AddressSanitizer (`ASAN=1`), and MSVC static analysis (`ANALYZE=1`).
 - ✅ **Configuration Management (`config.h` / `config.c`)**:
-  - Primary (`<plugin_dir>\restic_plugin.ini`) and fallback (`DefaultIniName` directory from `FsSetDefaultParams`) INI path resolution; on plugin initialization (`FsInit` / `FsInitW`), `config_ensure_default_ini()` creates `<plugin_dir>\restic_plugin.ini` (with all settings commented out) if no configuration file exists yet.
+  - Primary (`<plugin_dir>\restic_plugin.ini`) and fallback (`DefaultIniName` directory from `FsSetDefaultParams`) INI path resolution (read-only lookup; no default INI file is auto-created on disk).
   - Three-tier `restic.exe` binary resolution (`[Settings] ResticPath` -> `<plugin_dir>\restic.exe` -> system `PATH`).
   - `[Repositories]` section parsing, sanitization, case-insensitive deduplication, and Level 0 (`\`) virtual folder enumeration.
   - Automated unit test suite (`tests/test_config.c`, 39 assertions passing under Debug, `/analyze`, and AddressSanitizer).
@@ -23,7 +23,7 @@
   - Level 0 (`\`), Level 1 (`\<RepoAlias>`) and Level 2+ (`\<RepoAlias>\<SnapshotDir>\<SubPath>`) virtual path routing in `FsFindFirstW`.
   - In-memory password sessions, one per repository alias (8-slot table behind an SRW lock; `RT_Password` via `RequestProcW`, up to 3 attempts on `RESTIC_ERR_WRONG_PASSWORD`, wiped with `SecureZeroMemory` on wrong password, `FsInitW`, or `DLL_PROCESS_DETACH`).
   - `ProgressProcW`-based cancellation (`ESC`), `LogProcW` + `RT_MsgOK` error reporting, and Win32 error code mapping (`ERROR_NO_MORE_FILES` for empty dirs, `ERROR_PATH_NOT_FOUND` for missing paths/repos, `ERROR_ACCESS_DENIED` for auth failure, `ERROR_CANCELLED` for user abort).
-  - End-to-end unit and DLL tests: **499 assertions** (75 + 273 + 151), all passing across Debug, `/analyze`, ASan (74 + 273, DLL test skipped) and Release.
+  - End-to-end unit and DLL tests: **503 assertions** (79 + 273 + 151), all passing across Debug, `/analyze`, ASan (78 + 273, DLL test skipped) and Release.
 - ✅ **Post-integration Bug Review**: 8 further issues fixed in `main.c`/`restic_cli.c` plus one build pitfall documented (see "Code Review 2" below).
 - ✅ **File & Folder Extraction (`FsGetFileW` / `FsGetFile`, `restic_dump_file`)**:
   - Streaming file extraction via `restic dump --no-lock <snapshot_id> <filter_path>` with a fixed 64 KB buffer (constant memory usage), lazy local file creation (auth/path errors never touch the local disk), `LastWriteTime` preservation, two-step overwrite protocol (`FS_FILE_EXISTS` / `FS_COPYFLAGS_OVERWRITE`), byte-level `ProgressProcW` reporting + `ESC` abort with partial-file cleanup.
@@ -39,8 +39,8 @@
 1. **Combined Unicode + Mandatory ANSI WFX Stubs**
    - Total Commander's plugin loader checks for mandatory base exports (`FsInit`, `FsFindFirst`, `FsFindNext`, `FsFindClose`) when loading a `.wfx` / `.wfx64` DLL, then invokes the `W` variants (`FsInitW`, `FsFindFirstW`, `FsFindNextW`) on NT/Unicode systems. Exporting lightweight ANSI stubs alongside the Unicode implementation ensures unconditional compatibility across all Total Commander versions.
 
-2. **Two-Tier INI Resolution with Default Template Generation in `<plugin_dir>` on Init**
-   - On `FsInit` / `FsInitW`, if no `restic_plugin.ini` exists yet, `config_ensure_default_ini()` creates `<plugin_dir>\restic_plugin.ini` with a fully commented sample template. When `<plugin_dir>` is read-only or protected (e.g., `C:\Program Files\TotalCmd\plugins\...`), it falls back to Total Commander's user configuration directory provided via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`).
+2. **Two-Tier Read-Only INI Resolution**
+   - The plugin looks for `<plugin_dir>\restic_plugin.ini` first and falls back to Total Commander's user configuration directory provided via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`). It never auto-creates or writes `restic_plugin.ini` on disk.
 
 3. **Explicit Directory Setters for Unit Testing**
    - `config_set_plugin_dir()` and `config_set_fallback_dir()` decouple configuration logic from `DllMain` (`HMODULE`) and Total Commander runtime state, allowing deterministic unit testing in `tests/test_config.c`.
@@ -107,6 +107,10 @@ estic.wfx64`; `test_plugin_dll.c` enforces it.
 - **cmd.exe as a Deterministic Test Child**:
   - *Tip:* `restic_exec_command` can launch `%ComSpec% /c "..."` to test stream separation, exit codes, environment propagation, timeouts (`ping -n 6 127.0.0.1 >nul`) and large outputs (`for /L %i in (1,1,4000) do @echo ...`) without a real repository.
 
+- **Locked `restic.wfx64` While Total Commander Runs**:
+  - *Issue:* Windows refuses to overwrite a loaded DLL (`LNK1104: cannot open file 'buildestic.wfx64'`).
+  - *Solution:* `build.sh` renames the locked file to `restic.wfx64.old` before invoking NMake; unload the plugin in Total Commander with `cm_UnloadPlugins` (or restart it), then delete the `.old` file.
+
 - **Stale Objects After Switching Build Configuration**:
   - *Issue:* The `Makefile` does not track `CONFIG`/`ASAN`/`ANALYZE` changes, so Debug objects linked with Release ones (or vice versa) fail with `unresolved external symbol _calloc_dbg` / `LNK4098`.
   - *Solution:* `./build.sh clean` before changing configuration (the `asan`/`analyze` actions rebuild what they need; `release-test` after a Debug run needs a clean).
@@ -157,7 +161,7 @@ Full review of `config.c`, `restic_cli.c`, `main.c`, `Makefile`, tests. Everythi
 ### Open items / known limitations (documented, intentionally not fixed yet)
 - **Whole output is buffered** before parsing. A single directory with millions of entries means hundreds of MB of NDJSON. A streaming parser (parse while reading the pipe) is the future improvement.
 - **INI encoding:** `GetPrivateProfile*W` reads ANSI or UTF-16 LE only; a UTF-8 INI with non-ASCII characters is garbled. (Would need an own parser.)
-- **`FsSetDefaultParams` delivers `DefaultIniName` as ANSI:** a user profile path with characters outside the system code page is mangled by `MultiByteToWideChar(CP_ACP)`, so the fallback INI would be created in the wrong place. Possible mitigation: verify the directory exists, else use `%APPDATA%\GHISLER`.
+- **`FsSetDefaultParams` delivers `DefaultIniName` as ANSI:** a user profile path with characters outside the system code page is mangled by `MultiByteToWideChar(CP_ACP)`, so the fallback INI would be looked up in the wrong place. Possible mitigation: verify the directory exists, else use `%APPDATA%\GHISLER`.
 - **Child tree is not killed on cancel:** `TerminateProcess` kills `restic.exe` only (rclone/ssh helpers it started may linger). A Job Object with `KILL_ON_JOB_CLOSE` would fix this.
 - **Linux names with a literal backslash** cannot be addressed (backslash is the WFX separator). Names invalid on Windows (`:`/`*`/`?`) are passed through unchanged.
 - **Snapshot folder names use the time in Restic's recorded UTC offset**, not the local zone of the viewer (the file-list date column is correctly UTC-converted).
@@ -204,7 +208,7 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
 ## Current State & Next Steps (read this first after a session compaction)
 
 - **Functionality:** read-only browsing and file/folder extraction are complete: `\` (aliases) -> `\<Alias>` (snapshots `YYYY-MM-DD_HH-MM-SS_[id]`) -> `\<Alias>\<Snapshot>\<dirs/files>`, plus `FsGetFileW` (`F5` copy of files and recursive folders, `F3` Lister, `Ctrl+Q` Quick View). Exported API: the 11 `Fs*` read-only + extraction functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile` are not exported, and `FS_COPYFLAGS_MOVE` is rejected with `FS_FILE_NOTSUPPORTED`).
-- **Quality gates (all green):** `./build.sh test`, `analyze`, `asan`, `release-test`; 499 assertions (`test_config` 75, `test_restic_cli` 273, `test_plugin_dll` 151). Run `./build.sh clean` when switching configuration. Live tests need `tmp/restic.exe` (git-ignored, otherwise `[SKIP]`).
+- **Quality gates (all green):** `./build.sh test`, `analyze`, `asan`, `release-test`; 503 assertions (`test_config` 79, `test_restic_cli` 273, `test_plugin_dll` 151). Run `./build.sh clean` when switching configuration. Live tests need `tmp/restic.exe` (git-ignored, otherwise `[SKIP]`).
 - **Next:** (1) manual Total Commander tests by the user and bug fixes from them; (2) `README.md` (install, `restic_plugin.ini`, build/test, security notes); (3) optional future enhancements: streaming `ls` parser, optional directory cache, Job Object to kill child trees, UTF-8 INI.
 - **Conventions:** pure C11 (`/TC`), English comments/docs, UNICODE, LF endings, repository free of machine-specific paths (`grep -rnI -E 'setup_x64|_progetti' --exclude='.env' --exclude-dir=.git --exclude-dir=tmp --exclude-dir=build .` must print nothing), user conversation in Italian, update `AGENT.md`/`MEMORY.md` after significant changes.
 
@@ -233,7 +237,7 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
 - **Objective:** Review everything implemented so far (config, CLI/JSON, WFX layer, build), look for latent bugs, extend the tests, update the docs.
 - **Changes:**
   - `src/restic_cli.c` largely rewritten around a safer `restic_exec_command` (heap command line, separate stdout/stderr pipes, handle whitelist, poll loop with timeout/cancel, hardened environment block). New API: `ResticExecOptions`, `restic_quote_arg`, `RESTIC_ERR_PATH_NOT_FOUND/TIMEOUT/CANCELLED`. `restic_exec_command`, `restic_list_snapshots`, `restic_list_directory` gained an `options` parameter.
-  - `src/config.c`: PATH-only `restic.exe` lookup (no cwd), INI template notes the ANSI/UTF-16 requirement.
+  - `src/config.c`: PATH-only `restic.exe` lookup (no cwd).
   - `src/main.c`: root aliases carry the "no date" marker. `include/fsplugin.h`: `FS_SET_TIME_UNKNOWN`.
   - `Makefile`: `/DCJSON_HIDE_SYMBOLS`, empty `SYSLIBS` (plugin imports only KERNEL32), `TEST_LIBS = Shell32.lib`, new `test_plugin_dll.exe` target, `test` builds the plugin first (except under ASan). `build.sh`: new `release-test` action.
   - Tests: `test_config.c` 39 -> 58 assertions, `test_restic_cli.c` 43 -> 222, new `test_plugin_dll.c` (60). Verified under Debug (CRT leak check), `/analyze`, AddressSanitizer and Release (`/MT /O2`), all with `/W4 /WX`.
@@ -268,3 +272,11 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
   - Verified `test`, `analyze`, `asan`, `release-test`; the release DLL exports 11 `Fs*` functions and imports only `KERNEL32.dll`.
   - `AGENT.md` sections 5 and 8.7 updated.
 - **Next step:** manual tests in Total Commander (F5 on files/folders, overwrite dialog, `ESC`, F3/Ctrl+Q), then `README.md`.
+
+### 2026-10-18 — Removal of the Default INI Auto-Creation (cleanup review)
+- **Objective:** Remove the "create a default `restic_plugin.ini` on init" feature entirely and double-check that no leftovers remain.
+- **Changes:**
+  - `include/config.h` / `src/config.c`: removed the commented INI template, `create_default_ini_file`, `config_ensure_default_ini` and the `create_if_missing` parameter (`config_resolve_ini_path(out, cap)` is now a pure lookup). `src/main.c`: `FsInit`/`FsInitW`/`FsSetDefaultParams` no longer touch the disk.
+  - Cleanup review findings: `FsGetFileW` returned `FS_FILE_READERROR` when `config_load` failed (inconsistent with the listing code, which reports "not found") -> now `FS_FILE_NOTFOUND`; stale wording in `config.h` and in the `DefaultIniName` limitation note fixed; a grep for `templat|auto-creat|commented|create_if_missing|ensure_default` finds only the intentional "no auto-creation" statements.
+  - Tests: INI-priority test rewritten (verifies nothing is created), DLL scenario B adjusted, new `test_missing_ini_is_harmless` (no INI anywhere: all entry points stay inert, no prompt/popup, plugin and fallback directories remain empty). Totals: 503 assertions (79 + 273 + 151); `test`, `analyze`, `asan`, `release-test` green.
+- **Next step:** manual tests in Total Commander (the user creates `restic_plugin.ini` by hand), then `README.md` (document the INI format there, since the plugin no longer generates a sample).

@@ -10,6 +10,8 @@ Build a **File System Plugin (WFX)** extension for **Total Commander** written s
 
 The primary goal of Phase 1 (MVP) is to provide interactive, read-only browsing of **Restic** backup repositories ([https://restic.net](https://restic.net)), allowing users to navigate seamlessly across configured repositories, snapshots, and directory trees directly within Total Commander's dual-pane interface.
 
+**Current scope:** read-only browsing **plus extraction** of files and whole folders through Total Commander's native copy (`F5`), viewer (`F3`) and Quick View (`Ctrl+Q`). Repository modification (upload, delete, move/rename, mkdir) is deliberately out of scope and not exported.
+
 ---
 
 ## 2. Core Architectural Decisions
@@ -40,8 +42,9 @@ The primary goal of Phase 1 (MVP) is to provide interactive, read-only browsing 
 
 ### 3.1 INI File Path Resolution
 
-1. **Primary Lookup & Auto-Creation on Init:** inside the directory containing the plugin DLL (`<plugin_dir>\restic_plugin.ini`), resolved at load time in `DllMain` via `GetModuleFileNameW`. When the plugin is initialized (`FsInit` / `FsInitW`), if no configuration file exists yet, it immediately creates `<plugin_dir>\restic_plugin.ini` populated with a fully commented sample template (`config_ensure_default_ini()`).
-2. **Fallback:** if `<plugin_dir>\restic_plugin.ini` is missing and `<plugin_dir>` is not writable (e.g., when installed under protected paths such as `C:\Program Files\`), the plugin falls back to the directory supplied by Total Commander via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`) and looks up or creates `restic_plugin.ini` in that directory.
+1. **Primary Lookup:** inside the directory containing the plugin DLL (`<plugin_dir>\restic_plugin.ini`), resolved at load time in `DllMain` via `GetModuleFileNameW`.
+2. **Fallback:** if `<plugin_dir>\restic_plugin.ini` does not exist (e.g., when installed under a shared/read-only path such as `C:\Program Files\`), the plugin looks for `restic_plugin.ini` inside the directory supplied by Total Commander via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`).
+3. **No Auto-Creation:** the plugin never creates or modifies `restic_plugin.ini` on disk. If neither file exists: the root listing (``) returns `ERROR_NO_MORE_FILES` (empty folder), `<Alias>[...]` listings return `ERROR_PATH_NOT_FOUND`, and `FsGetFileW` returns `FS_FILE_NOTFOUND`; no password prompt and no popup are shown.
 
 ### 3.2 INI File Structure
 
@@ -73,7 +76,7 @@ Rules enforced by `config_resolve_restic_path()`:
 
 ### 3.4 INI File Encoding
 
-The file is read with the Win32 `GetPrivateProfile*W` APIs, which understand only **ANSI (system code page) or UTF-16 LE**. UTF-8 files are *not* decoded (non-ASCII aliases/paths would be garbled). The auto-generated template carries a comment saying so.
+The file is read with the Win32 `GetPrivateProfile*W` APIs, which understand only **ANSI (system code page) or UTF-16 LE**. UTF-8 files are *not* decoded (non-ASCII aliases/paths would be garbled).
 
 ---
 
@@ -89,14 +92,14 @@ Total Commander passes backslash-delimited paths rooted at `\`. The plugin maps 
 
 ---
 
-## 5. Implemented WFX API (Phase 1 - Read-Only MVP)
+## 5. Implemented WFX API (Read-Only Browsing + File Extraction)
 
 All exported functions use the `__stdcall` calling convention. Both Unicode (`W`) entry points and mandatory ANSI stubs are exported for full compatibility with the Total Commander plugin loader:
 
 - **`FsInitW` / `FsInit`**
-  - Stores the assigned `PluginNr` identifier and host callback pointers (`pProgressProcW`, `pLogProcW`, `pRequestProcW`), and calls `config_ensure_default_ini()` so `<plugin_dir>\restic_plugin.ini` (with all settings commented out) is created immediately on plugin initialization if missing.
+  - Stores the assigned `PluginNr` identifier and host callback pointers (`pProgressProcW`, `pLogProcW`, `pRequestProcW`).
 - **`FsSetDefaultParams`**
-  - Extracts and saves the fallback configuration directory from `DefaultIniName`, and calls `config_ensure_default_ini()` in case `<plugin_dir>` was not writable during `FsInit`.
+  - Extracts and saves the fallback configuration directory from `DefaultIniName`.
 - **`FsGetDefRootName`**
   - Returns the default root label displayed in Network Neighborhood (`"Restic Backups"`).
 - **`FsFindFirstW` / `FsFindFirst`**
@@ -237,17 +240,19 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 ./build.sh release-test  # Same tests against the optimized /MT /O2 build
 ./build.sh asan      # Rebuild and run unit tests under MSVC AddressSanitizer (DLL smoke test is skipped)
 ./build.sh analyze   # Rebuild plugin & tests with MSVC Static Analyzer (/analyze)
-./build.sh clean     # Remove build/ directory
+./build.sh clean     # Remove build/ directory (required when switching between Debug/Release/ASan/Analyze)
 ```
+
+If Total Commander still has `build/restic.wfx64` loaded, `build.sh` renames the locked DLL to `restic.wfx64.old` so the link can proceed; run `cm_UnloadPlugins` in Total Commander (or restart it) to load the new build, then delete the `.old` file.
 
 
 ### 8.7 Test Suites (`tests/`)
 
 | Program | Scope |
 | --- | --- |
-| `test_config.c` | Directory normalization, INI primary/fallback priority and auto-creation in `<plugin_dir>` on `FsInitW` (all settings commented out), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, and password prompt cancellation (74-75 assertions). |
+| `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, and the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty) (78-79 assertions). |
 | `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe` including `restic_dump_file` streaming extraction, mtime preservation, 0-byte and 100 KB files, overwrite protection, binary fidelity (`00/0A/0D/1A` bytes), existing target preserved on every failure or abort, no leftover `~rp*.tmp`, local-side failures, argument validation, plus `test_dump_with_fake_restic` (a fake `restic` batch file that deterministically covers exit codes 10/11/12/other, stderr classification, partial output then failure, empty stderr, environment injection and the inactivity timeout: a silent child is killed, a slow but steady one survives) (273 assertions). |
-| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 11-function export surface (`FsGetFile`/`FsGetFileW` included; write/delete/move functions forbidden), root name, primary INI auto-creation in `<plugin_dir>` on `FsInitW` (all settings commented out), fallback INI via `FsSetDefaultParams`, two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads (151 assertions). |
+| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 11-function export surface (`FsGetFile`/`FsGetFileW` included; write/delete/move functions forbidden), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads (151 assertions). |
 
 The live test needs only `tmp\restic.exe` (git-ignored; reported as `[SKIP]` when absent). On every run it rebuilds `tmp\test_fixture\{data,repo}` from scratch (300-file directory, Unicode and shell-metacharacter names, empty directory, 100 KB file, fixed mtime), initializes a repository whose password contains quotes, `%PATH%` and CJK text, takes two snapshots and verifies per-snapshot listings, timestamps and the error mapping (wrong password, missing repository, unknown snapshot, missing path, file used as directory, quote-injection attempt). The fixture stays on disk for inspection.
 

@@ -225,8 +225,7 @@ static void test_primary_ini_next_to_dll(void) {
     RemoveDirectoryW(dir);
 }
 
-/* Scenario B: no INI next to the DLL -> FsInitW creates the commented sample in <plugin_dir>;
-   if removed, FsSetDefaultParams fallback directory is still honored */
+/* Scenario B: no INI next to the DLL -> no file is auto-created; FsSetDefaultParams fallback directory is honored */
 static void test_fallback_ini_from_default_params(void) {
     WCHAR dir[MAX_PATH], plug_ini[MAX_PATH], fb_dir[MAX_PATH], fb_ini[MAX_PATH];
     EXPECT_TRUE(make_unique_dir(L"restic_dll_noini", dir, MAX_PATH) &&
@@ -247,18 +246,18 @@ static void test_fallback_ini_from_default_params(void) {
     WideCharToMultiByte(CP_ACP, 0, fb_dir, -1, dps.DefaultIniName, (int)sizeof(dps.DefaultIniName), NULL, NULL);
     strcat_s(dps.DefaultIniName, sizeof(dps.DefaultIniName), "\\wincmd.ini");
     p.init_w(1, NULL, NULL, NULL);
-    EXPECT_TRUE(GetFileAttributesW(plug_ini) != INVALID_FILE_ATTRIBUTES,
-                "FsInitW immediately creates sample restic_plugin.ini in the plugin directory");
     p.set_default_params(&dps);
 
     WIN32_FIND_DATAW fd;
     SetLastError(0);
     HANDLE h = p.find_first_w(L"\\", &fd);
     EXPECT_TRUE(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_NO_MORE_FILES,
-                "Commented sample INI without active repositories -> empty root");
+                "Missing INI -> empty root");
+    EXPECT_TRUE(GetFileAttributesW(plug_ini) == INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesW(fb_ini) == INVALID_FILE_ATTRIBUTES,
+                "No INI file is auto-created on disk");
 
-    /* Removing the plugin-dir INI and placing one in the fallback directory resolves the fallback INI */
-    DeleteFileW(plug_ini);
+    /* Placing an INI in the fallback directory resolves it dynamically */
     EXPECT_TRUE(write_file(fb_ini, "[Repositories]\r\nOnlyOne=D:\\repo\r\n"), "Write fallback INI");
     h = p.find_first_w(L"\\", &fd);
     EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "Fallback INI is picked up without reloading the plugin");
@@ -267,7 +266,6 @@ static void test_fallback_ini_from_default_params(void) {
     p.find_close(h);
 
     unload_plugin_copy(&p, dir);
-    DeleteFileW(plug_ini);
     DeleteFileW(fb_ini);
     RemoveDirectoryW(dir);
     RemoveDirectoryW(fb_dir);

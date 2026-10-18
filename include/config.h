@@ -2,7 +2,7 @@
 #include <windows.h>
 #include <stddef.h>
 
-/* Default configuration file and binary names */
+/* Configuration file name and default binary name */
 #define CONFIG_INI_FILENAME       L"restic_plugin.ini"
 #define CONFIG_DEFAULT_RESTIC_EXE L"restic.exe"
 #define CONFIG_MAX_PATH           1024
@@ -59,19 +59,11 @@ const WCHAR* config_get_fallback_dir(void);
  * Resolves the path to restic_plugin.ini:
  * 1. Primary: <plugin_dir>\restic_plugin.ini (if existing).
  * 2. Fallback: <fallback_dir>\restic_plugin.ini (if existing).
- * 3. If neither exists and create_if_missing is TRUE: creates the default commented template in
- *    <plugin_dir>\restic_plugin.ini first, falling back to <fallback_dir>\restic_plugin.ini when
- *    <plugin_dir> is unset or not writable.
  *
- * Returns TRUE if a valid INI file exists (or was created) at out_path.
+ * Returns TRUE if an existing INI file was found at out_path, or FALSE when neither file exists
+ * (in which case out_path receives the preferred candidate path).
  */
-BOOL config_resolve_ini_path(WCHAR* out_path, size_t out_capacity, BOOL create_if_missing);
-
-/**
- * Ensures that restic_plugin.ini exists on disk (creating the commented sample in <plugin_dir>
- * or, if not writable, in <fallback_dir>). Called during plugin initialization.
- */
-BOOL config_ensure_default_ini(void);
+BOOL config_resolve_ini_path(WCHAR* out_path, size_t out_capacity);
 
 /**
  * Resolves the Restic CLI executable path in priority order:
@@ -90,7 +82,7 @@ BOOL config_resolve_restic_path(const WCHAR* ini_path, WCHAR* out_path, size_t o
 BOOL config_load_from_file(const WCHAR* ini_path, ResticConfig* out_config);
 
 /**
- * Resolves the active INI file path (creating a default template if needed) and loads it.
+ * Resolves the active INI file path and loads it.
  * Caller must release allocated resources via config_free().
  */
 BOOL config_load(ResticConfig* out_config);

@@ -484,7 +484,6 @@ int __stdcall FsInit(
     (void)pLogProc;
     (void)pRequestProc;
     g_PluginNr = PluginNr;
-    config_ensure_default_ini();
     return 0;
 }
 
@@ -499,14 +498,12 @@ int __stdcall FsInitW(
     g_ProgressProc = pProgressProcW;
     g_LogProc      = pLogProcW;
     g_RequestProc  = pRequestProcW;
-    config_ensure_default_ini();
     return 0;
 }
 
 void __stdcall FsSetDefaultParams(FsDefaultParamStruct* dps) {
     if (dps != NULL) {
         config_set_fallback_from_default_params(dps->DefaultIniName);
-        config_ensure_default_ini();
     }
 }
 
@@ -681,7 +678,7 @@ int __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, Rem
     ResticConfig cfg;
     if (!config_load(&cfg)) {
         config_free(&cfg);
-        return FS_FILE_READERROR;
+        return FS_FILE_NOTFOUND; /* No configuration file: the repository alias cannot exist */
     }
     const ResticRepoEntry* repo = config_find_repo(&cfg, parsed.repo_alias);
     if (!repo) {
