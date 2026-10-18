@@ -39,6 +39,10 @@
 #define MSGTYPE_IMPORTANTERROR      6
 #define MSGTYPE_OPERATIONCOMPLETE   7
 
+/* Marks a FILETIME as "no date available" (Total Commander shows an empty column) */
+#define FS_SET_TIME_UNKNOWN(ft) \
+    do { (ft).dwHighDateTime = 0xFFFFFFFF; (ft).dwLowDateTime = 0xFFFFFFFE; } while (0)
+
 /* ANSI and Unicode host callback function types */
 typedef int  (__stdcall *tProgressProc)(int PluginNr, char* SourceName, char* TargetName, int PercentDone);
 typedef int  (__stdcall *tProgressProcW)(int PluginNr, WCHAR* SourceName, WCHAR* TargetName, int PercentDone);

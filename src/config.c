@@ -21,6 +21,7 @@ static WCHAR g_fallback_dir[CONFIG_MAX_PATH] = {0};
 
 /* Default configuration file template created when no INI file exists */
 static const char kDefaultIniTemplate[] =
+    "; Save this file as ANSI or UTF-16 LE: Windows INI APIs do not decode UTF-8.\r\n"
     "[Settings]\r\n"
     "; Optional path to restic.exe (if empty, checks plugin folder then system PATH)\r\n"
     "ResticPath=restic.exe\r\n"
@@ -300,6 +301,42 @@ BOOL config_resolve_ini_path(WCHAR* out_path, size_t out_capacity, BOOL create_i
     return FALSE;
 }
 
+/*
+ * Looks for an executable only inside the directories listed in %PATH%. Unlike SearchPathW, the
+ * current directory (which follows the Total Commander panel) is never searched, so a planted
+ * "restic.exe" in a browsed folder cannot hijack the lookup. Result is an absolute path.
+ */
+static BOOL find_in_path_env(const WCHAR* name, WCHAR* out_path, size_t out_capacity) {
+    WCHAR file_name[MAX_PATH];
+    wcsncpy_s(file_name, _countof(file_name), name, _TRUNCATE);
+    if (wcschr(file_name, L'.') == NULL) {
+        wcscat_s(file_name, _countof(file_name), L".exe");
+    }
+
+    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    WCHAR* path_env = (need > 0) ? (WCHAR*)malloc(need * sizeof(WCHAR)) : NULL;
+    if (!path_env) return FALSE;
+    if (GetEnvironmentVariableW(L"PATH", path_env, need) >= need) {
+        free(path_env);
+        return FALSE;
+    }
+
+    BOOL found = FALSE;
+    WCHAR* ctx = NULL;
+    for (WCHAR* dir = wcstok_s(path_env, L";", &ctx); dir && !found; dir = wcstok_s(NULL, L";", &ctx)) {
+        WCHAR candidate[CONFIG_MAX_PATH];
+        trim_whitespace(dir);
+        strip_quotes(dir);
+        if (dir[0] != L'\0' && join_path(dir, file_name, candidate, CONFIG_MAX_PATH) &&
+            file_exists(candidate)) {
+            DWORD len = GetFullPathNameW(candidate, (DWORD)out_capacity, out_path, NULL);
+            found = (len > 0 && len < out_capacity);
+        }
+    }
+    free(path_env);
+    return found;
+}
+
 BOOL config_resolve_restic_path(const WCHAR* ini_path, WCHAR* out_path, size_t out_capacity) {
     if (!out_path || out_capacity == 0) return FALSE;
     out_path[0] = L'\0';
@@ -349,10 +386,7 @@ BOOL config_resolve_restic_path(const WCHAR* ini_path, WCHAR* out_path, size_t o
                     return TRUE;
                 }
             }
-            WCHAR path_custom[CONFIG_MAX_PATH] = {0};
-            DWORD found = SearchPathW(NULL, configured_val, L".exe", CONFIG_MAX_PATH, path_custom, NULL);
-            if (found > 0 && found < CONFIG_MAX_PATH) {
-                wcsncpy_s(out_path, out_capacity, path_custom, _TRUNCATE);
+            if (find_in_path_env(configured_val, out_path, out_capacity)) {
                 return TRUE;
             }
         }
@@ -368,14 +402,12 @@ BOOL config_resolve_restic_path(const WCHAR* ini_path, WCHAR* out_path, size_t o
         }
     }
 
-    /* 3. Fallback to system PATH environment variable */
-    WCHAR system_restic[CONFIG_MAX_PATH] = {0};
-    DWORD found = SearchPathW(NULL, CONFIG_DEFAULT_RESTIC_EXE, NULL, CONFIG_MAX_PATH, system_restic, NULL);
-    if (found > 0 && found < CONFIG_MAX_PATH) {
-        wcsncpy_s(out_path, out_capacity, system_restic, _TRUNCATE);
+    /* 3. Fallback to the directories listed in the PATH environment variable */
+    if (find_in_path_env(CONFIG_DEFAULT_RESTIC_EXE, out_path, out_capacity)) {
         return TRUE;
     }
 
+    /* Not found: return the bare name (restic_exec_command refuses it, never searching the cwd) */
     wcsncpy_s(out_path, out_capacity, CONFIG_DEFAULT_RESTIC_EXE, _TRUNCATE);
     return FALSE;
 }

@@ -106,6 +106,7 @@ static HANDLE enumerate_root_repositories(WIN32_FIND_DATAW* FindData) {
     handle->count = cfg.repo_count;
     for (size_t i = 0; i < cfg.repo_count; ++i) {
         handle->items[i].dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        FS_SET_TIME_UNKNOWN(handle->items[i].ftLastWriteTime); /* Aliases have no date */
         wcsncpy_s(handle->items[i].cFileName, MAX_PATH, cfg.repos[i].alias, _TRUNCATE);
     }
 

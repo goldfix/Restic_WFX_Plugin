@@ -25,7 +25,13 @@
     "shell:nmake /nologo clean",
     "shell:nmake /nologo CONFIG=Debug all",
     "shell:nmake -nologo clean",
-    "shell:nmake -nologo CONFIG=Debug all"
+    "shell:nmake -nologo CONFIG=Debug all",
+    "shell:tmp/restic.exe *",
+    "shell:RESTIC_REPOSITORY=\"tmp/sample_repo\" RESTIC_PASSWORD=\"testpassword123\" MSYS2_ARG_CONV_EXCL=\"*\" tmp/restic.exe *",
+    "shell:cat -n *",
+    "shell:sed -n *",
+    "shell:sed *",
+    "shell:cut *"
   ],
   "deny": []
 }

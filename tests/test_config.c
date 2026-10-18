@@ -263,6 +263,128 @@ static void test_repositories_parsing_and_wfx_root(void) {
     RemoveDirectoryW(plugin_dir);
 }
 
+/* Helper: reads the current value of an environment variable into a heap string (or NULL) */
+static WCHAR* dup_env(const WCHAR* name) {
+    DWORD need = GetEnvironmentVariableW(name, NULL, 0);
+    WCHAR* buf = (need > 0) ? (WCHAR*)malloc(need * sizeof(WCHAR)) : NULL;
+    if (buf && GetEnvironmentVariableW(name, buf, need) >= need) {
+        free(buf);
+        buf = NULL;
+    }
+    return buf;
+}
+
+/* Test 5: restic.exe is searched in %PATH% only - never in the current directory (planting) */
+static void test_restic_lookup_ignores_current_directory(void) {
+    WCHAR plugin_dir[MAX_PATH] = {0}, path_dir[MAX_PATH] = {0};
+    WCHAR cwd_dir[MAX_PATH] = {0}, ini_path[MAX_PATH] = {0};
+    WCHAR expected[MAX_PATH] = {0}, expected_custom[MAX_PATH] = {0};
+    make_temp_dir(L"restic_lookup_plug", plugin_dir, MAX_PATH);
+    make_temp_dir(L"restic_lookup_path", path_dir, MAX_PATH);
+    make_temp_dir(L"restic_lookup_cwd", cwd_dir, MAX_PATH);
+    swprintf_s(ini_path, MAX_PATH, L"%ls\\%ls", plugin_dir, CONFIG_INI_FILENAME);
+    swprintf_s(expected, MAX_PATH, L"%ls\\restic.exe", path_dir);
+    swprintf_s(expected_custom, MAX_PATH, L"%ls\\custom_tool.exe", path_dir);
+
+    WCHAR cwd_restic[MAX_PATH] = {0};
+    swprintf_s(cwd_restic, MAX_PATH, L"%ls\\restic.exe", cwd_dir);
+    write_text_file(expected, "MZ_PATH");
+    write_text_file(expected_custom, "MZ_CUSTOM");
+    write_text_file(cwd_restic, "MZ_PLANTED");
+    config_set_plugin_dir(plugin_dir); /* No restic.exe here: forces the PATH fallback */
+    config_set_fallback_dir(L"");
+
+    WCHAR* old_path = dup_env(L"PATH");
+    WCHAR old_cwd[MAX_PATH] = {0};
+    GetCurrentDirectoryW(MAX_PATH, old_cwd);
+    SetCurrentDirectoryW(cwd_dir);
+
+    /* Case A: PATH with empty entries, a quoted entry with spaces and a missing directory */
+    WCHAR path_value[MAX_PATH * 2] = {0};
+    swprintf_s(path_value, _countof(path_value), L";;C:\\no_such_dir_xyz; \"%ls\" ;", path_dir);
+    SetEnvironmentVariableW(L"PATH", path_value);
+    WCHAR resolved_a[MAX_PATH] = {0};
+    BOOL ok_a = config_resolve_restic_path(NULL, resolved_a, MAX_PATH);
+
+    /* Case B: PATH without restic.exe while the current directory holds one */
+    SetEnvironmentVariableW(L"PATH", L"C:\\no_such_dir_xyz");
+    WCHAR resolved_b[MAX_PATH] = {0};
+    BOOL ok_b = config_resolve_restic_path(NULL, resolved_b, MAX_PATH);
+
+    /* Case C: [Settings] ResticPath is a bare name without extension, found through PATH */
+    SetEnvironmentVariableW(L"PATH", path_dir);
+    write_text_file(ini_path, "[Settings]\r\nResticPath=custom_tool\r\n");
+    WCHAR resolved_c[MAX_PATH] = {0};
+    BOOL ok_c = config_resolve_restic_path(ini_path, resolved_c, MAX_PATH);
+
+    SetCurrentDirectoryW(old_cwd);
+    SetEnvironmentVariableW(L"PATH", old_path);
+    free(old_path);
+
+    EXPECT_TRUE(ok_a, "restic.exe found through PATH");
+    EXPECT_WSTR_EQ(resolved_a, expected, "PATH lookup skips empty/invalid entries and strips quotes");
+    EXPECT_TRUE(!ok_b, "restic.exe in the current directory must NOT be used");
+    EXPECT_WSTR_EQ(resolved_b, L"restic.exe", "Bare name returned when nothing is found");
+    EXPECT_TRUE(ok_c, "Custom bare name found through PATH");
+    EXPECT_WSTR_EQ(resolved_c, expected_custom, ".exe extension appended to extension-less ResticPath");
+
+    DeleteFileW(expected);
+    DeleteFileW(expected_custom);
+    DeleteFileW(cwd_restic);
+    DeleteFileW(ini_path);
+    RemoveDirectoryW(plugin_dir);
+    RemoveDirectoryW(path_dir);
+    RemoveDirectoryW(cwd_dir);
+}
+
+/* Test 6: hundreds of repositories (array and INI-section buffer growth) + root listing details */
+static void test_large_repository_list(void) {
+    enum { REPO_COUNT = 300 };
+    WCHAR plugin_dir[CONFIG_MAX_PATH] = {0}, ini_path[CONFIG_MAX_PATH] = {0};
+    make_temp_dir(L"restic_large_plug", plugin_dir, CONFIG_MAX_PATH);
+    swprintf_s(ini_path, CONFIG_MAX_PATH, L"%ls\\%ls", plugin_dir, CONFIG_INI_FILENAME);
+
+    size_t cap = 256 + (size_t)REPO_COUNT * 160;
+    char* content = (char*)malloc(cap);
+    EXPECT_TRUE(content != NULL, "Allocate INI content");
+    size_t len = (size_t)snprintf(content, cap, "[Repositories]\r\n  Spaced Alias  =  D:\\path with spaces\\repo  \r\n");
+    for (int i = 0; i < REPO_COUNT; ++i) {
+        len += (size_t)snprintf(content + len, cap - len,
+            "Repo_%03d=D:\\Backups\\A\\Rather\\Long\\Directory\\Structure\\For\\Repository\\Number\\%03d\r\n", i, i);
+    }
+    BOOL written = write_text_file(ini_path, content);
+    free(content);
+    EXPECT_TRUE(written, "Write large INI");
+    config_set_plugin_dir(plugin_dir);
+    config_set_fallback_dir(L"");
+
+    ResticConfig cfg;
+    EXPECT_TRUE(config_load(&cfg), "Load large configuration");
+    EXPECT_TRUE(cfg.repo_count == REPO_COUNT + 1, "All 301 repositories parsed (section buffer grew past 16K chars)");
+    const ResticRepoEntry* spaced = config_find_repo(&cfg, L"Spaced Alias");
+    EXPECT_TRUE(spaced != NULL, "Alias with inner space, trimmed");
+    EXPECT_WSTR_EQ(spaced->target, L"D:\\path with spaces\\repo", "Target trimmed");
+    const ResticRepoEntry* last = config_find_repo(&cfg, L"Repo_299");
+    EXPECT_TRUE(last != NULL, "Last repository present");
+    config_free(&cfg);
+    EXPECT_TRUE(cfg.repos == NULL && cfg.repo_count == 0, "config_free resets the structure");
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FsFindFirstW(L"\\", &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "Root enumeration of 301 aliases");
+    size_t seen = 1;
+    EXPECT_TRUE(fd.ftLastWriteTime.dwHighDateTime == 0xFFFFFFFF && fd.ftLastWriteTime.dwLowDateTime == 0xFFFFFFFE,
+                "Aliases carry the 'no date' marker");
+    EXPECT_TRUE((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, "Aliases are directories");
+    while (FsFindNextW(h, &fd)) seen++;
+    FsFindClose(h);
+    EXPECT_TRUE(seen == REPO_COUNT + 1, "Every alias is enumerated exactly once");
+    EXPECT_TRUE(FsFindFirstW(L"\\NoSuchRepo", &fd) == INVALID_HANDLE_VALUE, "Unrouted path is refused");
+
+    DeleteFileW(ini_path);
+    RemoveDirectoryW(plugin_dir);
+}
+
 int main(void) {
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
@@ -277,6 +399,8 @@ int main(void) {
     test_ini_path_resolution_priority();
     test_restic_binary_resolution();
     test_repositories_parsing_and_wfx_root();
+    test_restic_lookup_ignores_current_directory();
+    test_large_repository_list();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     EXPECT_TRUE(_CrtCheckMemory(), "CRT heap integrity check must pass");

@@ -64,7 +64,16 @@ NAS_SMB=\\nas\share\restic_repo
 
 1. Explicit path or custom executable configured in `ResticPath` under `[Settings]`.
 2. Local `restic.exe` binary located in the plugin directory (`<plugin_dir>\restic.exe`).
-3. Fallback to `restic.exe` resolved via the system `PATH` environment variable (`SearchPathW`).
+3. Fallback to `restic.exe` found in the directories listed in the `PATH` environment variable.
+
+Rules enforced by `config_resolve_restic_path()`:
+- **The current directory is never searched.** `SearchPathW` and bare-name `CreateProcess` lookups include the process working directory (which follows the Total Commander panel), so a `restic.exe` planted in a browsed folder could hijack the plugin. `PATH` is therefore walked manually (`find_in_path_env`): empty entries are skipped, quoted entries are unquoted, an extension-less name gets `.exe` appended, and the hit is returned as an absolute path.
+- When nothing is found the function returns `FALSE` and the bare name `restic.exe`. `restic_exec_command()` refuses bare names (`RESTIC_ERR_SPAWN_FAILED`), so the caller must report "restic.exe not found" instead of spawning anything.
+- An explicit `ResticPath` that does not exist silently falls through to steps 2-3.
+
+### 3.4 INI File Encoding
+
+The file is read with the Win32 `GetPrivateProfile*W` APIs, which understand only **ANSI (system code page) or UTF-16 LE**. UTF-8 files are *not* decoded (non-ASCII aliases/paths would be garbled). The auto-generated template carries a comment saying so.
 
 ---
 
@@ -75,8 +84,8 @@ Total Commander passes backslash-delimited paths rooted at `\`. The plugin maps 
 | Level | WFX Path | Data Source | Action / Presentation |
 | --- | --- | --- | --- |
 | **0. Root** | `\` | `[Repositories]` section of `restic_plugin.ini` | Returns each configured alias (e.g., `BackupLocale`, `ServerLinux`) as a virtual directory (`FILE_ATTRIBUTE_DIRECTORY`). |
-| **1. Repository** | `\<RepoAlias>\` | `restic snapshots --json` | Executes Restic with `RESTIC_REPOSITORY` and `RESTIC_PASSWORD`. Returns each snapshot as a directory (`YYYY-MM-DD_HH-MM-SS_[short_id]`). |
-| **2. Snapshot/Subdir** | `\<RepoAlias>\<SnapshotDir>\<SubPath>` | `restic ls <snapshot_id> --json` | Lists files and folders at the requested directory depth, populating `WIN32_FIND_DATAW` (64-bit file sizes, timestamps, attributes). |
+| **1. Repository** | `\<RepoAlias>\` | `restic snapshots --json --no-lock` | Executes Restic with `RESTIC_REPOSITORY` and `RESTIC_PASSWORD`. Returns each snapshot as a directory (`YYYY-MM-DD_HH-MM-SS_[short_id]`). |
+| **2. Snapshot/Subdir** | `\<RepoAlias>\<SnapshotDir>\<SubPath>` | `restic ls --json --no-lock <snapshot_id> <filter_path>` | Lists direct child files and folders at the requested directory depth without recursive traversal, populating `WIN32_FIND_DATAW` (64-bit file sizes, UTC `FILETIME` timestamps, attributes). |
 
 ---
 
@@ -107,21 +116,24 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
 ```text
 totalcmd_plugin/
 ├── Makefile                    # NMake incremental build & test rules (Debug/Release/ASan/Analyze)
-├── build.sh                    # Bash wrapper loading Portable MSVC x64 + invoking NMake
+├── build.sh                    # Bash wrapper (expects an initialized MSVC x64 environment) invoking NMake
 ├── .clang-format               # Code formatting rules (C11, 4 spaces, 100 cols)
 ├── restic_wfx.def              # Explicit DLL exports to prevent MSVC name mangling
 ├── cJSON/
 │   ├── cJSON.h                 # cJSON parser header
 │   └── cJSON.c                 # cJSON parser implementation
 ├── include/
-│   ├── fsplugin.h              # Official Total Commander WFX API declarations
-│   └── config.h                # INI configuration & binary resolution interface
+│   ├── fsplugin.h              # Total Commander WFX API declarations (+ FS_SET_TIME_UNKNOWN macro)
+│   ├── config.h                # INI configuration & binary resolution interface
+│   └── restic_cli.h            # Restic CLI child process & JSON/NDJSON parser interface
 ├── src/
 │   ├── main.c                  # DllMain, WFX entry points, virtual path routing
 │   ├── config.c                # restic_plugin.ini resolution & parsing
-│   └── restic_cli.c            # Child process execution & Win32 anonymous pipes (planned)
+│   └── restic_cli.c            # Child process execution, Win32 pipes, JSON/NDJSON parsing
 └── tests/
-    └── test_config.c           # Unit test suite for configuration & root enumeration
+    ├── test_config.c           # Configuration, PATH-lookup security, 300-repo scaling, root enumeration
+    ├── test_restic_cli.c       # Parsers, quoting, process execution (cmd.exe stand-in) + live restic.exe tests
+    └── test_plugin_dll.c       # Black-box smoke test: LoadLibrary(restic.wfx64) + exported WFX surface
 ```
 
 ---
@@ -140,15 +152,32 @@ typedef struct {
 } ResticFindHandle;
 ```
 
-### 7.2 Invoking `restic.exe` via Win32 Pipes
+### 7.2 Invoking `restic.exe` via Win32 Pipes (`src/restic_cli.c`)
 
-- Create an anonymous pipe via `CreatePipe` with `bInheritHandle = TRUE` enabled only on the write handle.
-- Configure `STARTUPINFOW` with `dwFlags = STARTF_USESTDHANDLES` and `hStdOutput = hWritePipe`.
-- Build a UTF-16 environment block (`CREATE_UNICODE_ENVIRONMENT`) containing:
-  - `RESTIC_REPOSITORY=<target>`
-  - `RESTIC_PASSWORD=<session_password>`
-- Spawn the process via `CreateProcessW(..., CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, ...)`.
-- Immediately close `hWritePipe` in the parent process so `ReadFile` on `hReadPipe` receives `EOF` upon child termination.
+`restic_exec_command(exe, repo, password, args, options, out)` is the single process-spawning primitive:
+
+- **Executable:** must contain a path separator (bare names refused, see 3.3). The command line is built in a heap buffer sized from the inputs (limit 32767 chars, `RESTIC_ERR_INVALID_ARG` beyond it) - never in a fixed stack buffer, because `swprintf_s` aborts the host process on overflow.
+- **Two pipes, two streams:** stdout and stderr use separate anonymous pipes. With `--json` stdout carries only the payload, while `{"message_type":"exit_error",...}` and warnings go to **stderr** (verified against restic 0.19.1). Merging them would corrupt JSON parsing whenever Restic prints a warning.
+- **stdin = `NUL`** so Restic can never block on an interactive prompt.
+- **Explicit handle whitelist:** `STARTUPINFOEXW` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` makes the child inherit exactly {stdin NUL, stdout pipe, stderr pipe}. Total Commander spawns processes from other threads; without the whitelist a concurrent `CreateProcess` could inherit our write ends (EOF would never arrive) and unrelated inheritable handles would leak into Restic. Parent-side read ends are non-inheritable.
+- **Environment block** (`CREATE_UNICODE_ENVIRONMENT`): the parent environment (Go needs `SystemRoot`, `APPDATA`, `TEMP`...) minus any inherited `RESTIC_REPOSITORY`, `RESTIC_REPOSITORY_FILE`, `RESTIC_PASSWORD`, `RESTIC_PASSWORD_FILE`, `RESTIC_PASSWORD_COMMAND` (they would conflict), plus `RESTIC_REPOSITORY` and `RESTIC_PASSWORD`. The block is wiped with `SecureZeroMemory` right after `CreateProcessW`. The password is never placed on the command line.
+- **Output collection without deadlock:** one loop polls both pipes (`PeekNamedPipe` + `ReadFile`), waits at most 20 ms on the process handle only when idle, and performs a final drain after the child exits. Buffers grow geometrically and are always NUL-terminated and non-NULL after a successful spawn.
+- **Timeout and cancellation:** `ResticExecOptions { timeout_ms, cancel_proc, cancel_ctx }`. `cancel_proc` is polled about every 100 ms (intended to forward Total Commander's `ProgressProc` abort result); on timeout/cancel the child is terminated (`RESTIC_ERR_TIMEOUT` / `RESTIC_ERR_CANCELLED`). `NULL` options mean no limit. `main.c` must always pass a cancel callback: an unreachable `rest:`/cloud repository makes Restic retry for minutes and would otherwise freeze Total Commander.
+- **Exit codes:** `0` -> `RESTIC_OK`, `10` -> `RESTIC_ERR_REPO_NOT_FOUND`, `11` -> `RESTIC_ERR_REPO_LOCKED`, `12` -> `RESTIC_ERR_WRONG_PASSWORD`, anything else -> `RESTIC_ERR_CLI_FAILED`. `error_message` receives the `"message"` of the first JSON line on stderr (then stdout), or the raw trimmed text, safely truncated to 511 characters.
+
+### 7.3 Argument Safety (`restic_list_directory`)
+
+- Snapshot IDs go on the command line unquoted, so they are validated as hexadecimal (max 64 chars) before anything is spawned; `"--help"`, whitespace or `NULL` yield `RESTIC_ERR_INVALID_ARG`.
+- The `ls` filter path (arbitrary bytes from the backed-up file system, e.g. Linux names containing a double quote) goes through `restic_quote_arg()`, which implements the `CommandLineToArgvW` escaping rules (backslashes before quotes doubled, quotes escaped). A round-trip test against `CommandLineToArgvW` covers it.
+- Paths up to 1023 UTF-16 units (Total Commander's limit) are supported end to end (UTF-8 buffer of 3073 bytes).
+- Known limitation: a Linux file name containing a literal backslash cannot be addressed, because the backslash is the WFX path separator.
+
+### 7.4 Parsing Rules (`restic_parse_*`)
+
+- `snapshots --json`: a literal `null` is an empty list; entries with an invalid time or non-hex ID are skipped (the directory name must never contain separators). Directory name = snapshot time **as recorded by Restic (its own UTC offset)**; the `FILETIME` fields are converted to UTC.
+- `ls --json` NDJSON: strict - a malformed line aborts with `RESTIC_ERR_JSON_PARSE` (stdout contains JSON only). Only direct children of the filter path are returned. The filtered directory's own node is consumed to prove existence: a filter other than `/` whose node is missing or is not a `dir` yields `RESTIC_ERR_PATH_NOT_FOUND`. This distinguishes "missing" from "empty directory", which Total Commander needs (`ERROR_NO_MORE_FILES` = exists but empty, any other error = does not exist).
+- Entry mapping: `dir` -> `FILE_ATTRIBUTE_DIRECTORY`; everything else (files, **symlinks**, devices) -> plain file, as the WFX specification requires ("Links should be returned as files"). All entries carry `FILE_ATTRIBUTE_READONLY`. 64-bit sizes are split into `nFileSizeHigh/Low`.
+- Unknown dates: when `mtime` is missing or unparsable the entry gets Total Commander's "no date" marker (`FS_SET_TIME_UNKNOWN`: high `0xFFFFFFFF`, low `0xFFFFFFFE`); repository aliases at the root use it too.
 
 ---
 
@@ -178,14 +207,30 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 ### 8.5 Binary Security Hardening
 - **Compiler:** `/GS` (Buffer Security Check / stack cookie protection).
 - **Linker:** `/DYNAMICBASE` (ASLR - Address Space Layout Randomization) and `/NXCOMPAT` (DEP - Data Execution Prevention), plus `/DEF:restic_wfx.def` to export undecorated symbol names.
+- **Export surface:** `cJSON` is compiled with `/DCJSON_HIDE_SYMBOLS`. Without it the library marks every API `__declspec(dllexport)` and the plugin would export ~90 `cJSON_*` functions next to the WFX entry points. `tests/test_plugin_dll.c` asserts the exact surface: only the nine read-only `Fs*` functions are exported; `FsGetFile/PutFile/DeleteFile/MkDir/RemoveDir/RenMovFile/SetAttr/SetTime/ExecuteFile` (and any `cJSON_*`) must stay absent, because Total Commander enables an operation as soon as the symbol exists.
+- **Imports:** only `KERNEL32.dll` (static CRT). No extra import libraries are linked into the plugin (`SYSLIBS` is empty; the tests add `Shell32.lib` for `CommandLineToArgvW`).
 
 ### 8.6 Build & Test Commands (`build.sh` & `Makefile`)
 
 ```bash
 ./build.sh debug     # Incremental Debug build (build/restic.wfx64, /MTd)
 ./build.sh release   # Optimized Release build (build/restic.wfx64, /MT)
-./build.sh test      # Build and run unit tests with CRT heap & leak verification
-./build.sh asan      # Rebuild and run unit tests under MSVC AddressSanitizer
+./build.sh test      # Build plugin + run all three test programs (CRT heap & leak verification)
+./build.sh release-test  # Same tests against the optimized /MT /O2 build
+./build.sh asan      # Rebuild and run unit tests under MSVC AddressSanitizer (DLL smoke test is skipped)
 ./build.sh analyze   # Rebuild plugin & tests with MSVC Static Analyzer (/analyze)
 ./build.sh clean     # Remove build/ directory
 ```
+
+
+### 8.7 Test Suites (`tests/`)
+
+| Program | Scope |
+| --- | --- |
+| `test_config.c` | Directory normalization, INI primary/fallback priority and auto-creation, `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`. |
+| `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe`. |
+| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact export surface, root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (template auto-created, edits picked up live), two concurrent find handles, ANSI stub behavior. |
+
+The live test needs only `tmp\restic.exe` (git-ignored; reported as `[SKIP]` when absent). On every run it rebuilds `tmp\test_fixture\{data,repo}` from scratch (300-file directory, Unicode and shell-metacharacter names, empty directory, 100 KB file, fixed mtime), initializes a repository whose password contains quotes, `%PATH%` and CJK text, takes two snapshots and verifies per-snapshot listings, timestamps and the error mapping (wrong password, missing repository, unknown snapshot, missing path, file used as directory, quote-injection attempt). The fixture stays on disk for inspection.
+
+Test-quality note: the security-relevant tests were mutation-checked (reverting to `SearchPathW`, or removing the quote escaping, makes them fail).
