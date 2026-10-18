@@ -131,7 +131,7 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
 ## 6. Source Tree Structure
 
 ```text
-totalcmd_plugin/
+Restic_WFX_Plugin/
 ├── Makefile                    # NMake incremental build & test rules (Debug/Release/ASan/Analyze)
 ├── build.sh                    # Bash wrapper (expects an initialized MSVC x64 environment) invoking NMake
 ├── .clang-format               # Code formatting rules (C11, 4 spaces, 100 cols)
