@@ -23,7 +23,7 @@
   - Level 0 (`\`), Level 1 (`\<RepoAlias>`) and Level 2+ (`\<RepoAlias>\<SnapshotDir>\<SubPath>`) virtual path routing in `FsFindFirstW`.
   - In-memory password sessions, one per repository alias (8-slot table behind an SRW lock; `RT_Password` via `RequestProcW`, up to 3 attempts on `RESTIC_ERR_WRONG_PASSWORD`, wiped with `SecureZeroMemory` on wrong password, `FsInitW`, or `DLL_PROCESS_DETACH`).
   - `ProgressProcW`-based cancellation (`ESC`), `LogProcW` + `RT_MsgOK` error reporting, and Win32 error code mapping (`ERROR_NO_MORE_FILES` for empty dirs, `ERROR_PATH_NOT_FOUND` for missing paths/repos, `ERROR_ACCESS_DENIED` for auth failure, `ERROR_CANCELLED` for user abort).
-  - End-to-end unit and DLL tests: **504 assertions** (80 + 273 + 151), all passing across Debug, `/analyze`, ASan (79 + 273, DLL test skipped) and Release (79 + 273 + 151).
+  - End-to-end unit and DLL tests: **510 assertions** (80 + 273 + 157), all passing across Debug, `/analyze`, ASan (79 + 273, DLL test skipped) and Release (79 + 273 + 157).
 - ✅ **Post-integration Bug Review**: 8 further issues fixed in `main.c`/`restic_cli.c` plus one build pitfall documented (see "Code Review 2" below).
 - ✅ **File & Folder Extraction (`FsGetFileW` / `FsGetFile`, `restic_dump_file`)**:
   - Streaming file extraction via `restic dump --no-lock <snapshot_id> <filter_path>` with a fixed 64 KB buffer (constant memory usage), lazy local file creation (auth/path errors never touch the local disk), `LastWriteTime` preservation, two-step overwrite protocol (`FS_FILE_EXISTS` / `FS_COPYFLAGS_OVERWRITE`), byte-level `ProgressProcW` reporting + `ESC` abort with partial-file cleanup.
@@ -120,6 +120,9 @@ estic.wfx64'`).
   - *Issue:* Large `cat <<EOF` / `python - <<EOF` bodies are silently cut (warning "delimited by end-of-file"), leaving half-written files; chained with `&& rm` they delete the source.
   - *Solution:* Use the `write`/`edit` tools for anything beyond a few dozen lines and never chain `rm` after a heredoc script.
 
+- **Python Environment Already Active in Shell (`python`)**:
+  - *Fact:* `python` is directly available in the working shell with the project's virtual environment already active. When creating or executing Python helper scripts, invoke `python` directly without creating or activating a new virtual environment.
+
 - **Fake Restic via Batch File**:
   - *Technique:* `CreateProcessW` accepts a `.bat` as the executable (cmd starts implicitly), so tests can emulate `restic.exe` deterministically; the scenario is chosen from `%~4` (the path argument). `ping -n N 127.0.0.1 >nul` is a portable sleep and `<nul set /p "=text"` prints without a trailing CRLF.
 
@@ -209,9 +212,9 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
 ## Current State & Next Steps (read this first after a session compaction)
 
 - **Functionality:** read-only browsing and file/folder extraction are complete: `\` (aliases) -> `\<Alias>` (snapshots `YYYY-MM-DD_HH-MM-SS_[id]`) -> `\<Alias>\<Snapshot>\<dirs/files>`, plus `FsGetFileW` (`F5` copy of files and recursive folders, `F3` Lister, `Ctrl+Q` Quick View). Exported API: the 11 `Fs*` read-only + extraction functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile` are not exported, and `FS_COPYFLAGS_MOVE` is rejected with `FS_FILE_NOTSUPPORTED`).
-- **Quality gates (all green):** `./build.sh test`, `analyze`, `asan`, `release-test`; 504 assertions (`test_config` 80, `test_restic_cli` 273, `test_plugin_dll` 151). Run `./build.sh clean` when switching configuration. Live tests need `tmp/restic.exe` (git-ignored, otherwise `[SKIP]`).
-- **Next:** (1) manual Total Commander tests by the user and bug fixes from them; (2) optional embedding of the plugin `.ico` resource into `restic.wfx64` (first `ICON` resource in `.rc`, multi-resolution `16x16`, `24x24`, `32x32`, `48x48` 32-bit RGBA + `256x256` PNG); (3) `README.md` (install, `restic_plugin.ini`, build/test, security notes); (4) optional future enhancements: streaming `ls` parser, optional directory cache, Job Object to kill child trees, UTF-8 INI.
-- **Conventions:** pure C11 (`/TC`), English comments/docs, UNICODE, LF endings, repository free of machine-specific paths (`grep -rnI -E 'setup_x64|_progetti' --exclude='.env' --exclude-dir=.git --exclude-dir=tmp --exclude-dir=build .` must print nothing), user conversation in Italian, update `AGENT.md`/`MEMORY.md` after significant changes.
+- **Quality gates (all green):** `./build.sh test`, `analyze`, `asan`, `release-test`; 510 assertions (`test_config` 80, `test_restic_cli` 273, `test_plugin_dll` 157). Run `./build.sh clean` when switching configuration. Live tests need `tmp/restic.exe` (git-ignored, otherwise `[SKIP]`).
+- **Next:** (1) manual Total Commander tests by the user and bug fixes from them; (2) `README.md` (install, `restic_plugin.ini`, build/test, security notes); (3) optional future enhancements: streaming `ls` parser, optional directory cache, Job Object to kill child trees, UTF-8 INI.
+- **Conventions:** pure C11 (`/TC`), English comments/docs, UNICODE, LF endings, repository free of machine-specific paths (`grep -rnI -E 'setup_x64|_progetti' --exclude='.env' --exclude-dir=.git --exclude-dir=tmp --exclude-dir=build .` must print nothing), Python (`python`) is already active in the shell environment (do not create new venvs), user conversation in Italian, update `AGENT.md`/`MEMORY.md` after significant changes.
 
 ---
 
@@ -289,3 +292,20 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
   - Updated `Makefile` (`INI_TEMPLATE` / `INI_OUT`) so `all`, `test`, and `analyze` copy `restic_plugin.ini` to `build\restic_plugin.ini`.
   - Added assertion in `tests/test_config.c` (`test_missing_ini_is_harmless`) verifying `build\restic_plugin.ini` is staged and parses with `0` active repositories (504 assertions total: 80 + 273 + 151).
   - Documented Total Commander WFX icon rules in `AGENT.md` (§5.1) and `MEMORY.md`: Total Commander loads the first `ICON` resource in the `.wfx64` DLL for Network Neighborhood (`16x16` mandatory; `16, 24, 32, 48, 256` 32-bit RGBA `.ico` recommended).
+
+### 2026-10-18 — Python Environment Initialization & Activation Fix (`py_env.sh`)
+- **Objective:** Fix virtual environment activation failure on Windows Git Bash/MSYS2 (`.venv/bin/activate: No such file or directory`) and ensure `.env` toolchain variables load properly.
+- **Changes:**
+  - `py_env.sh`: added `_activate_venv` helper supporting both Windows (`.venv/Scripts/activate`) and POSIX (`.venv/bin/activate`), checking exit code and file existence before reporting success.
+  - Sourced `.env` upfront before calling `uv venv` / `uv sync` or activating the venv, so MSVC variables (`INCLUDE`, `LIB`, `PATH`) are available to build/tooling processes.
+  - Accepted `activate` as an alias for `active` (`source py_env.sh activate`).
+  - Added warning when `py_env.sh` is executed in a subshell rather than sourced.
+
+### 2026-10-18 — Multi-Resolution Plugin Icon (`logo/restic_wfx.ico` + `src/restic_wfx.rc`)
+- **Objective:** Merge the individual icon frames in `logo/` into a single multi-resolution `.ico` file, embed it as the first `ICON` resource in `restic.wfx64`, and verify it in `test_plugin_dll.c`.
+- **Changes:**
+  - Merged `logo/logo_16x16.ico`, `logo_24x24.ico`, `logo_32x32.ico`, `logo_48x48.ico` (32-bit BGRA BMP/DIB) and `logo_256x256.png` (32-bit RGBA PNG) into `logo/restic_wfx.ico` (5 frames) and removed the obsolete root `logo.png`.
+  - Created `src/restic_wfx.rc` (`1 ICON "logo\\restic_wfx.ico"`) and updated `Makefile` to compile `build\restic_wfx.res` via `rc.exe` and link it into `build\restic.wfx64`.
+  - Extended `test_export_surface` in `tests/test_plugin_dll.c` to verify `RT_GROUP_ICON` #1 and all 5 `RT_ICON` frames (510 assertions total: 80 + 273 + 157, all green across `test`, `analyze`, `asan`, `release-test`).
+  - Recorded in `MEMORY.md` that `python` is available with its virtual environment already active in the shell (no need to create a new venv).
+

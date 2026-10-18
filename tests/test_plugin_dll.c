@@ -165,6 +165,16 @@ static void test_export_surface(void) {
             g_tests_failed++;
         }
     }
+
+    /* Verify embedded plugin icon resource (ID 1, 5 frames: 16x16, 24x24, 32x32, 48x48, 256x256) */
+    HRSRC hGroup = FindResourceW(m, MAKEINTRESOURCEW(1), (LPCWSTR)RT_GROUP_ICON);
+    EXPECT_TRUE(hGroup != NULL && SizeofResource(m, hGroup) >= 6 + 5 * 14,
+                "Embedded RT_GROUP_ICON #1 present with 5 icon frames");
+    for (WORD id = 1; id <= 5; ++id) {
+        HRSRC hIcon = FindResourceW(m, MAKEINTRESOURCEW(id), (LPCWSTR)RT_ICON);
+        EXPECT_TRUE(hIcon != NULL && SizeofResource(m, hIcon) > 0, "Embedded RT_ICON frame present");
+    }
+
     FreeLibrary(m);
 }
 

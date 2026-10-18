@@ -1,0 +1,8 @@
+/*
+ * Windows Resource Script for Restic Total Commander WFX Plugin (restic.wfx64)
+ *
+ * Total Commander loads the FIRST icon resource (by index) found in the WFX DLL
+ * and displays it next to "Restic Backups" in Network Neighborhood.
+ */
+
+1 ICON "logo\\restic_wfx.ico"

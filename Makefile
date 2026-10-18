@@ -16,15 +16,19 @@ CONFIG = Debug
 BUILD_DIR  = build
 PLUGIN_OUT = $(BUILD_DIR)\restic.wfx64
 PLUGIN_LIB = $(BUILD_DIR)\restic.lib
+PLUGIN_RES = $(BUILD_DIR)\restic_wfx.res
 TEST_CONFIG_OUT = $(BUILD_DIR)\test_config.exe
 TEST_CLI_OUT    = $(BUILD_DIR)\test_restic_cli.exe
 TEST_DLL_OUT    = $(BUILD_DIR)\test_plugin_dll.exe
 DEF_FILE        = restic_wfx.def
+RC_FILE         = src\restic_wfx.rc
+ICO_FILE        = logo\restic_wfx.ico
 INI_TEMPLATE    = restic_plugin.ini
 INI_OUT         = $(BUILD_DIR)\restic_plugin.ini
 
 CC   = cl.exe
 LINK = link.exe
+RC   = rc.exe
 
 # Strict pure C11 (/TC /std:c11) compiler flags and security hardening (/GS)
 CFLAGS_COMMON = /nologo /TC /std:c11 /permissive- /W4 /WX /we4013 /GS \
@@ -89,8 +93,11 @@ $(BUILD_DIR)\test_config.obj: $(BUILD_DIR) tests\test_config.c include\config.h 
 $(BUILD_DIR)\test_restic_cli.obj: $(BUILD_DIR) tests\test_restic_cli.c include\restic_cli.h include\fsplugin.h
 	$(CC) /c $(CFLAGS) tests\test_restic_cli.c
 
-$(PLUGIN_OUT): $(PLUGIN_OBJS) $(DEF_FILE)
-	$(CC) /nologo /LD $(CFLAGS_CFG) $(CFLAGS_SAN) $(PLUGIN_OBJS) $(SYSLIBS) /link $(LFLAGS_CFG) /DEF:$(DEF_FILE) /IMPLIB:$(PLUGIN_LIB) /OUT:$(PLUGIN_OUT)
+$(PLUGIN_RES): $(BUILD_DIR) $(RC_FILE) $(ICO_FILE)
+	$(RC) /nologo /fo$(PLUGIN_RES) $(RC_FILE)
+
+$(PLUGIN_OUT): $(PLUGIN_OBJS) $(PLUGIN_RES) $(DEF_FILE)
+	$(CC) /nologo /LD $(CFLAGS_CFG) $(CFLAGS_SAN) $(PLUGIN_OBJS) $(PLUGIN_RES) $(SYSLIBS) /link $(LFLAGS_CFG) /DEF:$(DEF_FILE) /IMPLIB:$(PLUGIN_LIB) /OUT:$(PLUGIN_OUT)
 
 $(TEST_CONFIG_OUT): $(TEST_CONFIG_OBJS)
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(TEST_CONFIG_OBJS) $(SYSLIBS) /link $(LFLAGS_CFG) /OUT:$(TEST_CONFIG_OUT)
