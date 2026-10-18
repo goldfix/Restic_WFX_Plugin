@@ -1,0 +1,107 @@
+# ==========================================================
+#  test-py template — .gitignore
+# ==========================================================
+
+cJSON/
+build/
+
+# --- Secrets & ambiente locale (MAI committare) -----------
+.env
+.env.*
+py_var.sh
+key.json
+*.pem
+
+# --- Python virtual environments --------------------------
+.venv/
+venv/
+env/
+py-env/
+conda-env/
+
+# --- Bytecode / cache Python ------------------------------
+__pycache__/
+*.py[codz]
+*$py.class
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+
+# --- Testing & coverage -----------------------------------
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Jupyter / notebook artifacts -------------------------
+.ipynb_checkpoints/
+.marimo/
+
+# --- Log & artefatti runtime ------------------------------
+*.log
+tmp/
+.pi-subagents/artifacts/
+
+# --- Editor / OS ------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+uv.lock
+
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo

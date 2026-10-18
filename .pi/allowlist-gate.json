@@ -1,0 +1,27 @@
+{
+  "enabled": true,
+  "allow": [
+    "shell:git status *",
+    "shell:git diff *",
+    "shell:git log *",
+    "shell:ls *",
+    "shell:cat *",
+    "shell:pwd *",
+    "shell:echo *",
+    "shell:wc *",
+    "shell:grep *",
+    "shell:tail *",
+    "mcp:docs-mcp-server",
+    "shell:git show *",
+    "shell:find *",
+    "shell:./build.sh clean",
+    "shell:./build.sh debug",
+    "shell:./build.sh test",
+    "shell:./build.sh analyze",
+    "shell:./build.sh asan",
+    "shell:./build.sh release",
+    "shell:rm -f build.pdb",
+    "shell:ls -la build"
+  ],
+  "deny": []
+}

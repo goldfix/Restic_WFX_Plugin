@@ -1,2 +1,1 @@
-# totalcmd_restic_plugin
-totalcmd_restic_plugin
+# README File
