@@ -415,6 +415,11 @@ static BOOL node_to_find_data(const cJSON* obj, WIN32_FIND_DATAW* fd) {
         MultiByteToWideChar(CP_UTF8, 0, j_name->valuestring, -1, fd->cFileName, MAX_PATH) <= 0) {
         return FALSE;
     }
+    /* Empty names and "."/".." would break Total Commander's navigation: never report them */
+    if (fd->cFileName[0] == L'\0' || wcscmp(fd->cFileName, L".") == 0 ||
+        wcscmp(fd->cFileName, L"..") == 0) {
+        return FALSE;
+    }
 
     if (cJSON_IsString(j_type) && strcmp(j_type->valuestring, "dir") == 0) {
         fd->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY;
@@ -975,4 +980,318 @@ ResticResult restic_list_directory(
     res = restic_parse_ls_ndjson(cmd_out.output, filter_utf8, out_items, out_count);
     restic_free_command_output(&cmd_out);
     return res;
+}
+
+#define DUMP_CHUNK_BYTES (64u * 1024u)
+
+/* State of one streaming extraction: data goes to a temporary file that replaces the target on success */
+typedef struct {
+    const WCHAR* final_path;
+    WCHAR* part_path;        /* Heap copy: <target dir>\~rp<thread id>.tmp (short, to stay below MAX_PATH) */
+    BOOL overwrite;
+    HANDLE hLocal;           /* Handle of the temporary file (INVALID_HANDLE_VALUE until the first byte) */
+    BOOL part_created;       /* TRUE while the temporary file exists on disk and must be cleaned up */
+    ULONGLONG written;       /* Cumulative payload bytes written */
+    ULONGLONG last_poll;     /* Tick of the last progress/cancel callback */
+    ULONGLONG last_activity; /* Tick of the last byte received from Restic (inactivity timeout) */
+    BOOL first_reported;     /* TRUE once the first payload chunk was reported to the progress callback */
+    ResticDumpProgressProc progress_proc;
+    void* progress_ctx;
+    char* chunk;
+} DumpState;
+
+static BOOL is_unknown_time(const FILETIME* ft) {
+    return ft->dwHighDateTime == 0xFFFFFFFF && ft->dwLowDateTime == 0xFFFFFFFE;
+}
+
+/* Builds "<dir of final_path>\~rp<tid>.tmp" on the heap. Returns NULL on failure. */
+static WCHAR* make_partial_path(const WCHAR* final_path) {
+    size_t len     = wcslen(final_path);
+    size_t dir_len = 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (final_path[i] == L'\\' || final_path[i] == L'/') dir_len = i + 1;
+    }
+    size_t cap  = dir_len + 32;
+    WCHAR* part = (WCHAR*)malloc(cap * sizeof(WCHAR));
+    if (!part) return NULL;
+    wmemcpy(part, final_path, dir_len);
+    swprintf_s(part + dir_len, cap - dir_len, L"~rp%lx.tmp", GetCurrentThreadId());
+    return part;
+}
+
+/* Returns the open temporary file, creating it on first use. INVALID_HANDLE_VALUE on failure. */
+static HANDLE dump_get_partial(DumpState* st) {
+    if (st->hLocal != INVALID_HANDLE_VALUE) return st->hLocal;
+    HANDLE h = CreateFileW(
+        st->part_path,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    st->hLocal       = h;
+    st->part_created = TRUE;
+    return h;
+}
+
+/*
+ * Moves every byte available on Restic's stdout into the temporary file (opened lazily on the first
+ * byte). The progress callback runs at most every CANCEL_POLL_MS so multi-GB transfers do not flood
+ * Total Commander with UI updates.
+ */
+static ResticResult dump_drain_stdout(HANDLE out_pipe, DumpState* st, BOOL* out_eof) {
+    while (!*out_eof) {
+        DWORD avail = 0, got = 0;
+        if (!PeekNamedPipe(out_pipe, NULL, 0, NULL, &avail, NULL)) {
+            *out_eof = TRUE;
+            break;
+        }
+        if (avail == 0) break;
+        if (!ReadFile(
+                out_pipe,
+                st->chunk,
+                avail < DUMP_CHUNK_BYTES ? avail : DUMP_CHUNK_BYTES,
+                &got,
+                NULL
+            ) ||
+            got == 0) {
+            *out_eof = TRUE;
+            break;
+        }
+        ULONGLONG now    = GetTickCount64();
+        st->last_activity = now;
+        HANDLE hf = dump_get_partial(st);
+        if (hf == INVALID_HANDLE_VALUE) {
+            return RESTIC_ERR_LOCAL_WRITE;
+        }
+        DWORD written = 0;
+        if (!WriteFile(hf, st->chunk, got, &written, NULL) || written != got) {
+            return RESTIC_ERR_LOCAL_WRITE;
+        }
+        st->written += written;
+        if (st->progress_proc && (!st->first_reported || now - st->last_poll >= CANCEL_POLL_MS)) {
+            st->first_reported = TRUE;
+            st->last_poll = now;
+            if (st->progress_proc(st->written, st->progress_ctx)) return RESTIC_ERR_CANCELLED;
+        }
+    }
+    return RESTIC_OK;
+}
+
+/* Finalizes a successful transfer: applies the mtime and moves the temporary file over the target */
+static ResticResult dump_commit(DumpState* st, const FILETIME* mtime) {
+    HANDLE hf = dump_get_partial(st); /* Zero-byte file: nothing was streamed, create it now */
+    if (hf == INVALID_HANDLE_VALUE) {
+        return RESTIC_ERR_LOCAL_WRITE;
+    }
+    if (mtime != NULL && !is_unknown_time(mtime)) {
+        SetFileTime(hf, NULL, NULL, mtime);
+    }
+    CloseHandle(hf);
+    st->hLocal = INVALID_HANDLE_VALUE;
+
+    DWORD flags = 0;
+    if (st->overwrite) {
+        DWORD attr = GetFileAttributesW(st->final_path);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY) != 0 &&
+            (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            SetFileAttributesW(st->final_path, attr & ~FILE_ATTRIBUTE_READONLY);
+        }
+        flags = MOVEFILE_REPLACE_EXISTING;
+    }
+    if (!MoveFileExW(st->part_path, st->final_path, flags)) {
+        return RESTIC_ERR_LOCAL_WRITE;
+    }
+    st->part_created = FALSE;
+    return RESTIC_OK;
+}
+
+ResticResult restic_dump_file(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const char* snapshot_id,
+    const WCHAR* subpath_w,
+    const WCHAR* local_dest_path,
+    BOOL overwrite,
+    const FILETIME* mtime,
+    DWORD timeout_ms,
+    ResticDumpProgressProc progress_proc,
+    void* progress_ctx,
+    WCHAR* out_error_msg,
+    size_t err_capacity
+) {
+    if (out_error_msg && err_capacity > 0) out_error_msg[0] = L'\0';
+    if (!restic_exe || !repo_target || !password || !snapshot_id || !subpath_w ||
+        !local_dest_path || local_dest_path[0] == L'\0' || !is_hex_string(snapshot_id) ||
+        strlen(snapshot_id) > 64) {
+        return RESTIC_ERR_INVALID_ARG;
+    }
+    if (restic_exe[0] == L'\0' || wcspbrk(restic_exe, L"\\/:") == NULL) {
+        return RESTIC_ERR_SPAWN_FAILED;
+    }
+
+    /* Fail fast, before contacting the repository, when the target cannot be replaced */
+    DWORD existing = GetFileAttributesW(local_dest_path);
+    if (existing != INVALID_FILE_ATTRIBUTES &&
+        ((existing & FILE_ATTRIBUTE_DIRECTORY) != 0 || !overwrite)) {
+        return RESTIC_ERR_LOCAL_WRITE;
+    }
+
+    char filter_utf8[MAX_UTF8_PATH] = {0};
+    WCHAR filter_w[MAX_UTF8_PATH]   = {0};
+    WCHAR snap_w[65]                = {0};
+    if (!restic_normalize_filter_path(subpath_w, filter_utf8, sizeof(filter_utf8)) ||
+        strcmp(filter_utf8, "/") == 0 ||
+        MultiByteToWideChar(CP_UTF8, 0, filter_utf8, -1, filter_w, (int)_countof(filter_w)) <= 0) {
+        return RESTIC_ERR_INVALID_ARG;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, snapshot_id, -1, snap_w, (int)_countof(snap_w));
+
+    WCHAR* quoted_filter = restic_quote_arg(filter_w);
+    if (!quoted_filter) return RESTIC_ERR_OUT_OF_MEMORY;
+
+    size_t cmd_chars = wcslen(restic_exe) + wcslen(L"\"\" dump --no-lock  ") + wcslen(snap_w) +
+                       wcslen(quoted_filter) + 4;
+    if (cmd_chars > MAX_CMDLINE_CHARS) {
+        free(quoted_filter);
+        return RESTIC_ERR_INVALID_ARG;
+    }
+    WCHAR* cmd_line = (WCHAR*)malloc(cmd_chars * sizeof(WCHAR));
+    if (!cmd_line) {
+        free(quoted_filter);
+        return RESTIC_ERR_OUT_OF_MEMORY;
+    }
+    swprintf_s(cmd_line, cmd_chars, L"\"%ls\" dump --no-lock %ls %ls", restic_exe, snap_w, quoted_filter);
+    free(quoted_filter);
+
+    DumpState st;
+    memset(&st, 0, sizeof(st));
+    st.final_path    = local_dest_path;
+    st.overwrite     = overwrite;
+    st.hLocal        = INVALID_HANDLE_VALUE;
+    st.progress_proc = progress_proc;
+    st.progress_ctx  = progress_ctx;
+    st.part_path     = make_partial_path(local_dest_path);
+    st.chunk         = (char*)malloc(DUMP_CHUNK_BYTES);
+
+    size_t env_chars = 0;
+    WCHAR* env_block = (st.part_path && st.chunk)
+                           ? build_child_environment(repo_target, password, &env_chars)
+                           : NULL;
+    if (!env_block) {
+        free(cmd_line);
+        free(st.part_path);
+        free(st.chunk);
+        return RESTIC_ERR_OUT_OF_MEMORY;
+    }
+
+    HANDLE out_pipe = NULL, err_pipe = NULL;
+    PROCESS_INFORMATION pi;
+    BOOL spawned = spawn_hidden(cmd_line, env_block, &out_pipe, &err_pipe, &pi);
+    SecureZeroMemory(env_block, env_chars * sizeof(WCHAR));
+    free(env_block);
+    free(cmd_line);
+    if (!spawned) {
+        free(st.part_path);
+        free(st.chunk);
+        return RESTIC_ERR_SPAWN_FAILED;
+    }
+    CloseHandle(pi.hThread);
+
+    ByteBuf err         = {0};
+    BOOL out_eof        = FALSE;
+    BOOL err_eof        = FALSE;
+    ResticResult result = RESTIC_ERR_OUT_OF_MEMORY;
+
+    if (bytebuf_append(&err, "", 0)) {
+        ULONGLONG start  = GetTickCount64();
+        st.last_poll     = start;
+        st.last_activity = start;
+        result           = RESTIC_OK;
+
+        for (;;) {
+            ULONGLONG before_out = st.written;
+            size_t before_err    = err.len;
+
+            result = dump_drain_stdout(out_pipe, &st, &out_eof);
+            if (result != RESTIC_OK) break;
+            if (!drain_pipe(err_pipe, &err, &err_eof)) {
+                result = RESTIC_ERR_OUT_OF_MEMORY;
+                break;
+            }
+
+            if (st.written != before_out || err.len != before_err) {
+                st.last_activity = GetTickCount64();
+            } else if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {
+                result = dump_drain_stdout(out_pipe, &st, &out_eof);
+                if (result == RESTIC_OK && !drain_pipe(err_pipe, &err, &err_eof)) {
+                    result = RESTIC_ERR_OUT_OF_MEMORY;
+                }
+                break;
+            }
+
+            ULONGLONG now = GetTickCount64();
+            /* Inactivity timeout: a slow but progressing multi-GB transfer is never aborted */
+            if (timeout_ms != 0 && now - st.last_activity >= timeout_ms) {
+                result = RESTIC_ERR_TIMEOUT;
+                break;
+            }
+            if (progress_proc && now - st.last_poll >= CANCEL_POLL_MS) {
+                st.last_poll = now;
+                if (progress_proc(st.written, progress_ctx)) {
+                    result = RESTIC_ERR_CANCELLED;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (result == RESTIC_OK) {
+        DWORD exit_code = 1;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        if (exit_code != 0) {
+            if (out_error_msg && err_capacity > 0) {
+                ByteBuf empty_out = {0};
+                build_error_message(&empty_out, &err, out_error_msg, err_capacity);
+            }
+            switch (exit_code) {
+                case 10: result = RESTIC_ERR_REPO_NOT_FOUND; break;
+                case 11: result = RESTIC_ERR_REPO_LOCKED; break;
+                case 12: result = RESTIC_ERR_WRONG_PASSWORD; break;
+                default:
+                    if (err.data && (strstr(err.data, "not found in snapshot") != NULL ||
+                                     strstr(err.data, "does not exist") != NULL)) {
+                        result = RESTIC_ERR_PATH_NOT_FOUND;
+                    } else {
+                        result = RESTIC_ERR_CLI_FAILED;
+                    }
+                    break;
+            }
+        } else {
+            result = dump_commit(&st, mtime);
+        }
+    } else {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
+
+    /* Any failure: discard the partial data. A pre-existing target file stays untouched. */
+    if (st.hLocal != INVALID_HANDLE_VALUE) {
+        CloseHandle(st.hLocal);
+    }
+    if (st.part_created) {
+        DeleteFileW(st.part_path);
+    }
+
+    free(st.part_path);
+    free(st.chunk);
+    free(err.data);
+    CloseHandle(out_pipe);
+    CloseHandle(err_pipe);
+    CloseHandle(pi.hProcess);
+    return result;
 }

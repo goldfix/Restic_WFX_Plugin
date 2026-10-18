@@ -32,6 +32,11 @@ if [[ -n "${LIB:-}" ]]; then
 fi
 
 run_nmake() {
+    # If Total Commander currently holds build/restic.wfx64 loaded in memory,
+    # Windows forbids overwriting it in place but allows renaming it out of the way.
+    if [[ -f "build/restic.wfx64" ]] && ! rm -f "build/restic.wfx64" 2>/dev/null; then
+        mv -f "build/restic.wfx64" "build/restic.wfx64.old" 2>/dev/null || true
+    fi
     MSYS2_ARG_CONV_EXCL="*" nmake -nologo "$@"
 }
 

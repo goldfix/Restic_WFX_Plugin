@@ -8,3 +8,5 @@ EXPORTS
     FsFindNext
     FsFindNextW
     FsFindClose
+    FsGetFile
+    FsGetFileW

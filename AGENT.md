@@ -32,7 +32,7 @@ The primary goal of Phase 1 (MVP) is to provide interactive, read-only browsing 
 5. **Credential Lifecycle**
    - No passwords are stored on disk (neither in `restic_plugin.ini` nor in external files).
    - Credentials are requested at runtime when entering a repository via Total Commander's `RequestProcW` (`RT_Password`) callback.
-   - Credentials remain in a dedicated in-memory buffer for the active repository session and are wiped when switching repositories or unloading the plugin.
+   - Credentials remain in RAM only, in a small per-repository session table (8 slots, so two panels can browse two repositories without being re-prompted). Entries are wiped on wrong password, on `FsInitW` and on DLL unload; the oldest slot is recycled when the table is full.
 
 ---
 
@@ -40,8 +40,8 @@ The primary goal of Phase 1 (MVP) is to provide interactive, read-only browsing 
 
 ### 3.1 INI File Path Resolution
 
-1. **Primary Lookup:** inside the directory containing the plugin DLL (`<plugin_dir>\restic_plugin.ini`), resolved at load time in `DllMain` via `GetModuleFileNameW`.
-2. **Fallback:** if the primary file is missing or inaccessible (e.g., when installed under protected paths such as `C:\Program Files\`), the plugin uses the directory supplied by Total Commander via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`) and looks up or creates `restic_plugin.ini` in that directory.
+1. **Primary Lookup & Auto-Creation on Init:** inside the directory containing the plugin DLL (`<plugin_dir>\restic_plugin.ini`), resolved at load time in `DllMain` via `GetModuleFileNameW`. When the plugin is initialized (`FsInit` / `FsInitW`), if no configuration file exists yet, it immediately creates `<plugin_dir>\restic_plugin.ini` populated with a fully commented sample template (`config_ensure_default_ini()`).
+2. **Fallback:** if `<plugin_dir>\restic_plugin.ini` is missing and `<plugin_dir>` is not writable (e.g., when installed under protected paths such as `C:\Program Files\`), the plugin falls back to the directory supplied by Total Commander via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`) and looks up or creates `restic_plugin.ini` in that directory.
 
 ### 3.2 INI File Structure
 
@@ -94,9 +94,9 @@ Total Commander passes backslash-delimited paths rooted at `\`. The plugin maps 
 All exported functions use the `__stdcall` calling convention. Both Unicode (`W`) entry points and mandatory ANSI stubs are exported for full compatibility with the Total Commander plugin loader:
 
 - **`FsInitW` / `FsInit`**
-  - Stores the assigned `PluginNr` identifier and host callback pointers (`pProgressProcW`, `pLogProcW`, `pRequestProcW`).
+  - Stores the assigned `PluginNr` identifier and host callback pointers (`pProgressProcW`, `pLogProcW`, `pRequestProcW`), and calls `config_ensure_default_ini()` so `<plugin_dir>\restic_plugin.ini` (with all settings commented out) is created immediately on plugin initialization if missing.
 - **`FsSetDefaultParams`**
-  - Extracts and saves the fallback configuration directory from `DefaultIniName`.
+  - Extracts and saves the fallback configuration directory from `DefaultIniName`, and calls `config_ensure_default_ini()` in case `<plugin_dir>` was not writable during `FsInit`.
 - **`FsGetDefRootName`**
   - Returns the default root label displayed in Network Neighborhood (`"Restic Backups"`).
 - **`FsFindFirstW` / `FsFindFirst`**
@@ -106,8 +106,14 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
   - Advances the `ResticFindHandle` cursor and populates the next `WIN32_FIND_DATAW` entry, or returns `FALSE` when exhausted.
 - **`FsFindClose`**
   - Frees the `ResticFindHandle` and all associated buffers.
+- **`FsGetFileW` / `FsGetFile`**
+  - Extracts a single file from a snapshot (`restic dump --no-lock <snapshot_id> <filter_path>`) via `restic_dump_file()`, streaming Restic's stdout in 64 KB chunks (constant memory) into a **temporary file** `<target dir>\~rp<thread id>.tmp` that atomically replaces `LocalName` (`MoveFileExW`) only after Restic exits with code 0. On any failure or `ESC` only the temporary file is deleted and a pre-existing target stays untouched (an interrupted overwrite never destroys the old file). The temporary file is created on the first byte, so authentication/path errors never touch the disk; 0-byte files are created at commit time.
+  - Integrates with Total Commander's native copy/extract workflow: when the user copies a folder (`F5`), Total Commander walks the folder tree via `FsFindFirstW`/`FsFindNextW`/`FsFindClose`, creates the local directory hierarchy, and calls `FsGetFileW` for each file. Viewing files with `F3` (Lister) and `Ctrl+Q` (Quick View) also works automatically.
+  - Implements Total Commander's two-step overwrite protocol (`FS_FILE_EXISTS` when `FS_COPYFLAGS_OVERWRITE` is not set; a read-only target is replaced when the flag is set), preserves `LastWriteTime` from `RemoteInfoStruct` (the "unknown time" marker is ignored), and reports progress to `ProgressProcW`: 0 % before the transfer, then the first chunk and at most one call per ~100 ms (capped at 99 %), 100 % on success. `ESC` -> `FS_FILE_USERABORT`. The timeout is an **inactivity** timeout (`WFX_RESTIC_TIMEOUT_MS`, 30 min without a single byte on stdout/stderr), so a slow multi-GB transfer is never killed.
+  - Result mapping: `RESTIC_ERR_LOCAL_WRITE` (disk full, missing destination directory, destination is a directory) -> `FS_FILE_WRITEERROR` without popup; `PATH_NOT_FOUND`, invalid virtual path, unknown alias, root/repository/snapshot-level path -> `FS_FILE_NOTFOUND`; cancelled or empty password dialog -> `FS_FILE_USERABORT`; wrong password after 3 attempts and other Restic failures -> `FS_FILE_READERROR` with one popup. The password session (7.5) is shared with the listing code.
+  - Rejects `FS_COPYFLAGS_MOVE` (`F6`, even combined with `OVERWRITE`) and `FS_COPYFLAGS_RESUME` with `FS_FILE_NOTSUPPORTED`; entries whose `RemoteInfoStruct.Attr` has `FILE_ATTRIBUTE_DIRECTORY` are refused too. Known limitation: Total Commander always passes `ri`, but a caller passing `ri == NULL` for a directory path would receive a tar stream (`restic dump` archives folders).
 
-*Note:* Modification functions (`FsGetFile`, `FsPutFile`, `FsDeleteFile`, `FsMkDir`) are intentionally omitted in Phase 1 to enforce strict read-only browsing.
+*Note:* Modification, deletion, and move functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally omitted to enforce strict read-only repository access.
 
 ---
 
@@ -179,6 +185,18 @@ typedef struct {
 - Entry mapping: `dir` -> `FILE_ATTRIBUTE_DIRECTORY`; everything else (files, **symlinks**, devices) -> plain file, as the WFX specification requires ("Links should be returned as files"). All entries carry `FILE_ATTRIBUTE_READONLY`. 64-bit sizes are split into `nFileSizeHigh/Low`.
 - Unknown dates: when `mtime` is missing or unparsable the entry gets Total Commander's "no date" marker (`FS_SET_TIME_UNKNOWN`: high `0xFFFFFFFF`, low `0xFFFFFFFE`); repository aliases at the root use it too.
 
+### 7.5 Virtual Path Routing, Password Session & Host Callbacks (`src/main.c`)
+
+- **Path decomposition (`parse_wfx_path`):** splits the backslash-delimited `Path` passed to `FsFindFirstW` into:
+  - `WFX_PATH_ROOT` (`\`): calls `enumerate_root_repositories()`.
+  - `WFX_PATH_REPO` (`\<RepoAlias>`): resolves `RepoAlias` via `config_find_repo()` and calls `restic_list_snapshots()`.
+  - `WFX_PATH_SNAPSHOT_DIR` (`\<RepoAlias>\<SnapshotDir>[\<SubPath>]`): extracts the hexadecimal `snapshot_id` via `restic_extract_snapshot_id()` (rejecting malformed folder names before prompting or spawning) and calls `restic_list_directory()`.
+- **Pre-flight binary check:** if `cfg.restic_path` contains no path separator (`config_resolve_restic_path` returned `FALSE`), `execute_repo_query()` logs and displays `"restic.exe not found..."` and returns `ERROR_FILE_NOT_FOUND` without prompting for a password.
+- **In-memory password sessions:** `g_Sessions[8]` (`SessionSlot { alias, password }`) is guarded by an `SRWLOCK` (statically initialized, so it also works in unit tests where `DllMain` never runs) because Total Commander may call the plugin from worker threads. `execute_repo_query()` copies the password into a local buffer (`session_get`), runs Restic **without** holding the lock, and wipes the local copy with `SecureZeroMemory`. A password is cached (`session_put`) only when the outcome does not prove it wrong (`RESTIC_OK`, `PATH_NOT_FOUND`, `CANCELLED`, `TIMEOUT`); wrong passwords, missing repositories and spawn failures are never kept. `session_forget` / `clear_password_session` wipe one slot / all slots.
+- **Password prompt & retry:** when no password is cached for the alias, `prompt_repository_password()` calls `RequestProcW(RT_Password)` with `ReturnedText[0] = 0` (the buffer is the dialog's default text). An **empty** password or a cancelled dialog yields `ERROR_CANCELLED` without any popup (Restic rejects empty passwords, and accepting one would only produce a confusing generic failure). Up to `MAX_PASSWORD_ATTEMPTS` (3) prompts are shown when Restic keeps answering `RESTIC_ERR_WRONG_PASSWORD` (exit code 12); a stale cached password counts as the first attempt and is forgotten.
+- **User abort (`ESC`):** `wfx_cancel_callback()` polls `ProgressProcW` every ~100 ms while Restic runs and terminates `restic.exe` on a non-zero result (`ERROR_CANCELLED`, no popup, a valid cached password is kept). Per the WFX SDK, calls made during the `FsFindFirst/Next/Close` loop are ignored by Total Commander for the first 5 seconds and only then show a progress dialog, so fast listings never flicker. The call uses `PercentDone = 0` (indeterminate) and passes the **alias, never the repository URL**, as `TargetName`: the URL can embed credentials (`rest:https://user:pass@host`) and would be shown on screen. A 30-minute `WFX_RESTIC_TIMEOUT_MS` is a safety net against hung commands.
+- **Win32 error mapping:** empty listings (`RESTIC_OK` with `count == 0`) set `ERROR_NO_MORE_FILES`; missing paths or repositories set `ERROR_PATH_NOT_FOUND`; wrong passwords after retries set `ERROR_ACCESS_DENIED`; locked repositories set `ERROR_LOCK_VIOLATION`. User-facing errors are reported via both `g_LogProc(MSGTYPE_IMPORTANTERROR)` and `g_RequestProc(RT_MsgOK)`.
+
 ---
 
 ## 8. Compilation, Hardening & Quality Standards (MSVC `cl.exe`)
@@ -227,9 +245,9 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 
 | Program | Scope |
 | --- | --- |
-| `test_config.c` | Directory normalization, INI primary/fallback priority and auto-creation, `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`. |
-| `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe`. |
-| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact export surface, root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (template auto-created, edits picked up live), two concurrent find handles, ANSI stub behavior. |
+| `test_config.c` | Directory normalization, INI primary/fallback priority and auto-creation in `<plugin_dir>` on `FsInitW` (all settings commented out), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, and password prompt cancellation (74-75 assertions). |
+| `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe` including `restic_dump_file` streaming extraction, mtime preservation, 0-byte and 100 KB files, overwrite protection, binary fidelity (`00/0A/0D/1A` bytes), existing target preserved on every failure or abort, no leftover `~rp*.tmp`, local-side failures, argument validation, plus `test_dump_with_fake_restic` (a fake `restic` batch file that deterministically covers exit codes 10/11/12/other, stderr classification, partial output then failure, empty stderr, environment injection and the inactivity timeout: a silent child is killed, a slow but steady one survives) (273 assertions). |
+| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 11-function export surface (`FsGetFile`/`FsGetFileW` included; write/delete/move functions forbidden), root name, primary INI auto-creation in `<plugin_dir>` on `FsInitW` (all settings commented out), fallback INI via `FsSetDefaultParams`, two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads (151 assertions). |
 
 The live test needs only `tmp\restic.exe` (git-ignored; reported as `[SKIP]` when absent). On every run it rebuilds `tmp\test_fixture\{data,repo}` from scratch (300-file directory, Unicode and shell-metacharacter names, empty directory, 100 KB file, fixed mtime), initializes a repository whose password contains quotes, `%PATH%` and CJK text, takes two snapshots and verifies per-snapshot listings, timestamps and the error mapping (wrong password, missing repository, unknown snapshot, missing path, file used as directory, quote-injection attempt). The fixture stays on disk for inspection.
 

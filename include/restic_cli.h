@@ -16,6 +16,7 @@ typedef enum {
     RESTIC_ERR_CLI_FAILED,       /* Other non-zero Restic exit code */
     RESTIC_ERR_JSON_PARSE,       /* Invalid or unexpected JSON/NDJSON payload */
     RESTIC_ERR_PATH_NOT_FOUND,   /* Requested snapshot path does not exist or is not a directory */
+    RESTIC_ERR_LOCAL_WRITE,      /* Failed to create or write the local destination file */
     RESTIC_ERR_TIMEOUT,          /* Child process exceeded ResticExecOptions.timeout_ms */
     RESTIC_ERR_CANCELLED         /* ResticExecOptions.cancel_proc requested abort */
 } ResticResult;
@@ -26,6 +27,13 @@ typedef enum {
  * Typical use: forward Total Commander's ProgressProc "user pressed Esc" result.
  */
 typedef BOOL (*ResticCancelProc)(void* user_data);
+
+/**
+ * Optional streaming progress/cancellation callback invoked by `restic_dump_file`.
+ * `bytes_written` is the cumulative number of bytes written to the destination file so far.
+ * Return TRUE to abort the transfer (`RESTIC_ERR_CANCELLED`).
+ */
+typedef BOOL (*ResticDumpProgressProc)(ULONGLONG bytes_written, void* user_data);
 
 /**
  * Optional execution controls. Pass NULL to use defaults (no timeout, not cancellable).
@@ -167,6 +175,38 @@ ResticResult restic_list_directory(
     const ResticExecOptions* options,
     WIN32_FIND_DATAW** out_items,
     size_t* out_count,
+    WCHAR* out_error_msg,
+    size_t err_capacity
+);
+
+/**
+ * Extracts a single file from a snapshot (`restic dump --no-lock <snapshot_id> <filter_path>`)
+ * and streams its raw content to `local_dest_path` using a 64 KB buffer.
+ *
+ * - Data is written to a temporary file (`<target dir>\~rp<thread id>.tmp`) that atomically replaces
+ *   `local_dest_path` only after Restic exited with code 0. On ANY failure or cancellation the
+ *   temporary file is deleted and a pre-existing `local_dest_path` is left untouched.
+ * - The temporary file is created only once Restic emits its first byte (or exits with code 0 for
+ *   a 0-byte file), so authentication or path errors never touch the local disk.
+ * - If `overwrite` is FALSE and `local_dest_path` exists (or is a directory), returns
+ *   `RESTIC_ERR_LOCAL_WRITE` before contacting the repository.
+ * - If `mtime` is non-NULL and not the "unknown time" marker, it is applied to the new file.
+ * - `timeout_ms` is an INACTIVITY timeout (no byte on stdout/stderr for that long; 0 = unlimited):
+ *   a slow but progressing multi-GB transfer is never aborted.
+ * - `progress_proc` is invoked at most every ~100 ms with the cumulative byte count.
+ */
+ResticResult restic_dump_file(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const char* snapshot_id,
+    const WCHAR* subpath_w,
+    const WCHAR* local_dest_path,
+    BOOL overwrite,
+    const FILETIME* mtime,
+    DWORD timeout_ms,
+    ResticDumpProgressProc progress_proc,
+    void* progress_ctx,
     WCHAR* out_error_msg,
     size_t err_capacity
 );

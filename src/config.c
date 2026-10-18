@@ -19,19 +19,45 @@
 static WCHAR g_plugin_dir[CONFIG_MAX_PATH]   = {0};
 static WCHAR g_fallback_dir[CONFIG_MAX_PATH] = {0};
 
-/* Default configuration file template created when no INI file exists */
+/* Default configuration file template created when no INI file exists (all settings commented out) */
 static const char kDefaultIniTemplate[] =
-    "; Save this file as ANSI or UTF-16 LE: Windows INI APIs do not decode UTF-8.\r\n"
+    "; ==============================================================================\r\n"
+    "; Total Commander Restic WFX Plugin - Configuration File (restic_plugin.ini)\r\n"
+    "; ==============================================================================\r\n"
+    "; IMPORTANT: Save this file as ANSI or UTF-16 LE (with BOM).\r\n"
+    ";            Windows INI APIs do not decode UTF-8.\r\n"
+    "; ==============================================================================\r\n"
+    "\r\n"
     "[Settings]\r\n"
-    "; Optional path to restic.exe (if empty, checks plugin folder then system PATH)\r\n"
-    "ResticPath=restic.exe\r\n"
+    "; Path to the restic.exe executable.\r\n"
+    "; When commented out (or set to \"restic.exe\"), the plugin searches in order:\r\n"
+    ";   1. The explicit path configured below\r\n"
+    ";   2. <plugin_dir>\\restic.exe (next to restic.wfx64)\r\n"
+    ";   3. Directories listed in the system PATH environment variable\r\n"
+    ";\r\n"
+    "; ResticPath=restic.exe\r\n"
+    "; ResticPath=C:\\Tools\\restic\\restic.exe\r\n"
+    "; ResticPath=bin\\restic.exe\r\n"
     "\r\n"
     "[Repositories]\r\n"
-    "; <Display_Alias>=<Restic_Repository_Target>\r\n"
+    "; Format: <Display_Alias>=<Restic_Repository_Target>\r\n"
+    "; Uncomment or add your repositories below. Each entry appears as a virtual\r\n"
+    "; folder under \"\\Restic Backups\\\".\r\n"
+    "; Do NOT store passwords here: Total Commander prompts for the password on\r\n"
+    "; first access and keeps it in RAM for the current session.\r\n"
+    ";\r\n"
+    "; --- Local or external drive repositories ---\r\n"
     "; LocalBackup=D:\\Backups\\ResticRepo\r\n"
-    "; LinuxServer=rest:https://backup.lan:8000/\r\n"
+    "; Documents=E:\\Restic\\Documents\r\n"
+    ";\r\n"
+    "; --- Network share (UNC / SMB) ---\r\n"
+    "; NAS_SMB=\\\\nas\\share\\restic_repo\r\n"
+    ";\r\n"
+    "; --- Remote repositories (REST, SFTP, S3, Rclone) ---\r\n"
+    "; LinuxServer=rest:https://backup.lan:8000/my_repo\r\n"
+    "; ServerSFTP=sftp:user@192.168.1.50:/srv/restic/my_repo\r\n"
     "; CloudS3=s3:s3.us-east-1.amazonaws.com/company-backup/restic\r\n"
-    "; NAS_SMB=\\\\nas\\share\\restic_repo\r\n";
+    "; CloudRclone=rclone:gdrive:ResticBackups\r\n";
 
 static BOOL is_space_char(WCHAR c) {
     return (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n');
@@ -266,7 +292,7 @@ BOOL config_resolve_ini_path(WCHAR* out_path, size_t out_capacity, BOOL create_i
     WCHAR primary_candidate[CONFIG_MAX_PATH]  = {0};
     WCHAR fallback_candidate[CONFIG_MAX_PATH] = {0};
 
-    /* 1. Primary search: <plugin_dir>\restic_plugin.ini */
+    /* 1. Existing INI in the plugin directory: <plugin_dir>\restic_plugin.ini */
     if (g_plugin_dir[0] != L'\0') {
         join_path(g_plugin_dir, CONFIG_INI_FILENAME, primary_candidate, CONFIG_MAX_PATH);
         if (file_exists(primary_candidate)) {
@@ -275,30 +301,39 @@ BOOL config_resolve_ini_path(WCHAR* out_path, size_t out_capacity, BOOL create_i
         }
     }
 
-    /* 2. Fallback search: <fallback_dir>\restic_plugin.ini */
+    /* 2. Existing INI in the fallback directory: <fallback_dir>\restic_plugin.ini */
     if (g_fallback_dir[0] != L'\0') {
         join_path(g_fallback_dir, CONFIG_INI_FILENAME, fallback_candidate, CONFIG_MAX_PATH);
         if (file_exists(fallback_candidate)) {
             wcsncpy_s(out_path, out_capacity, fallback_candidate, _TRUNCATE);
             return TRUE;
         }
-        if (create_if_missing && create_default_ini_file(fallback_candidate)) {
-            wcsncpy_s(out_path, out_capacity, fallback_candidate, _TRUNCATE);
-            return TRUE;
-        }
-        wcsncpy_s(out_path, out_capacity, fallback_candidate, _TRUNCATE);
-        return FALSE;
     }
 
-    /* 3. No fallback directory set: use primary candidate and optionally create it */
-    if (primary_candidate[0] != L'\0') {
-        if (create_if_missing && create_default_ini_file(primary_candidate)) {
+    /* 3. Neither file exists: create in <plugin_dir> first, or <fallback_dir> if not writable */
+    if (create_if_missing) {
+        if (primary_candidate[0] != L'\0' && create_default_ini_file(primary_candidate)) {
             wcsncpy_s(out_path, out_capacity, primary_candidate, _TRUNCATE);
             return TRUE;
         }
+        if (fallback_candidate[0] != L'\0' && create_default_ini_file(fallback_candidate)) {
+            wcsncpy_s(out_path, out_capacity, fallback_candidate, _TRUNCATE);
+            return TRUE;
+        }
+    }
+
+    /* Report the preferred candidate path even when the file does not exist yet */
+    if (primary_candidate[0] != L'\0') {
         wcsncpy_s(out_path, out_capacity, primary_candidate, _TRUNCATE);
+    } else if (fallback_candidate[0] != L'\0') {
+        wcsncpy_s(out_path, out_capacity, fallback_candidate, _TRUNCATE);
     }
     return FALSE;
+}
+
+BOOL config_ensure_default_ini(void) {
+    WCHAR ini_path[CONFIG_MAX_PATH] = {0};
+    return config_resolve_ini_path(ini_path, CONFIG_MAX_PATH, TRUE);
 }
 
 /*

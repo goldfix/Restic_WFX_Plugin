@@ -11,6 +11,13 @@
 #define FS_FILE_NOTSUPPORTED        6
 #define FS_FILE_EXISTSRESUMEALLOWED 7
 
+/* CopyFlags for FsGetFile / FsGetFileW */
+#define FS_COPYFLAGS_OVERWRITE            1
+#define FS_COPYFLAGS_RESUME               2
+#define FS_COPYFLAGS_MOVE                 4
+#define FS_COPYFLAGS_EXISTS_SAMECASE      8
+#define FS_COPYFLAGS_EXISTS_DIFFERENTCASE 16
+
 /* Return codes for FsExecuteFile */
 #define FS_EXEC_OK                  0
 #define FS_EXEC_ERROR               1
@@ -59,6 +66,14 @@ typedef struct {
     char DefaultIniName[MAX_PATH];
 } FsDefaultParamStruct;
 
+/* Remote file metadata passed by Total Commander to FsGetFile / FsGetFileW */
+typedef struct {
+    DWORD SizeLow;
+    DWORD SizeHigh;
+    FILETIME LastWriteTime;
+    int Attr;
+} RemoteInfoStruct;
+
 /* Exported WFX plugin entry points (Unicode and mandatory ANSI stubs) */
 int    __stdcall FsInit(int PluginNr, tProgressProc pProgressProc, tLogProc pLogProc, tRequestProc pRequestProc);
 int    __stdcall FsInitW(int PluginNr, tProgressProcW pProgressProcW, tLogProcW pLogProcW, tRequestProcW pRequestProcW);
@@ -69,3 +84,5 @@ HANDLE __stdcall FsFindFirstW(WCHAR* Path, WIN32_FIND_DATAW* FindData);
 BOOL   __stdcall FsFindNext(HANDLE Hdl, WIN32_FIND_DATAA* FindData);
 BOOL   __stdcall FsFindNextW(HANDLE Hdl, WIN32_FIND_DATAW* FindData);
 int    __stdcall FsFindClose(HANDLE Hdl);
+int    __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri);
+int    __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, RemoteInfoStruct* ri);

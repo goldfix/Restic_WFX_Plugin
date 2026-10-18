@@ -303,6 +303,17 @@ static void test_parse_ls_ndjson(void) {
     res = restic_parse_ls_ndjson(HEADER_LINE, "/", &items, &count);
     EXPECT_TRUE(res == RESTIC_OK && count == 0 && items == NULL, "Empty snapshot root is valid");
 
+    /* Names that would break Total Commander's navigation are never reported */
+    res = restic_parse_ls_ndjson(HEADER_LINE
+        "{\"name\":\"\",\"type\":\"file\",\"path\":\"/x\",\"message_type\":\"node\"}\r\n"
+        "{\"name\":\".\",\"type\":\"dir\",\"path\":\"/.\",\"message_type\":\"node\"}\r\n"
+        "{\"name\":\"..\",\"type\":\"dir\",\"path\":\"/..\",\"message_type\":\"node\"}\r\n"
+        "{\"name\":\"ok.txt\",\"type\":\"file\",\"path\":\"/ok.txt\",\"message_type\":\"node\"}\r\n",
+        "/", &items, &count);
+    EXPECT_TRUE(res == RESTIC_OK && count == 1 && wcscmp(items[0].cFileName, L"ok.txt") == 0,
+                "Empty, '.' and '..' node names are skipped");
+    free(items);
+
     /* Existing but empty directory vs. missing path vs. file used as directory */
     res = restic_parse_ls_ndjson(HEADER_LINE
         "{\"name\":\"empty_dir\",\"type\":\"dir\",\"path\":\"/a/empty_dir\",\"message_type\":\"node\"}\r\n",
@@ -565,6 +576,66 @@ static BOOL write_file(const WCHAR* dir, const WCHAR* name, DWORD size, const FI
     return TRUE;
 }
 
+/* Deterministic binary payload containing 0x00, 0x0A, 0x0D and 0x1A: exposes any text-mode translation */
+static unsigned char pattern_byte(unsigned long i) {
+    return (unsigned char)((i * 7u + i / 251u) & 0xFFu);
+}
+
+static BOOL write_pattern(const WCHAR* dir, const WCHAR* name, DWORD size) {
+    WCHAR path[MAX_PATH];
+    swprintf_s(path, MAX_PATH, L"%ls\\%ls", dir, name);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    BOOL ok = TRUE;
+    for (DWORD i = 0; ok && i < size; ++i) {
+        unsigned char b = pattern_byte(i);
+        DWORD w = 0;
+        ok = WriteFile(h, &b, 1, &w, NULL) && w == 1;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+/* TRUE when the file holds exactly `size` bytes of the deterministic pattern */
+static BOOL verify_pattern_file(const WCHAR* path, DWORD size) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    BOOL ok = TRUE;
+    DWORD pos = 0, got = 0;
+    unsigned char buf[4096];
+    while (ok && ReadFile(h, buf, sizeof(buf), &got, NULL) && got > 0) {
+        for (DWORD i = 0; ok && i < got; ++i) ok = (buf[i] == pattern_byte(pos + i));
+        pos += got;
+    }
+    CloseHandle(h);
+    return ok && pos == size;
+}
+
+/* TRUE when the file content equals `text` exactly */
+static BOOL file_equals(const WCHAR* path, const char* text) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    char buf[256] = {0};
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, NULL) && got == strlen(text) &&
+              memcmp(buf, text, got) == 0;
+    CloseHandle(h);
+    return ok;
+}
+
+/* Number of leftover "~rp*.tmp" temporary files in dir */
+static int count_partial_files(const WCHAR* dir) {
+    WCHAR pattern[MAX_PATH];
+    swprintf_s(pattern, MAX_PATH, L"%ls\\~rp*.tmp", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do { n++; } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
 static BOOL make_dir(const WCHAR* parent, const WCHAR* name, WCHAR* out_path) {
     swprintf_s(out_path, MAX_PATH, L"%ls\\%ls", parent, name);
     return CreateDirectoryW(out_path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
@@ -583,6 +654,8 @@ static BOOL create_fixture(const WCHAR* data) {
               write_file(data, L"zero.bin", 0, NULL) &&
               write_file(data, L"big.bin", 100000, NULL) &&
               make_dir(data, L"sub", sub) && write_file(sub, L"inner.txt", 3, NULL) &&
+              make_dir(sub, L"sub2", dir) && write_file(dir, L"deep.txt", 4, NULL) &&
+              write_pattern(dir, L"binary.dat", 70000) &&
               make_dir(data, L"empty_dir", dir) &&
               make_dir(data, L"odd [dir] & (x) ^ 100% !", sub) && write_file(sub, L"odd_inner.txt", 9, NULL) &&
               make_dir(data, L"many", dir);
@@ -601,6 +674,15 @@ static void to_wfx_path(const WCHAR* abs_path, const WCHAR* leaf, WCHAR* out, si
     } else {
         swprintf_s(out, cap, L"\\%c%ls", abs_path[0], abs_path + 2);
     }
+}
+
+static ULONGLONG g_last_dump_bytes = 0;
+static BOOL      g_abort_dump      = FALSE;
+
+static BOOL dump_progress_cb(ULONGLONG bytes_written, void* user_data) {
+    (void)user_data;
+    g_last_dump_bytes = bytes_written;
+    return g_abort_dump && (bytes_written > 0);
 }
 
 static void test_live_restic_cli(void) {
@@ -742,6 +824,219 @@ static void test_live_restic_cli(void) {
     EXPECT_TRUE(res == RESTIC_ERR_INVALID_ARG, "Snapshot ID with whitespace rejected");
     res = restic_list_directory(restic_bin, repo, password, NULL, L"\\", NULL, &items, &count, err, _countof(err));
     EXPECT_TRUE(res == RESTIC_ERR_INVALID_ARG, "NULL snapshot ID rejected");
+
+    /* File extraction via restic_dump_file */
+    WCHAR dump_dest[MAX_PATH];
+    swprintf_s(dump_dest, _countof(dump_dest), L"%ls\\dumped_file.bin", base);
+    DeleteFileW(dump_dest);
+
+    /* 1. Missing snapshot file or wrong password never creates the local file */
+    to_wfx_path(data, L"no_such_file.txt", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_PATH_NOT_FOUND, "Missing file in snapshot -> RESTIC_ERR_PATH_NOT_FOUND");
+    EXPECT_TRUE(GetFileAttributesW(dump_dest) == INVALID_FILE_ATTRIBUTES, "Local file not created when remote path is missing");
+
+    to_wfx_path(data, L"readme.txt", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, L"wrong_pwd", snap2, wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_WRONG_PASSWORD, "Wrong password on dump -> RESTIC_ERR_WRONG_PASSWORD");
+    EXPECT_TRUE(GetFileAttributesW(dump_dest) == INVALID_FILE_ATTRIBUTES, "Local file not created when password fails");
+
+    /* 2. Extract readme.txt (5 bytes) and preserve mtime */
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, FALSE, &expected, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK, "Dump readme.txt succeeds");
+    HANDLE hf = CreateFileW(dump_dest, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    EXPECT_TRUE(hf != INVALID_HANDLE_VALUE, "Extracted readme.txt exists");
+    char buf[16] = {0};
+    DWORD got = 0;
+    FILETIME actual_ft = {0};
+    BOOL read_ok = ReadFile(hf, buf, 10, &got, NULL);
+    GetFileTime(hf, NULL, NULL, &actual_ft);
+    CloseHandle(hf);
+    EXPECT_TRUE(read_ok && got == 5 && memcmp(buf, "xxxxx", 5) == 0, "Extracted content matches readme.txt");
+    EXPECT_TRUE(ft_u64(actual_ft) == ft_u64(expected), "Extracted file preserves snapshot LastWriteTime");
+
+    /* 3. overwrite = FALSE refuses to clobber an existing file; overwrite = TRUE succeeds even on READONLY */
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, FALSE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_LOCAL_WRITE, "Refuses to overwrite when overwrite is FALSE");
+    SetFileAttributesW(dump_dest, FILE_ATTRIBUTE_READONLY);
+    to_wfx_path(data, L"big.bin", wfx, _countof(wfx));
+    g_last_dump_bytes = 0;
+    g_abort_dump      = FALSE;
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, TRUE, NULL, 0, dump_progress_cb, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK, "Streaming 100 KB file over multi-chunk pipe succeeds");
+    WIN32_FILE_ATTRIBUTE_DATA big_fad;
+    EXPECT_TRUE(GetFileAttributesExW(dump_dest, GetFileExInfoStandard, &big_fad) &&
+                big_fad.nFileSizeLow == 100000 && big_fad.nFileSizeHigh == 0 &&
+                (big_fad.dwFileAttributes & FILE_ATTRIBUTE_READONLY) == 0,
+                "100 KB file is complete and the READONLY target was replaced");
+    EXPECT_TRUE(g_last_dump_bytes > 0 && g_last_dump_bytes <= 100000ULL, "Progress callback reported a plausible byte count");
+
+    /* 4. Zero-byte file extraction */
+    DeleteFileW(dump_dest);
+    to_wfx_path(data, L"zero.bin", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, FALSE, NULL, 0, NULL, NULL, err, _countof(err));
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    EXPECT_TRUE(res == RESTIC_OK && GetFileAttributesExW(dump_dest, GetFileExInfoStandard, &fad) &&
+                fad.nFileSizeLow == 0 && fad.nFileSizeHigh == 0, "Zero-byte file created on disk");
+
+    /* 5. User abort during transfer leaves no local file (the target did not exist before) */
+    DeleteFileW(dump_dest);
+    to_wfx_path(data, L"big.bin", wfx, _countof(wfx));
+    g_abort_dump = TRUE;
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, TRUE, NULL, 0, dump_progress_cb, NULL, err, _countof(err));
+    g_abort_dump = FALSE;
+    EXPECT_TRUE(res == RESTIC_ERR_CANCELLED, "Dump cancelled via progress callback");
+    EXPECT_TRUE(GetFileAttributesW(dump_dest) == INVALID_FILE_ATTRIBUTES, "Incomplete local file removed on abort");
+    EXPECT_TRUE(count_partial_files(base) == 0, "No temporary ~rp*.tmp file is left behind after an abort");
+
+    /* 6. Binary fidelity: 0x00/0x0A/0x0D/0x1A bytes survive the pipe byte for byte (no text-mode translation) */
+    to_wfx_path(data, L"sub\\sub2\\binary.dat", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, FALSE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && verify_pattern_file(dump_dest, 70000), "Binary file extracted byte for byte");
+
+    /* 7. A failed overwrite never destroys the existing target (data goes to a temporary file first) */
+    to_wfx_path(data, L"no_such_file.txt", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_PATH_NOT_FOUND && verify_pattern_file(dump_dest, 70000),
+                "Missing remote file keeps the existing target intact");
+    to_wfx_path(data, L"big.bin", wfx, _countof(wfx));
+    g_abort_dump = TRUE;
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, TRUE, NULL, 0, dump_progress_cb, NULL, err, _countof(err));
+    g_abort_dump = FALSE;
+    EXPECT_TRUE(res == RESTIC_ERR_CANCELLED && verify_pattern_file(dump_dest, 70000) && count_partial_files(base) == 0,
+                "Cancelled overwrite keeps the existing target intact and removes the temporary file");
+    res = restic_dump_file(restic_bin, repo, L"wrong_pwd", snap2, wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_WRONG_PASSWORD && verify_pattern_file(dump_dest, 70000),
+                "Wrong password keeps the existing target intact");
+
+    /* 8. Local-side failures */
+    to_wfx_path(data, L"readme.txt", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, dump_dest, FALSE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_LOCAL_WRITE && verify_pattern_file(dump_dest, 70000),
+                "overwrite=FALSE on an existing target fails before touching it");
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, base, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_LOCAL_WRITE, "A directory as the local target is refused");
+    WCHAR bad_dest[MAX_PATH];
+    swprintf_s(bad_dest, _countof(bad_dest), L"%ls\\no_such_dir\\out.bin", base);
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, bad_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_LOCAL_WRITE, "Non-existent local directory -> RESTIC_ERR_LOCAL_WRITE (non-empty file)");
+    to_wfx_path(data, L"zero.bin", wfx, _countof(wfx));
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, bad_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_LOCAL_WRITE, "Non-existent local directory -> RESTIC_ERR_LOCAL_WRITE (zero-byte file)");
+    EXPECT_TRUE(count_partial_files(base) == 0, "No temporary file after local failures");
+
+    /* 9. Argument validation (nothing is spawned) */
+    res = restic_dump_file(restic_bin, repo, password, snap2, L"\\", dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_INVALID_ARG, "Dumping the snapshot root is refused");
+    res = restic_dump_file(restic_bin, repo, password, "--help", wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_INVALID_ARG, "Option-like snapshot ID refused");
+    res = restic_dump_file(restic_bin, repo, password, NULL, wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_INVALID_ARG, "NULL snapshot ID refused");
+    res = restic_dump_file(restic_bin, repo, password, snap2, wfx, L"", TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_INVALID_ARG, "Empty local path refused");
+    res = restic_dump_file(L"restic.exe", repo, password, snap2, wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_SPAWN_FAILED, "Bare executable name refused (cwd is never searched)");
+    res = restic_dump_file(restic_bin, repo, password, "deadbeef", wfx, dump_dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_CLI_FAILED && verify_pattern_file(dump_dest, 70000),
+                "Unknown snapshot -> CLI failure, target intact");
+    DeleteFileW(dump_dest);
+}
+
+/*
+ * restic_dump_file against a fake "restic" batch file: deterministic coverage of exit codes, stderr
+ * classification, partial output followed by failure, environment injection and the INACTIVITY
+ * timeout, none of which can be provoked reliably with the real binary.
+ * The scenario is selected by the 4th command-line argument (the snapshot path).
+ */
+static void test_dump_with_fake_restic(void) {
+    WCHAR dir[MAX_PATH], bat[MAX_PATH], dest[MAX_PATH];
+    GetTempPathW(MAX_PATH, dir);
+    swprintf_s(dir + wcslen(dir), MAX_PATH - wcslen(dir), L"restic_fake_%lu", GetCurrentProcessId());
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(bat, MAX_PATH, L"%ls\\fake_restic.bat", dir);
+    swprintf_s(dest, MAX_PATH, L"%ls\\out.bin", dir);
+
+    const char* script =
+        "@echo off\r\n"
+        "if \"%~4\"==\"/ok\"      (<nul set /p \"=hello\" & exit /b 0)\r\n"
+        "if \"%~4\"==\"/env\"     (<nul set /p \"=%RESTIC_REPOSITORY%|%RESTIC_PASSWORD%\" & exit /b 0)\r\n"
+        "if \"%~4\"==\"/empty\"   exit /b 0\r\n"
+        "if \"%~4\"==\"/partial\" (<nul set /p \"=partial-data\" & echo Fatal: boom 1>&2 & exit /b 1)\r\n"
+        "if \"%~4\"==\"/missing\" (echo Fatal: cannot dump file: path not found in snapshot 1>&2 & exit /b 1)\r\n"
+        "if \"%~4\"==\"/silent\"  exit /b 1\r\n"
+        "if \"%~4\"==\"/norepo\"  (echo Fatal: repository does not exist 1>&2 & exit /b 10)\r\n"
+        "if \"%~4\"==\"/locked\"  exit /b 11\r\n"
+        "if \"%~4\"==\"/badpw\"   exit /b 12\r\n"
+        "if \"%~4\"==\"/hang\"    (ping -n 8 127.0.0.1 >nul & exit /b 0)\r\n"
+        "if \"%~4\"==\"/slow\"    (<nul set /p \"=a\" & ping -n 2 127.0.0.1 >nul & <nul set /p \"=b\" & ping -n 2 127.0.0.1 >nul & <nul set /p \"=c\" & ping -n 2 127.0.0.1 >nul & exit /b 0)\r\n"
+        "exit /b 99\r\n";
+    HANDLE hb = CreateFileW(bat, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    EXPECT_TRUE(hb != INVALID_HANDLE_VALUE, "Create fake restic batch file");
+    DWORD w = 0;
+    BOOL wrote = WriteFile(hb, script, (DWORD)strlen(script), &w, NULL);
+    CloseHandle(hb);
+    EXPECT_TRUE(wrote, "Write fake restic batch file");
+
+    WCHAR err[512];
+    ResticResult res;
+    DeleteFileW(dest);
+#define FAKE_DUMP(path, overwrite, timeout) \
+    restic_dump_file(bat, L"repo-url", L"s3cret", "abcd1234", path, dest, overwrite, NULL, timeout, NULL, NULL, err, _countof(err))
+
+    res = FAKE_DUMP(L"\\ok", FALSE, 0);
+    EXPECT_TRUE(res == RESTIC_OK && file_equals(dest, "hello"), "Fake restic: stdout bytes are stored verbatim");
+    EXPECT_TRUE(count_partial_files(dir) == 0, "No temporary file after success");
+
+    res = FAKE_DUMP(L"\\env", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_OK && file_equals(dest, "repo-url|s3cret"),
+                "RESTIC_REPOSITORY and RESTIC_PASSWORD reach the child through the environment");
+
+    res = FAKE_DUMP(L"\\empty", TRUE, 0);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    EXPECT_TRUE(res == RESTIC_OK && GetFileAttributesExW(dest, GetFileExInfoStandard, &fad) && fad.nFileSizeLow == 0,
+                "Exit code 0 without output replaces the target with an empty file");
+
+    /* Failures after partial output must keep the previous target and leave nothing behind */
+    DeleteFileW(dest);
+    EXPECT_TRUE(FAKE_DUMP(L"\\ok", FALSE, 0) == RESTIC_OK, "Re-create target");
+    res = FAKE_DUMP(L"\\partial", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_CLI_FAILED && wcsstr(err, L"boom") != NULL,
+                "Partial output + exit code 1 -> RESTIC_ERR_CLI_FAILED with Restic's message");
+    EXPECT_TRUE(file_equals(dest, "hello") && count_partial_files(dir) == 0,
+                "Partial data never replaces the target and the temporary file is removed");
+    DeleteFileW(dest);
+    res = FAKE_DUMP(L"\\partial", FALSE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_CLI_FAILED && GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES,
+                "Failed extraction leaves no target file at all");
+
+    res = FAKE_DUMP(L"\\missing", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_PATH_NOT_FOUND, "'not found in snapshot' on stderr -> RESTIC_ERR_PATH_NOT_FOUND");
+    res = FAKE_DUMP(L"\\silent", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_CLI_FAILED && err[0] == L'\0', "Exit code 1 without any output is handled (empty reason)");
+    res = FAKE_DUMP(L"\\norepo", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_REPO_NOT_FOUND && err[0] != L'\0', "Exit code 10 -> RESTIC_ERR_REPO_NOT_FOUND");
+    res = FAKE_DUMP(L"\\locked", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_REPO_LOCKED, "Exit code 11 -> RESTIC_ERR_REPO_LOCKED");
+    res = FAKE_DUMP(L"\\badpw", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_WRONG_PASSWORD, "Exit code 12 -> RESTIC_ERR_WRONG_PASSWORD");
+    res = FAKE_DUMP(L"\\unknown", TRUE, 0);
+    EXPECT_TRUE(res == RESTIC_ERR_CLI_FAILED, "Other exit codes -> RESTIC_ERR_CLI_FAILED");
+
+    /* Inactivity timeout: silence is punished, steady progress is not */
+    ULONGLONG t0 = GetTickCount64();
+    res = FAKE_DUMP(L"\\hang", TRUE, 700);
+    ULONGLONG hang_ms = GetTickCount64() - t0;
+    EXPECT_TRUE(res == RESTIC_ERR_TIMEOUT && hang_ms < 5000, "Silent child is killed by the inactivity timeout");
+    t0 = GetTickCount64();
+    res = FAKE_DUMP(L"\\slow", TRUE, 1800);
+    ULONGLONG slow_ms = GetTickCount64() - t0;
+    EXPECT_TRUE(res == RESTIC_OK && file_equals(dest, "abc"), "Child that keeps producing bytes survives the inactivity timeout");
+    EXPECT_TRUE(slow_ms > 1800, "The whole transfer lasted longer than the timeout value (it is not a total-time limit)");
+#undef FAKE_DUMP
+
+    DeleteFileW(dest);
+    DeleteFileW(bat);
+    RemoveDirectoryW(dir);
 }
 
 int main(void) {
@@ -763,6 +1058,7 @@ int main(void) {
     test_exec_environment();
     test_exec_limits_and_failures();
     test_exec_large_output_and_long_args();
+    test_dump_with_fake_restic();
     test_live_restic_cli();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)

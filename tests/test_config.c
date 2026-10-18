@@ -93,15 +93,15 @@ static void test_plugin_and_fallback_dirs(void) {
 
 /* Test 2: INI path resolution (primary plugin dir vs fallback dir + auto-creation) */
 static void test_ini_path_resolution_priority(void) {
-    WCHAR plugin_dir[CONFIG_MAX_PATH]   = {0};
-    WCHAR fallback_dir[CONFIG_MAX_PATH] = {0};
-    make_temp_dir(L"restic_test_plug", plugin_dir, CONFIG_MAX_PATH);
-    make_temp_dir(L"restic_test_fb", fallback_dir, CONFIG_MAX_PATH);
+    WCHAR plugin_dir[MAX_PATH]   = {0};
+    WCHAR fallback_dir[MAX_PATH] = {0};
+    make_temp_dir(L"restic_test_plug", plugin_dir, MAX_PATH);
+    make_temp_dir(L"restic_test_fb", fallback_dir, MAX_PATH);
 
-    WCHAR primary_ini[CONFIG_MAX_PATH]  = {0};
-    WCHAR fallback_ini[CONFIG_MAX_PATH] = {0};
-    swprintf_s(primary_ini, CONFIG_MAX_PATH, L"%ls\\%ls", plugin_dir, CONFIG_INI_FILENAME);
-    swprintf_s(fallback_ini, CONFIG_MAX_PATH, L"%ls\\%ls", fallback_dir, CONFIG_INI_FILENAME);
+    WCHAR primary_ini[MAX_PATH]  = {0};
+    WCHAR fallback_ini[MAX_PATH] = {0};
+    swprintf_s(primary_ini, MAX_PATH, L"%ls\\%ls", plugin_dir, CONFIG_INI_FILENAME);
+    swprintf_s(fallback_ini, MAX_PATH, L"%ls\\%ls", fallback_dir, CONFIG_INI_FILENAME);
 
     DeleteFileW(primary_ini);
     DeleteFileW(fallback_ini);
@@ -110,20 +110,39 @@ static void test_ini_path_resolution_priority(void) {
     config_set_fallback_dir(fallback_dir);
 
     /* Case A: Neither exists, create_if_missing = FALSE */
-    WCHAR resolved[CONFIG_MAX_PATH] = {0};
-    BOOL ok = config_resolve_ini_path(resolved, CONFIG_MAX_PATH, FALSE);
+    WCHAR resolved[MAX_PATH] = {0};
+    BOOL ok = config_resolve_ini_path(resolved, MAX_PATH, FALSE);
     EXPECT_TRUE(!ok, "Should return FALSE when no INI exists and create_if_missing is FALSE");
-    EXPECT_WSTR_EQ(resolved, fallback_ini, "Candidate path should point to fallback INI");
+    EXPECT_WSTR_EQ(resolved, primary_ini, "Preferred candidate path points to <plugin_dir>\\restic_plugin.ini");
 
-    /* Case B: Neither exists, create_if_missing = TRUE -> creates in fallback_dir */
-    ok = config_resolve_ini_path(resolved, CONFIG_MAX_PATH, TRUE);
-    EXPECT_TRUE(ok, "Should create default INI in fallback_dir when create_if_missing is TRUE");
-    EXPECT_WSTR_EQ(resolved, fallback_ini, "Resolved path should be fallback INI");
-    EXPECT_TRUE(GetFileAttributesW(fallback_ini) != INVALID_FILE_ATTRIBUTES, "Fallback INI file must exist on disk");
+    /* Case B: FsInitW auto-creates the sample INI in <plugin_dir> with all settings commented out */
+    EXPECT_TRUE(FsInitW(1, NULL, NULL, NULL) == 0, "FsInitW succeeds");
+    EXPECT_TRUE(GetFileAttributesW(primary_ini) != INVALID_FILE_ATTRIBUTES,
+                "FsInitW creates restic_plugin.ini in the plugin directory when missing");
+    EXPECT_TRUE(GetFileAttributesW(fallback_ini) == INVALID_FILE_ATTRIBUTES,
+                "Fallback INI is not created when plugin_dir is writable");
+    WCHAR raw_setting[64] = {0};
+    GetPrivateProfileStringW(L"Settings", L"ResticPath", L"<commented>", raw_setting, _countof(raw_setting), primary_ini);
+    EXPECT_WSTR_EQ(raw_setting, L"<commented>", "ResticPath is commented out in the generated sample INI");
+    ResticConfig sample_cfg;
+    EXPECT_TRUE(config_load(&sample_cfg) && sample_cfg.repo_count == 0,
+                "Generated sample INI has all repository entries commented out");
+    config_free(&sample_cfg);
 
-    /* Case C: Primary INI exists -> takes priority over fallback INI */
+    /* Case C: If <plugin_dir> is not writable, create_if_missing falls back to <fallback_dir> */
+    DeleteFileW(primary_ini);
+    WCHAR unwritable_plug[MAX_PATH] = {0};
+    swprintf_s(unwritable_plug, MAX_PATH, L"%ls\\non_existent_subdir", plugin_dir);
+    config_set_plugin_dir(unwritable_plug);
+    ok = config_resolve_ini_path(resolved, MAX_PATH, TRUE);
+    EXPECT_TRUE(ok, "Falls back to fallback_dir when plugin_dir cannot be written");
+    EXPECT_WSTR_EQ(resolved, fallback_ini, "Resolved path is fallback INI");
+    EXPECT_TRUE(GetFileAttributesW(fallback_ini) != INVALID_FILE_ATTRIBUTES, "Fallback INI file exists on disk");
+
+    /* Case D: Primary INI in plugin_dir takes priority over an existing fallback INI */
+    config_set_plugin_dir(plugin_dir);
     write_text_file(primary_ini, "[Settings]\r\nResticPath=restic.exe\r\n");
-    ok = config_resolve_ini_path(resolved, CONFIG_MAX_PATH, FALSE);
+    ok = config_resolve_ini_path(resolved, MAX_PATH, FALSE);
     EXPECT_TRUE(ok, "Should resolve primary INI when present");
     EXPECT_WSTR_EQ(resolved, primary_ini, "Primary INI in plugin_dir must take precedence over fallback_dir");
 
@@ -385,6 +404,121 @@ static void test_large_repository_list(void) {
     RemoveDirectoryW(plugin_dir);
 }
 
+/* Mock callback state for test_wfx_routing_and_callbacks */
+static int   g_mock_pwd_calls   = 0;
+static int   g_mock_msgok_calls = 0;
+static int   g_mock_log_calls   = 0;
+static BOOL  g_mock_pwd_accept  = FALSE;
+static WCHAR g_mock_last_log[256] = {0};
+
+static void __stdcall mock_log_proc(int PluginNr, int MsgType, WCHAR* LogString) {
+    (void)PluginNr;
+    if (MsgType == MSGTYPE_IMPORTANTERROR && LogString) {
+        g_mock_log_calls++;
+        wcsncpy_s(g_mock_last_log, _countof(g_mock_last_log), LogString, _TRUNCATE);
+    }
+}
+
+static BOOL __stdcall mock_request_proc(
+    int PluginNr,
+    int RequestType,
+    WCHAR* CustomTitle,
+    WCHAR* CustomText,
+    WCHAR* ReturnedText,
+    int maxlen
+) {
+    (void)PluginNr;
+    (void)CustomTitle;
+    (void)CustomText;
+    if (RequestType == RT_Password) {
+        g_mock_pwd_calls++;
+        if (!g_mock_pwd_accept) {
+            return FALSE;
+        }
+        wcsncpy_s(ReturnedText, (size_t)maxlen, L"secret", _TRUNCATE);
+        return TRUE;
+    }
+    if (RequestType == RT_MsgOK) {
+        g_mock_msgok_calls++;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Test 7: WFX virtual path validation, missing restic.exe diagnostic, and user password cancel */
+static void test_wfx_routing_and_callbacks(void) {
+    WCHAR plugin_dir[MAX_PATH] = {0};
+    WCHAR ini_path[MAX_PATH]   = {0};
+    WCHAR dummy_exe[MAX_PATH]  = {0};
+    make_temp_dir(L"restic_wfx_route", plugin_dir, MAX_PATH);
+    swprintf_s(ini_path, MAX_PATH, L"%ls\\%ls", plugin_dir, CONFIG_INI_FILENAME);
+    swprintf_s(dummy_exe, MAX_PATH, L"%ls\\restic.exe", plugin_dir);
+
+    write_text_file(ini_path, "[Repositories]\r\nMyRepo=D:\\SomeRepo\r\n");
+    config_set_plugin_dir(plugin_dir);
+    config_set_fallback_dir(L"");
+
+    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    WCHAR* saved_path = (WCHAR*)calloc((size_t)need + 1, sizeof(WCHAR));
+    if (need > 0 && saved_path) {
+        GetEnvironmentVariableW(L"PATH", saved_path, need);
+    }
+    SetEnvironmentVariableW(L"PATH", L"C:\\no_such_dir_restic_test");
+
+    FsInitW(7, NULL, mock_log_proc, mock_request_proc);
+
+    WIN32_FIND_DATAW fd;
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(NULL, &fd) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_INVALID_PARAMETER, "NULL Path rejected");
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\", NULL) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_INVALID_PARAMETER, "NULL FindData rejected");
+
+    /* Unknown alias or malformed snapshot folder fails with ERROR_PATH_NOT_FOUND before prompting */
+    g_mock_pwd_calls = g_mock_msgok_calls = g_mock_log_calls = 0;
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\UnknownAlias", &fd) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_PATH_NOT_FOUND, "Unknown repository alias rejected");
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\MyRepo\\not_a_snapshot_folder", &fd) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_PATH_NOT_FOUND, "Invalid snapshot folder name rejected");
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\MyRepo\\2026-10-18_12-00-00_[not_hex!]\\sub", &fd) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_PATH_NOT_FOUND, "Non-hex snapshot ID rejected");
+    EXPECT_TRUE(g_mock_pwd_calls == 0 && g_mock_msgok_calls == 0,
+                "Invalid paths must not prompt for a password or show error dialogs");
+
+    /* Missing restic.exe reports ERROR_FILE_NOT_FOUND + LogProc + RT_MsgOK without asking password */
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\MyRepo", &fd) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_FILE_NOT_FOUND, "Missing restic.exe returns ERROR_FILE_NOT_FOUND");
+    EXPECT_TRUE(g_mock_pwd_calls == 0, "Missing restic.exe does not prompt for password");
+    EXPECT_TRUE(g_mock_msgok_calls == 1 && g_mock_log_calls == 1, "Missing restic.exe notifies user and log");
+    EXPECT_TRUE(wcsstr(g_mock_last_log, L"restic.exe not found") != NULL, "Log mentions restic.exe not found");
+
+    /* Place a dummy restic.exe and verify that cancelling the password prompt returns ERROR_CANCELLED */
+    write_text_file(dummy_exe, "MZ");
+    g_mock_pwd_accept  = FALSE;
+    g_mock_pwd_calls   = 0;
+    g_mock_msgok_calls = 0;
+    g_mock_log_calls   = 0;
+    SetLastError(0);
+    EXPECT_TRUE(FsFindFirstW(L"\\MyRepo", &fd) == INVALID_HANDLE_VALUE &&
+                GetLastError() == ERROR_CANCELLED, "Cancelled password prompt returns ERROR_CANCELLED");
+    EXPECT_TRUE(g_mock_pwd_calls == 1 && g_mock_msgok_calls == 0,
+                "Cancelled password prompt asks once and shows no error dialog");
+
+    FsInitW(0, NULL, NULL, NULL);
+    if (saved_path) {
+        SetEnvironmentVariableW(L"PATH", saved_path);
+        free(saved_path);
+    }
+    DeleteFileW(dummy_exe);
+    DeleteFileW(ini_path);
+    RemoveDirectoryW(plugin_dir);
+}
+
 int main(void) {
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
@@ -401,6 +535,7 @@ int main(void) {
     test_repositories_parsing_and_wfx_root();
     test_restic_lookup_ignores_current_directory();
     test_large_repository_list();
+    test_wfx_routing_and_callbacks();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     EXPECT_TRUE(_CrtCheckMemory(), "CRT heap integrity check must pass");

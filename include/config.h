@@ -57,13 +57,21 @@ const WCHAR* config_get_fallback_dir(void);
 
 /**
  * Resolves the path to restic_plugin.ini:
- * 1. Primary: <plugin_dir>\restic_plugin.ini (if existing and readable).
- * 2. Fallback: <fallback_dir>\restic_plugin.ini (creates default file if create_if_missing is TRUE).
- * 3. If no fallback_dir is set, uses <plugin_dir>\restic_plugin.ini.
+ * 1. Primary: <plugin_dir>\restic_plugin.ini (if existing).
+ * 2. Fallback: <fallback_dir>\restic_plugin.ini (if existing).
+ * 3. If neither exists and create_if_missing is TRUE: creates the default commented template in
+ *    <plugin_dir>\restic_plugin.ini first, falling back to <fallback_dir>\restic_plugin.ini when
+ *    <plugin_dir> is unset or not writable.
  *
  * Returns TRUE if a valid INI file exists (or was created) at out_path.
  */
 BOOL config_resolve_ini_path(WCHAR* out_path, size_t out_capacity, BOOL create_if_missing);
+
+/**
+ * Ensures that restic_plugin.ini exists on disk (creating the commented sample in <plugin_dir>
+ * or, if not writable, in <fallback_dir>). Called during plugin initialization.
+ */
+BOOL config_ensure_default_ini(void);
 
 /**
  * Resolves the Restic CLI executable path in priority order:
