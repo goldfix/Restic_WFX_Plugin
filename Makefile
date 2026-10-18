@@ -6,6 +6,7 @@
 #   nmake /nologo test             -> Build and run unit tests
 #   nmake /nologo test ASAN=1      -> Build and run unit tests with AddressSanitizer
 #   nmake /nologo analyze          -> Run MSVC static analysis (/analyze)
+#   nmake /nologo package          -> Build Release plugin and create installation ZIP
 #   nmake /nologo clean            -> Remove build artifacts
 # ==============================================================================
 
@@ -25,6 +26,8 @@ RC_FILE         = src\restic_wfx.rc
 ICO_FILE        = logo\restic_wfx.ico
 INI_TEMPLATE    = restic_plugin.ini
 INI_OUT         = $(BUILD_DIR)\restic_plugin.ini
+PLUGINST_FILE   = pluginst.inf
+PLUGINST_OUT    = $(BUILD_DIR)\pluginst.inf
 
 CC   = cl.exe
 LINK = link.exe
@@ -69,13 +72,16 @@ PLUGIN_OBJS = $(BUILD_DIR)\main.obj $(BUILD_DIR)\config.obj $(BUILD_DIR)\restic_
 TEST_CONFIG_OBJS = $(BUILD_DIR)\test_config.obj $(PLUGIN_OBJS)
 TEST_CLI_OBJS    = $(BUILD_DIR)\test_restic_cli.obj $(PLUGIN_OBJS)
 
-all: $(BUILD_DIR) $(PLUGIN_OUT) $(INI_OUT)
+all: $(BUILD_DIR) $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT)
 
 $(BUILD_DIR):
 	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)"
 
 $(INI_OUT): $(BUILD_DIR) $(INI_TEMPLATE)
 	copy /Y "$(INI_TEMPLATE)" "$(INI_OUT)" >nul
+
+$(PLUGINST_OUT): $(BUILD_DIR) $(PLUGINST_FILE)
+	copy /Y "$(PLUGINST_FILE)" "$(PLUGINST_OUT)" >nul
 
 $(BUILD_DIR)\main.obj: $(BUILD_DIR) src\main.c include\fsplugin.h include\config.h
 	$(CC) /c $(CFLAGS) src\main.c
@@ -115,7 +121,7 @@ $(TEST_DLL_OUT): $(BUILD_DIR)\test_plugin_dll.obj
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(BUILD_DIR)\test_plugin_dll.obj /link $(LFLAGS_CFG) /OUT:$(TEST_DLL_OUT)
 
 # The DLL smoke test needs the plugin binary; AddressSanitizer runs only exercise the unit tests
-TEST_DEPS = $(INI_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
+TEST_DEPS = $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
 !IF "$(ASAN)" != "1"
 TEST_DEPS = $(PLUGIN_OUT) $(TEST_DEPS)
 !ENDIF
@@ -126,7 +132,11 @@ test: $(TEST_DEPS)
 	$(TEST_DLL_OUT)
 
 analyze:
-	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
+	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
+
+package:
+	$(MAKE) /nologo CONFIG=Release all
+	python -c "import re, zipfile; ver = re.search(r'RESTIC_WFX_PRODUCT_VER\s+\"([^\"]+)\"', open('include/version.h').read()).group(1); inf = open('build/pluginst.inf').read(); assert f'version={ver}' in inf and 'file=restic.wfx64' in inf; zpath = f'build/wfx_restic_{ver}_x64.zip'; zf = zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED); [zf.write(src, arc) for src, arc in [('build/pluginst.inf','pluginst.inf'),('build/restic.wfx64','restic.wfx64'),('build/restic_plugin.ini','restic_plugin.ini'),('README.md','README.md'),('LICENSE','LICENSE')]]; zf.close(); print(f'[PACKAGE] Created {zpath} ({len(zf.namelist())} files)')"
 
 clean:
 	@if exist "$(BUILD_DIR)" rmdir /s /q "$(BUILD_DIR)"

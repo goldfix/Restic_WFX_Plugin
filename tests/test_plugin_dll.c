@@ -196,6 +196,15 @@ static void test_export_surface(void) {
     }
     EXPECT_TRUE(foundFixed, "VS_FIXEDFILEINFO matches RESTIC_WFX_VERSION_CSV and VFT_DLL");
 
+    /* Verify staged build\pluginst.inf manifest matches Total Commander auto-install specification */
+    WCHAR infType[32] = {0}, infFile[64] = {0}, infVer[32] = {0};
+    GetPrivateProfileStringW(L"plugininstall", L"type", L"", infType, _countof(infType), L"build\\pluginst.inf");
+    GetPrivateProfileStringW(L"plugininstall", L"file", L"", infFile, _countof(infFile), L"build\\pluginst.inf");
+    GetPrivateProfileStringW(L"plugininstall", L"version", L"", infVer, _countof(infVer), L"build\\pluginst.inf");
+    EXPECT_TRUE(wcscmp(infType, L"wfx") == 0 && wcscmp(infFile, L"restic.wfx64") == 0 &&
+                wcscmp(infVer, L"" RESTIC_WFX_PRODUCT_VER) == 0,
+                "Staged build\\pluginst.inf has valid [plugininstall] type, file, and version");
+
     FreeLibrary(m);
 }
 

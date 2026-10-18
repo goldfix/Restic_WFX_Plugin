@@ -71,15 +71,28 @@ This plugin uses the official **Restic** command-line binary (`restic.exe`) unde
 
 ## Installation in Total Commander
 
-1. Obtain `restic.wfx64` and the sample `restic_plugin.ini` (from a [GitHub Release](https://github.com/goldfix/totalcmd_restic_plugin/releases) or by building from source into `build\`).
-2. Copy `restic.wfx64` (and optionally `restic.exe`) into a dedicated plugin folder, for example:
+### Option A: Automatic Installation (Recommended)
+
+1. Download `wfx_restic_<version>_x64.zip` from the [GitHub Releases](https://github.com/goldfix/totalcmd_restic_plugin/releases) page.
+2. In Total Commander, navigate to the ZIP file and **double-click it** (or press `Enter`).
+3. Total Commander reads the bundled `pluginst.inf`, asks where to install the plugin (default: `plugins\wfx\restic`) and registers it automatically as **`Restic Backups`** in Network Neighborhood.
+4. Edit `restic_plugin.ini` (extracted next to `restic.wfx64`) and add your repositories (see below).
+5. Open **Network Neighborhood** (`Alt+F1` / `Alt+F2` -> `\`) and enter **`Restic Backups`**.
+
+The ZIP contains: `pluginst.inf`, `restic.wfx64`, `restic_plugin.ini` (commented sample), `README.md` and `LICENSE`.
+
+> If a `restic_plugin.ini` already exists in the target folder (upgrade), make sure to keep your own copy of it: Total Commander may ask before overwriting files.
+
+### Option B: Manual Installation
+
+1. Extract `restic.wfx64` and `restic_plugin.ini` (from the ZIP, or from `build\` after building from source) and copy them (optionally together with `restic.exe`) into a dedicated plugin folder, for example:
    ```text
    C:\TotalCmd\plugins\wfx\restic\restic.wfx64
    ```
-3. In Total Commander, open **Configuration** -> **Options...** -> **Plugins** -> **File system plugins (.WFX)** -> click **Configure**.
-4. Click **Add**, select `restic.wfx64`, and confirm with **OK**.
-5. Copy `restic_plugin.ini` to one of the supported configuration locations (see below) and add your repositories.
-6. Open **Network Neighborhood** (`Alt+F1` / `Alt+F2` -> `\`) and enter **`Restic Backups`**.
+2. In Total Commander, open **Configuration** -> **Options...** -> **Plugins** -> **File system plugins (.WFX)** -> click **Configure**.
+3. Click **Add**, select `restic.wfx64`, and confirm with **OK**.
+4. Edit `restic_plugin.ini` (see below) and add your repositories.
+5. Open **Network Neighborhood** (`Alt+F1` / `Alt+F2` -> `\`) and enter **`Restic Backups`**.
 
 ---
 
@@ -186,6 +199,7 @@ Using the Git Bash / MSYS2 wrapper (`build.sh`) or directly via `nmake`:
 ./build.sh release-test  # Build & run all 3 test suites against the Release build
 ./build.sh analyze       # Run MSVC Static Code Analyzer (/analyze) with warnings-as-errors (/W4 /WX)
 ./build.sh asan          # Run unit tests under MSVC AddressSanitizer (/fsanitize=address)
+./build.sh package       # Clean, build Release, run tests and create build/wfx_restic_<version>_x64.zip
 ./build.sh clean         # Clean build/ directory (run before switching between Debug/Release/ASan)
 ```
 
@@ -199,6 +213,8 @@ nmake /nologo CONFIG=Debug test
 Build artifacts are generated in `build\`:
 - `build\restic.wfx64` — 64-bit Total Commander WFX plugin DLL (with embedded multi-resolution icon and `VERSIONINFO` metadata)
 - `build\restic_plugin.ini` — Commented sample configuration file ready for deployment
+- `build\pluginst.inf` — Total Commander auto-install manifest (`[plugininstall]`)
+- `build\wfx_restic_<version>_x64.zip` — Release package (only with `./build.sh package`), installable by double-clicking it in Total Commander. The version is read from `include\version.h`.
 
 ---
 

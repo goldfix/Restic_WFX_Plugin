@@ -11,6 +11,7 @@
 #   ./build.sh release-test # Build and run unit tests against the optimized /MT build
 #   ./build.sh asan         # Build and run unit tests with AddressSanitizer
 #   ./build.sh analyze      # Run MSVC static code analysis (/analyze)
+#   ./build.sh package      # Build Release, run tests, and create Total Commander installation ZIP
 #   ./build.sh clean        # Clean build directory
 # ==============================================================================
 set -euo pipefail
@@ -61,11 +62,16 @@ case "${ACTION}" in
         run_nmake clean
         run_nmake CONFIG=Debug ANALYZE=1 all test
         ;;
+    package)
+        run_nmake clean
+        run_nmake CONFIG=Release test
+        run_nmake CONFIG=Release package
+        ;;
     clean)
         run_nmake clean
         ;;
     *)
-        echo "Usage: $0 {debug|release|test|release-test|asan|analyze|clean}" >&2
+        echo "Usage: $0 {debug|release|test|release-test|asan|analyze|package|clean}" >&2
         exit 1
         ;;
 esac
