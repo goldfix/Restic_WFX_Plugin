@@ -43,9 +43,11 @@ TEST_LIBS     = Shell32.lib
 !IF "$(CONFIG)" == "Release"
 CFLAGS_CFG = /MT /O2 /Zi /DNDEBUG
 LFLAGS_CFG = $(LFLAGS_COMMON) /OPT:REF /OPT:ICF
+RCFLAGS    = /nologo /Iinclude /DNDEBUG
 !ELSE
 CFLAGS_CFG = /MTd /Zi /Od /D_DEBUG
 LFLAGS_CFG = $(LFLAGS_COMMON)
+RCFLAGS    = /nologo /Iinclude /D_DEBUG
 !ENDIF
 
 CFLAGS_EXTRA =
@@ -93,8 +95,8 @@ $(BUILD_DIR)\test_config.obj: $(BUILD_DIR) tests\test_config.c include\config.h 
 $(BUILD_DIR)\test_restic_cli.obj: $(BUILD_DIR) tests\test_restic_cli.c include\restic_cli.h include\fsplugin.h
 	$(CC) /c $(CFLAGS) tests\test_restic_cli.c
 
-$(PLUGIN_RES): $(BUILD_DIR) $(RC_FILE) $(ICO_FILE)
-	$(RC) /nologo /fo$(PLUGIN_RES) $(RC_FILE)
+$(PLUGIN_RES): $(BUILD_DIR) $(RC_FILE) $(ICO_FILE) include\version.h
+	$(RC) $(RCFLAGS) /fo$(PLUGIN_RES) $(RC_FILE)
 
 $(PLUGIN_OUT): $(PLUGIN_OBJS) $(PLUGIN_RES) $(DEF_FILE)
 	$(CC) /nologo /LD $(CFLAGS_CFG) $(CFLAGS_SAN) $(PLUGIN_OBJS) $(PLUGIN_RES) $(SYSLIBS) /link $(LFLAGS_CFG) /DEF:$(DEF_FILE) /IMPLIB:$(PLUGIN_LIB) /OUT:$(PLUGIN_OUT)
@@ -105,7 +107,7 @@ $(TEST_CONFIG_OUT): $(TEST_CONFIG_OBJS)
 $(TEST_CLI_OUT): $(TEST_CLI_OBJS)
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(TEST_CLI_OBJS) $(SYSLIBS) $(TEST_LIBS) /link $(LFLAGS_CFG) /OUT:$(TEST_CLI_OUT)
 
-$(BUILD_DIR)\test_plugin_dll.obj: $(BUILD_DIR) tests\test_plugin_dll.c
+$(BUILD_DIR)\test_plugin_dll.obj: $(BUILD_DIR) tests\test_plugin_dll.c include\version.h
 	$(CC) /c $(CFLAGS) tests\test_plugin_dll.c
 
 # Black-box smoke test: loads build\restic.wfx64 like Total Commander does (links no plugin code)

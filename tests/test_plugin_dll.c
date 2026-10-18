@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include "version.h"
 
 #define PLUGIN_DLL L"build\\restic.wfx64"
 
@@ -174,6 +175,26 @@ static void test_export_surface(void) {
         HRSRC hIcon = FindResourceW(m, MAKEINTRESOURCEW(id), (LPCWSTR)RT_ICON);
         EXPECT_TRUE(hIcon != NULL && SizeofResource(m, hIcon) > 0, "Embedded RT_ICON frame present");
     }
+
+    /* Verify embedded VS_VERSION_INFO resource (FileVersion, ProductName, VS_FIXEDFILEINFO signature) */
+    HRSRC hVer = FindResourceW(m, MAKEINTRESOURCEW(VS_VERSION_INFO), (LPCWSTR)RT_VERSION);
+    DWORD verSize = hVer ? SizeofResource(m, hVer) : 0;
+    HGLOBAL hVerMem = hVer ? LoadResource(m, hVer) : NULL;
+    const BYTE* verBytes = hVerMem ? (const BYTE*)LockResource(hVerMem) : NULL;
+    EXPECT_TRUE(verBytes != NULL && verSize >= 92, "Embedded RT_VERSION (VS_VERSION_INFO) resource present");
+    BOOL foundFixed = FALSE;
+    DWORD expectedMS = ((DWORD)RESTIC_WFX_VER_MAJOR << 16) | (DWORD)RESTIC_WFX_VER_MINOR;
+    DWORD expectedLS = ((DWORD)RESTIC_WFX_VER_PATCH << 16) | (DWORD)RESTIC_WFX_VER_BUILD;
+    for (DWORD off = 0; verBytes && off + sizeof(VS_FIXEDFILEINFO) <= verSize; off += 4) {
+        const VS_FIXEDFILEINFO* ffi = (const VS_FIXEDFILEINFO*)(verBytes + off);
+        if (ffi->dwSignature == 0xFEEF04BDu) {
+            foundFixed = (ffi->dwFileVersionMS == expectedMS && ffi->dwFileVersionLS == expectedLS &&
+                          ffi->dwProductVersionMS == expectedMS && ffi->dwProductVersionLS == expectedLS &&
+                          ffi->dwFileType == VFT_DLL);
+            break;
+        }
+    }
+    EXPECT_TRUE(foundFixed, "VS_FIXEDFILEINFO matches RESTIC_WFX_VERSION_CSV and VFT_DLL");
 
     FreeLibrary(m);
 }
