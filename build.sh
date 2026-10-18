@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Build & Test wrapper script for Restic Total Commander WFX Plugin
-# Loads the Portable MSVC x64 environment and invokes NMake.
+# Requires an active MSVC (x64) environment (cl.exe, link.exe, nmake.exe).
 #
 # Usage:
 #   ./build.sh              # Build Debug plugin (default)
@@ -14,11 +14,24 @@
 # ==============================================================================
 set -euo pipefail
 
-MSVC_SETUP="D:\\_progetti\\_tool_\\msvc\\msvc\\setup_x64.bat"
 ACTION="${1:-debug}"
 
+# Under MSYS2 / Git Bash, convert POSIX-style drive prefixes (/c/..., /d/...)
+# in INCLUDE and LIB to Windows drive prefixes (C:/..., D:/...) required by cl.exe/link.exe.
+normalize_win_env_list() {
+    local val="${1:-}"
+    echo "${val}" | sed -E 's (^|;)/([a-zA-Z])/ \1\U\2:/ g'
+}
+
+if [[ -n "${INCLUDE:-}" ]]; then
+    export INCLUDE="$(normalize_win_env_list "${INCLUDE}")"
+fi
+if [[ -n "${LIB:-}" ]]; then
+    export LIB="$(normalize_win_env_list "${LIB}")"
+fi
+
 run_nmake() {
-    cmd.exe //c "${MSVC_SETUP} && nmake /nologo $*"
+    MSYS2_ARG_CONV_EXCL="*" nmake -nologo "$@"
 }
 
 case "${ACTION}" in

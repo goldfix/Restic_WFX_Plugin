@@ -4,7 +4,7 @@
 
 - ✅ **Project Skeleton & WFX Exports**: Initial WFX entry points (`FsInitW`, `FsGetDefRootName`, `FsSetDefaultParams`, `FsFindFirstW`, `FsFindNextW`, `FsFindClose`) and mandatory ANSI stubs (`FsInit`, `FsFindFirst`, `FsFindNext`).
 - ✅ **Build System & Compiler Hardening (`Makefile`, `build.sh`, `.vscode/tasks.json`, `.clang-format`)**:
-  - Incremental NMake `Makefile` + `build.sh` wrapper loading Portable MSVC x64 (`D:\_progetti\_tool_\msvc\msvc\setup_x64.bat`).
+  - Environment-agnostic incremental NMake `Makefile` + `build.sh` wrapper for MSVC x64 (`cl.exe`, `link.exe`, `nmake.exe`).
   - Strict pure C11 flags (`/TC /std:c11 /permissive- /W4 /WX /we4013`, strictly no C++), static CRT (`/MT` Release, `/MTd` Debug), binary hardening (`/GS`, `/DYNAMICBASE`, `/NXCOMPAT`), CRT Debug Heap leak checking (`<crtdbg.h>`), AddressSanitizer (`ASAN=1`), and MSVC static analysis (`ANALYZE=1`).
 - ✅ **Configuration Management (`config.h` / `config.c`)**:
   - Primary (`<plugin_dir>\restic_plugin.ini`) and fallback (`DefaultIniName` directory from `FsSetDefaultParams`) INI path resolution with automatic default template creation.
@@ -33,8 +33,8 @@
 3. **Explicit Directory Setters for Unit Testing**
    - `config_set_plugin_dir()` and `config_set_fallback_dir()` decouple configuration logic from `DllMain` (`HMODULE`) and Total Commander runtime state, allowing deterministic unit testing in `tests/test_config.c`.
 
-4. **NMake `Makefile` + `build.sh` Wrapper & Static CRT (`/MT` / `/MTd`)**
-   - The environment uses Portable MSVC x64 (`cl.exe`, `link.exe`, `nmake.exe`) without external CMake/Ninja installations. An NMake `Makefile` paired with `build.sh` provides incremental `.obj` compilation and unified targets (`debug`, `release`, `test`, `asan`, `analyze`, `clean`).
+4. **Environment-Agnostic NMake `Makefile` + `build.sh` Wrapper & Static CRT (`/MT` / `/MTd`)**
+   - The repository contains zero hardcoded machine paths (no hardcoded batch setup scripts or absolute compiler paths). Anyone cloning the repo simply runs `./build.sh` or `nmake` from an initialized MSVC x64 environment.
    - Static CRT linking (`/MT` in Release, `/MTd` in Debug) embeds the C runtime into `restic.wfx64`, eliminating any dependency on external `VCRUNTIME140.dll` redistributables on target machines.
 
 5. **Dual Memory Safety Verification (CRT Debug Heap + AddressSanitizer)**
@@ -56,6 +56,10 @@
 - **NMake Line Continuation After Trailing Backslash**:
   - *Issue:* Writing `/Fd$(BUILD_DIR)\` at the end of a line in an NMake `Makefile` treats the trailing `\` as a line-continuation character, swallowing the path separator.
   - *Solution:* Always specify an explicit filename such as `/Fd$(BUILD_DIR)\vc.pdb` when placing compiler PDB flags in NMake variables.
+
+- **MSYS2 / Git Bash `/usr/bin/link.exe` Collision & POSIX Drive Prefixes**:
+  - *Issue:* In Git Bash environments, `/usr/bin/link.exe` (GNU coreutils hard-link tool) can shadow MSVC's `link.exe`, and POSIX paths (`/d/...`) inside `INCLUDE`/`LIB` are not understood by native Win32 `cl.exe`.
+  - *Solution:* Link via `cl.exe ... /link ...` in `Makefile` (so `cl.exe` invokes its own companion `link.exe`), and normalize POSIX drive prefixes in `INCLUDE`/`LIB` inside `build.sh`.
 
 ---
 

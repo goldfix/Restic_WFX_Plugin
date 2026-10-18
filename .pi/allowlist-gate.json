@@ -21,7 +21,11 @@
     "shell:./build.sh asan",
     "shell:./build.sh release",
     "shell:rm -f build.pdb",
-    "shell:ls -la build"
+    "shell:ls -la build",
+    "shell:nmake /nologo clean",
+    "shell:nmake /nologo CONFIG=Debug all",
+    "shell:nmake -nologo clean",
+    "shell:nmake -nologo CONFIG=Debug all"
   ],
   "deny": []
 }

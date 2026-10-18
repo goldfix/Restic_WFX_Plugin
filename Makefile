@@ -1,6 +1,6 @@
 # ==============================================================================
 # NMake Makefile for Restic Total Commander WFX Plugin (x64)
-# Usage (after running setup_x64.bat, or via ./build.sh):
+# Usage (with MSVC x64 environment configured, or via ./build.sh):
 #   nmake /nologo                  -> Build Debug plugin (build\restic.wfx64)
 #   nmake /nologo CONFIG=Release   -> Build Release plugin (static CRT /MT)
 #   nmake /nologo test             -> Build and run unit tests
@@ -75,10 +75,10 @@ $(BUILD_DIR)\test_config.obj: $(BUILD_DIR) tests\test_config.c include\config.h 
 	$(CC) /c $(CFLAGS) tests\test_config.c
 
 $(PLUGIN_OUT): $(PLUGIN_OBJS) $(DEF_FILE)
-	$(LINK) /DLL $(LFLAGS_CFG) /DEF:$(DEF_FILE) /IMPLIB:$(PLUGIN_LIB) /OUT:$(PLUGIN_OUT) $(PLUGIN_OBJS) $(SYSLIBS)
+	$(CC) /nologo /LD $(CFLAGS_CFG) $(CFLAGS_SAN) $(PLUGIN_OBJS) $(SYSLIBS) /link $(LFLAGS_CFG) /DEF:$(DEF_FILE) /IMPLIB:$(PLUGIN_LIB) /OUT:$(PLUGIN_OUT)
 
 $(TEST_OUT): $(TEST_OBJS)
-	$(LINK) $(LFLAGS_CFG) /OUT:$(TEST_OUT) $(TEST_OBJS) $(SYSLIBS)
+	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(TEST_OBJS) $(SYSLIBS) /link $(LFLAGS_CFG) /OUT:$(TEST_OUT)
 
 test: $(TEST_OUT)
 	$(TEST_OUT)
