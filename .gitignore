@@ -2,7 +2,6 @@
 #  test-py template — .gitignore
 # ==========================================================
 
-cJSON/
 build/
 
 # --- Secrets & ambiente locale (MAI committare) -----------

@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Build & Test wrapper script for Restic Total Commander WFX Plugin
-# Loads the Portable MSVC x64 environment and invokes NMake.
+# Requires an active MSVC (x64) environment (cl.exe, link.exe, nmake.exe).
 #
 # Usage:
 #   ./build.sh              # Build Debug plugin (default)
 #   ./build.sh debug        # Build Debug plugin (/MTd)
 #   ./build.sh release      # Build Release plugin (/MT, optimized)
 #   ./build.sh test         # Build and run unit tests (Debug + CRT Leak Check)
+#   ./build.sh release-test # Build and run unit tests against the optimized /MT build
 #   ./build.sh asan         # Build and run unit tests with AddressSanitizer
 #   ./build.sh analyze      # Run MSVC static code analysis (/analyze)
 #   ./build.sh clean        # Clean build directory
 # ==============================================================================
 set -euo pipefail
 
-MSVC_SETUP="D:\\_progetti\\_tool_\\msvc\\msvc\\setup_x64.bat"
 ACTION="${1:-debug}"
 
+# Under MSYS2 / Git Bash, convert POSIX-style drive prefixes (/c/..., /d/...)
+# in INCLUDE and LIB to Windows drive prefixes (C:/..., D:/...) required by cl.exe/link.exe.
+normalize_win_env_list() {
+    local val="${1:-}"
+    echo "${val}" | sed -E 's (^|;)/([a-zA-Z])/ \1\U\2:/ g'
+}
+
+if [[ -n "${INCLUDE:-}" ]]; then
+    export INCLUDE="$(normalize_win_env_list "${INCLUDE}")"
+fi
+if [[ -n "${LIB:-}" ]]; then
+    export LIB="$(normalize_win_env_list "${LIB}")"
+fi
+
 run_nmake() {
-    cmd.exe //c "${MSVC_SETUP} && nmake /nologo $*"
+    MSYS2_ARG_CONV_EXCL="*" nmake -nologo "$@"
 }
 
 case "${ACTION}" in
@@ -30,6 +44,9 @@ case "${ACTION}" in
         ;;
     test)
         run_nmake CONFIG=Debug test
+        ;;
+    release-test)
+        run_nmake CONFIG=Release test
         ;;
     asan)
         run_nmake clean
@@ -43,7 +60,7 @@ case "${ACTION}" in
         run_nmake clean
         ;;
     *)
-        echo "Usage: $0 {debug|release|test|asan|analyze|clean}" >&2
+        echo "Usage: $0 {debug|release|test|release-test|asan|analyze|clean}" >&2
         exit 1
         ;;
 esac
