@@ -3,6 +3,7 @@
 # ==========================================================
 
 build/
+MEMORY.md
 
 # --- Secrets & ambiente locale (MAI committare) -----------
 .env
