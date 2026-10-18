@@ -471,6 +471,13 @@ static void test_missing_ini_is_harmless(void) {
     /* RemoveDirectoryW only succeeds on empty directories: nothing was written anywhere */
     EXPECT_TRUE(RemoveDirectoryW(plugin_dir), "Plugin directory is still empty (no INI auto-created)");
     EXPECT_TRUE(RemoveDirectoryW(fallback_dir), "Fallback directory is still empty (no INI auto-created)");
+
+    /* Verify that the sample restic_plugin.ini staged in build\ by the build system is valid and all-commented */
+    ResticConfig sample_cfg;
+    EXPECT_TRUE(config_load_from_file(L"build\\restic_plugin.ini", &sample_cfg) && sample_cfg.repo_count == 0,
+                "Staged build\\restic_plugin.ini template exists and has all repositories commented out");
+    config_free(&sample_cfg);
+
     FsInitW(0, NULL, NULL, NULL);
 }
 

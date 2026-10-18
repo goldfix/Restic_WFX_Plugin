@@ -44,7 +44,7 @@ The primary goal of Phase 1 (MVP) is to provide interactive, read-only browsing 
 
 1. **Primary Lookup:** inside the directory containing the plugin DLL (`<plugin_dir>\restic_plugin.ini`), resolved at load time in `DllMain` via `GetModuleFileNameW`.
 2. **Fallback:** if `<plugin_dir>\restic_plugin.ini` does not exist (e.g., when installed under a shared/read-only path such as `C:\Program Files\`), the plugin looks for `restic_plugin.ini` inside the directory supplied by Total Commander via `FsSetDefaultParams` (`DefaultIniName`, typically `%APPDATA%\GHISLER\`).
-3. **No Auto-Creation:** the plugin never creates or modifies `restic_plugin.ini` on disk. If neither file exists: the root listing (``) returns `ERROR_NO_MORE_FILES` (empty folder), `<Alias>[...]` listings return `ERROR_PATH_NOT_FOUND`, and `FsGetFileW` returns `FS_FILE_NOTFOUND`; no password prompt and no popup are shown.
+3. **No Auto-Creation at Runtime (Sample Template in Repo):** the plugin DLL never creates or modifies `restic_plugin.ini` on disk. If neither file exists: the root listing (`\`) returns `ERROR_NO_MORE_FILES` (empty folder), `\<Alias>[...]` listings return `ERROR_PATH_NOT_FOUND`, and `FsGetFileW` returns `FS_FILE_NOTFOUND`; no password prompt and no popup are shown. A fully commented sample `restic_plugin.ini` is tracked in the repository root and copied to `build\restic_plugin.ini` by `Makefile` during builds so the `build\` folder is ready for deployment.
 
 ### 3.2 INI File Structure
 
@@ -118,6 +118,13 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
 
 *Note:* Modification, deletion, and move functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally omitted to enforce strict read-only repository access.
 
+### 5.1 Plugin Icon Specification (Total Commander WFX Standard)
+
+- **Network Neighborhood Root Icon (recommended):** Total Commander automatically displays the **first `ICON` resource (by index)** embedded inside `restic.wfx64` to the left of `"Restic Backups"` in Network Neighborhood (no extra exported function is required). Per the official WFX specification:
+  - Format: standard Windows **`.ico`** file linked into the DLL via a `.rc` resource script (`rc.exe` -> `.res`).
+  - Required & recommended sizes inside the `.ico`: must include at least **16×16** pixels; a multi-resolution `.ico` containing **16×16, 24×24, 32×32, 48×48** (32-bit RGBA uncompressed BMP/DIB frames) plus **256×256** (PNG-compressed) covers standard and High-DPI displays cleanly.
+- **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
+
 ---
 
 ## 6. Source Tree Structure
@@ -128,6 +135,8 @@ totalcmd_plugin/
 ├── build.sh                    # Bash wrapper (expects an initialized MSVC x64 environment) invoking NMake
 ├── .clang-format               # Code formatting rules (C11, 4 spaces, 100 cols)
 ├── restic_wfx.def              # Explicit DLL exports to prevent MSVC name mangling
+├── restic_plugin.ini           # Commented sample configuration file (copied to build\restic_plugin.ini)
+├── logo.png                    # Project mascot/logo image
 ├── cJSON/
 │   ├── cJSON.h                 # cJSON parser header
 │   └── cJSON.c                 # cJSON parser implementation
@@ -250,7 +259,7 @@ If Total Commander still has `build/restic.wfx64` loaded, `build.sh` renames the
 
 | Program | Scope |
 | --- | --- |
-| `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, and the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty) (78-79 assertions). |
+| `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty), and verification that the staged `build\restic_plugin.ini` sample template is valid and has 0 active repositories (79-80 assertions). |
 | `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe` including `restic_dump_file` streaming extraction, mtime preservation, 0-byte and 100 KB files, overwrite protection, binary fidelity (`00/0A/0D/1A` bytes), existing target preserved on every failure or abort, no leftover `~rp*.tmp`, local-side failures, argument validation, plus `test_dump_with_fake_restic` (a fake `restic` batch file that deterministically covers exit codes 10/11/12/other, stderr classification, partial output then failure, empty stderr, environment injection and the inactivity timeout: a silent child is killed, a slow but steady one survives) (273 assertions). |
 | `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 11-function export surface (`FsGetFile`/`FsGetFileW` included; write/delete/move functions forbidden), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads (151 assertions). |
 

@@ -20,6 +20,8 @@ TEST_CONFIG_OUT = $(BUILD_DIR)\test_config.exe
 TEST_CLI_OUT    = $(BUILD_DIR)\test_restic_cli.exe
 TEST_DLL_OUT    = $(BUILD_DIR)\test_plugin_dll.exe
 DEF_FILE        = restic_wfx.def
+INI_TEMPLATE    = restic_plugin.ini
+INI_OUT         = $(BUILD_DIR)\restic_plugin.ini
 
 CC   = cl.exe
 LINK = link.exe
@@ -61,10 +63,13 @@ PLUGIN_OBJS = $(BUILD_DIR)\main.obj $(BUILD_DIR)\config.obj $(BUILD_DIR)\restic_
 TEST_CONFIG_OBJS = $(BUILD_DIR)\test_config.obj $(PLUGIN_OBJS)
 TEST_CLI_OBJS    = $(BUILD_DIR)\test_restic_cli.obj $(PLUGIN_OBJS)
 
-all: $(BUILD_DIR) $(PLUGIN_OUT)
+all: $(BUILD_DIR) $(PLUGIN_OUT) $(INI_OUT)
 
 $(BUILD_DIR):
 	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)"
+
+$(INI_OUT): $(BUILD_DIR) $(INI_TEMPLATE)
+	copy /Y "$(INI_TEMPLATE)" "$(INI_OUT)" >nul
 
 $(BUILD_DIR)\main.obj: $(BUILD_DIR) src\main.c include\fsplugin.h include\config.h
 	$(CC) /c $(CFLAGS) src\main.c
@@ -101,7 +106,7 @@ $(TEST_DLL_OUT): $(BUILD_DIR)\test_plugin_dll.obj
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(BUILD_DIR)\test_plugin_dll.obj /link $(LFLAGS_CFG) /OUT:$(TEST_DLL_OUT)
 
 # The DLL smoke test needs the plugin binary; AddressSanitizer runs only exercise the unit tests
-TEST_DEPS = $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
+TEST_DEPS = $(INI_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
 !IF "$(ASAN)" != "1"
 TEST_DEPS = $(PLUGIN_OUT) $(TEST_DEPS)
 !ENDIF
@@ -112,7 +117,7 @@ test: $(TEST_DEPS)
 	$(TEST_DLL_OUT)
 
 analyze:
-	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
+	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_DLL_OUT)
 
 clean:
 	@if exist "$(BUILD_DIR)" rmdir /s /q "$(BUILD_DIR)"
