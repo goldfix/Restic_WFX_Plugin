@@ -124,7 +124,7 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
   - Format: `logo\restic_wfx.ico` linked into `restic.wfx64` via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
   - Included frames inside `logo\restic_wfx.ico` (5 resolutions): **16×16, 24×24, 32×32, 48×48** (32-bit BGRA uncompressed BMP/DIB frames) plus **256×256** (32-bit RGBA PNG-compressed), built from `logo\logo_16x16.ico`, `logo\logo_24x24.ico`, `logo\logo_32x32.ico`, `logo\logo_48x48.ico`, and `logo\logo_256x256.png`.
 - **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
-- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`0.1.0.0` / `"0.1.0"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
+- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.0.0.0` / `"1.0.0"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
 
 ---
 
@@ -145,7 +145,7 @@ totalcmd_plugin/
 │   ├── fsplugin.h              # Total Commander WFX API declarations (+ FS_SET_TIME_UNKNOWN macro)
 │   ├── config.h                # INI configuration & binary resolution interface
 │   ├── restic_cli.h            # Restic CLI child process & JSON/NDJSON parser interface
-│   └── version.h               # Single source of truth for plugin version macros (0.1.0)
+│   └── version.h               # Single source of truth for plugin version macros (1.0.0)
 ├── src/
 │   ├── main.c                  # DllMain, WFX entry points, virtual path routing
 │   ├── config.c                # restic_plugin.ini resolution & parsing

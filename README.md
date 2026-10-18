@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX64-orange.svg" alt="Total Commander WFX64" />
-  <img src="https://img.shields.io/badge/Version-0.1.0-success.svg" alt="Version: 0.1.0" />
+  <img src="https://img.shields.io/badge/Version-1.0.0-success.svg" alt="Version: 1.0.0" />
 </p>
 
 ---

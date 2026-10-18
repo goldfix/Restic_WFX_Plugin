@@ -30,7 +30,7 @@
   - Native Total Commander integration for recursive folder copy (`F5`), file viewing (`F3` / `Ctrl+Q`), while keeping modification/deletion/move (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`, `FS_COPYFLAGS_MOVE`) disabled.
 - ✅ **Extraction Code Review (Code Review 3)**: atomic temp-file replace, inactivity timeout, throttled progress, fake-restic and edge-case tests (see "Code Review 3" below).
 - ✅ **Manual Total Commander Tests** (user): initial manual verification succeeded.
-- ✅ **DLL Versioning (`include/version.h`, `src/restic_wfx.rc`) & Final Documentation (`README.md`)**: `VS_VERSION_INFO` (`0.1.0.0`) embedded in `restic.wfx64` and verified by `test_plugin_dll.c`; complete English `README.md` prepared for the v0.1.0 release.
+- ✅ **DLL Versioning (`include/version.h`, `src/restic_wfx.rc`) & Final Documentation (`README.md`)**: `VS_VERSION_INFO` (`1.0.0.0`) embedded in `restic.wfx64` and verified by `test_plugin_dll.c`; complete English `README.md` prepared for the v1.0.0 release.
 
 ---
 
@@ -213,7 +213,7 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
 
 - **Functionality:** read-only browsing and file/folder extraction are complete: `\` (aliases) -> `\<Alias>` (snapshots `YYYY-MM-DD_HH-MM-SS_[id]`) -> `\<Alias>\<Snapshot>\<dirs/files>`, plus `FsGetFileW` (`F5` copy of files and recursive folders, `F3` Lister, `Ctrl+Q` Quick View). Exported API: the 11 `Fs*` read-only + extraction functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile` are not exported, and `FS_COPYFLAGS_MOVE` is rejected with `FS_FILE_NOTSUPPORTED`).
 - **Quality gates (all green):** `./build.sh test`, `analyze`, `asan`, `release-test`; 512 assertions (`test_config` 80, `test_restic_cli` 273, `test_plugin_dll` 159). Run `./build.sh clean` when switching configuration. Live tests need `tmp/restic.exe` (git-ignored, otherwise `[SKIP]`).
-- **Next:** Ready for `v0.1.0` release tagging; optional future enhancements: streaming `ls` parser, optional directory cache, Job Object to kill child trees, UTF-8 INI.
+- **Next:** Ready for `v1.0.0` release tagging; optional future enhancements: streaming `ls` parser, optional directory cache, Job Object to kill child trees, UTF-8 INI.
 - **Conventions:** pure C11 (`/TC`), English comments/docs, UNICODE, LF endings, repository free of machine-specific paths (`grep -rnI -E 'setup_x64|_progetti' --exclude='.env' --exclude-dir=.git --exclude-dir=tmp --exclude-dir=build .` must print nothing), Python (`python`) is already active in the shell environment (do not create new venvs), user conversation in Italian, update `AGENT.md`/`MEMORY.md` after significant changes.
 
 ---
@@ -310,9 +310,9 @@ Verified non-issues: `build_error_message` copes with an empty stderr (`utf8_to_
   - Recorded in `MEMORY.md` that `python` is available with its virtual environment already active in the shell (no need to create a new venv).
 
 ### 2026-10-18 — DLL Versioning (`include/version.h`, `VS_VERSION_INFO`) & Release `README.md`
-- **Objective:** Prepare the project for its first public release (`v0.1.0`): add Windows version metadata to `restic.wfx64` ("Details" tab in Explorer/Total Commander) and write the comprehensive English `README.md`.
+- **Objective:** Prepare the project for its first public release (`v1.0.0`): add Windows version metadata to `restic.wfx64` ("Details" tab in Explorer/Total Commander) and write the comprehensive English `README.md`.
 - **Changes:**
-  - Created `include/version.h` (`0.1.0.0` / `"0.1.0"`) and added `VS_VERSION_INFO` (`VERSIONINFO`) to `src/restic_wfx.rc`; updated `Makefile` (`RCFLAGS` with `/Iinclude`).
+  - Created `include/version.h` (`1.0.0.0` / `"1.0.0"`) and added `VS_VERSION_INFO` (`VERSIONINFO`) to `src/restic_wfx.rc`; updated `Makefile` (`RCFLAGS` with `/Iinclude`).
   - Extended `test_export_surface` in `tests/test_plugin_dll.c` to inspect `RT_VERSION` (`VS_FIXEDFILEINFO` signature `0xFEEF04BD`, version numbers, and `VFT_DLL` type): 512 assertions total (80 + 273 + 159), all green across `test`, `analyze`, `asan`, `release-test`.
   - Wrote `README.md` covering plugin purpose, Restic overview and download links, Total Commander installation, `restic_plugin.ini` locations and backend examples, usage (`F5`/`F3`/`Ctrl+Q`/`ESC`), security model, build/test instructions, external libraries (`cJSON`, WFX SDK, Restic), and GitHub links.
 
