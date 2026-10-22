@@ -138,6 +138,7 @@ Restic_WFX_Plugin/
 ├── restic_wfx.def              # Explicit DLL exports to prevent MSVC name mangling
 ├── restic_plugin.ini           # Commented sample configuration file (copied to build\restic_plugin.ini)
 ├── pluginst.inf                # Total Commander auto-install manifest (copied to build\ and packed in the ZIP)
+├── .agents/skills/             # Agent skills: memory-updater, kroki-diagrams, release-packager (scripts/release.py: bump version, docs, tests, ZIP)
 ├── logo/                       # Plugin icons (.ico 16/24/32/48 + multi-res restic_wfx.ico) & PNG logos (256/512/2048)
 ├── cJSON/
 │   ├── cJSON.h                 # cJSON parser header
