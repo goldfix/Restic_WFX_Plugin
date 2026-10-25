@@ -906,6 +906,37 @@ static ResticResult run_and_check(
     return res;
 }
 
+ResticResult restic_fetch_snapshots_json(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const ResticExecOptions* options,
+    char** out_json,
+    WCHAR* out_error_msg,
+    size_t err_capacity
+) {
+    if (out_error_msg && err_capacity > 0) out_error_msg[0] = L'\0';
+    if (out_json == NULL) {
+        return RESTIC_ERR_INVALID_ARG;
+    }
+    *out_json = NULL;
+    if (!restic_exe || !repo_target || !password) {
+        return RESTIC_ERR_INVALID_ARG;
+    }
+
+    ResticCommandOutput cmd_out;
+    ResticResult res = run_and_check(restic_exe, repo_target, password, L"snapshots --json --no-lock",
+                                     options, &cmd_out, out_error_msg, err_capacity);
+    if (res != RESTIC_OK) return res;
+
+    /* Transfer the ownership of the stdout buffer to the caller */
+    *out_json        = cmd_out.output;
+    cmd_out.output   = NULL;
+    cmd_out.length   = 0;
+    restic_free_command_output(&cmd_out);
+    return RESTIC_OK;
+}
+
 ResticResult restic_list_snapshots(
     const WCHAR* restic_exe,
     const WCHAR* repo_target,
@@ -916,18 +947,20 @@ ResticResult restic_list_snapshots(
     WCHAR* out_error_msg,
     size_t err_capacity
 ) {
-    if (out_error_msg && err_capacity > 0) out_error_msg[0] = L'\0';
-    if (!restic_exe || !repo_target || !password || !out_items || !out_count) {
+    if (out_items == NULL || out_count == NULL) {
         return RESTIC_ERR_INVALID_ARG;
     }
+    *out_items = NULL;
+    *out_count = 0;
 
-    ResticCommandOutput cmd_out;
-    ResticResult res = run_and_check(restic_exe, repo_target, password, L"snapshots --json --no-lock",
-                                     options, &cmd_out, out_error_msg, err_capacity);
+    char* json  = NULL;
+    ResticResult res =
+        restic_fetch_snapshots_json(restic_exe, repo_target, password, options, &json, out_error_msg,
+                                    err_capacity);
     if (res != RESTIC_OK) return res;
 
-    res = restic_parse_snapshots_json(cmd_out.output, out_items, out_count);
-    restic_free_command_output(&cmd_out);
+    res = restic_parse_snapshots_json(json, out_items, out_count);
+    free(json);
     return res;
 }
 

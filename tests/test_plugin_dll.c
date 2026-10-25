@@ -56,6 +56,22 @@ static int g_tests_failed = 0;
 #define FS_COPYFLAGS_RESUME    2
 #define FS_COPYFLAGS_MOVE      4
 
+/* Content (custom columns) constants, same values as the plugin interface */
+#define ft_nomorefields     0
+#define ft_numeric_32       1
+#define ft_numeric_64       2
+#define ft_numeric_floating 3
+#define ft_date             4
+#define ft_time             5
+#define ft_boolean          6
+#define ft_multiplechoice   7
+#define ft_string           8
+#define ft_fulltext         9
+#define ft_datetime        10
+#define ft_nosuchfield     (-1)
+#define ft_fieldempty      (-3)
+#define ft_fileerror       (-2)
+
 typedef struct {
     int size;
     DWORD PluginInterfaceVersionLow;
@@ -79,6 +95,16 @@ typedef BOOL   (__stdcall *PFN_FindNextW)(HANDLE, WIN32_FIND_DATAW*);
 typedef int    (__stdcall *PFN_FindClose)(HANDLE);
 typedef int    (__stdcall *PFN_GetFile)(char*, char*, int, RemoteInfo*);
 typedef int    (__stdcall *PFN_GetFileW)(WCHAR*, WCHAR*, int, RemoteInfo*);
+typedef int    (__stdcall *PFN_ContentGetSupportedField)(int, char*, char*, int);
+typedef int    (__stdcall *PFN_ContentGetValue)(char*, int, int, void*, int, int);
+typedef int    (__stdcall *PFN_ContentGetSupportedFieldFlags)(int);
+typedef int    (__stdcall *PFN_ContentGetDefaultSortOrder)(int);
+typedef BOOL   (__stdcall *PFN_ContentGetDefaultView)(char*, char*, char*, char*, int);
+typedef int    (__stdcall *PFN_ContentGetValueW)(WCHAR*, int, int, void*, int, int);
+typedef BOOL   (__stdcall *PFN_ContentGetDefaultViewW)(WCHAR*, WCHAR*, WCHAR*, WCHAR*, int);
+typedef void   (__stdcall *PFN_ContentStopGetValueW)(WCHAR*);
+typedef void   (__stdcall *PFN_ContentStopGetValue)(char*);
+typedef void   (__stdcall *PFN_ContentPluginUnloading)(void);
 
 typedef struct {
     HMODULE module;
@@ -143,7 +169,12 @@ static void test_export_surface(void) {
 
     const char* required[] = {"FsInit", "FsInitW", "FsFindFirst", "FsFindFirstW", "FsFindNext",
                               "FsFindNextW", "FsFindClose", "FsGetDefRootName", "FsSetDefaultParams",
-                              "FsGetFile", "FsGetFileW"};
+                              "FsGetFile", "FsGetFileW", "FsContentGetSupportedField",
+                              "FsContentGetValue", "FsContentGetSupportedFieldFlags",
+                              "FsContentGetDefaultSortOrder", "FsContentGetDefaultView",
+                              "FsContentStopGetValue", "FsContentPluginUnloading",
+                              "FsContentGetValueW", "FsContentGetDefaultViewW",
+                              "FsContentStopGetValueW"};
     for (size_t i = 0; i < _countof(required); ++i) {
         FARPROC fn = GetProcAddress(m, required[i]);
         g_tests_run++;
@@ -758,6 +789,98 @@ static BOOL descend_to_fixture_data(
 }
 
 /* Scenario C: full end-to-end navigation (Level 0 -> Level 1 -> Level 2+, password retry & session) */
+/* Returns the FsContentGetSupportedField index of `name`, or -1 */
+static int find_content_field(HMODULE module, const char* name) {
+    PFN_ContentGetSupportedField get_field =
+        (PFN_ContentGetSupportedField)(void*)GetProcAddress(module, "FsContentGetSupportedField");
+    if (!get_field) return -1;
+    for (int i = 0; i < 64; ++i) {
+        char field_name[64] = {0};
+        char units[64]      = {0};
+        if (get_field(i, field_name, units, (int)sizeof(field_name)) == ft_nomorefields) break;
+        if (strcmp(field_name, name) == 0) return i;
+    }
+    return -1;
+}
+
+/* After the Level 1 listing the custom columns are served from the statistics cache (no restic run) */
+static void test_e2e_statistics_columns(const Plugin* p_in, WCHAR (*snap_names)[MAX_PATH]) {
+    const Plugin p = *p_in;
+    PFN_ContentGetValue get_value =
+        (PFN_ContentGetValue)(void*)GetProcAddress(p.module, "FsContentGetValue");
+    int f_host  = find_content_field(p.module, "hostname");
+    int f_time  = find_content_field(p.module, "time");
+    int f_files = find_content_field(p.module, "files");
+    int f_sid   = find_content_field(p.module, "short_id");
+    int f_sum   = find_content_field(p.module, "has_summary");
+    EXPECT_TRUE(get_value && f_host >= 0 && f_time >= 0 && f_files >= 0 && f_sid >= 0 && f_sum >= 0,
+                "Content fields resolve in the loaded plugin");
+
+    for (size_t i = 0; i < 2; ++i) {
+        WCHAR wide_path[MAX_PATH * 2];
+        char ansi_path[MAX_PATH * 2] = {0};
+        char deep_path[MAX_PATH * 2] = {0};
+        swprintf_s(wide_path, _countof(wide_path), L"\\MainRepo\\%ls", snap_names[i]);
+        WideCharToMultiByte(CP_ACP, 0, wide_path, -1, ansi_path, (int)sizeof(ansi_path), NULL, NULL);
+        snprintf(deep_path, sizeof(deep_path), "%s\\D\\data\\readme.txt", ansi_path);
+
+        char host[128] = {0};
+        EXPECT_TRUE(get_value(ansi_path, f_host, 0, host, (int)sizeof(host), 0) == ft_string &&
+                        host[0] != '\0',
+                    "Snapshot folder exposes the host name recorded by Restic");
+        char deep_host[128] = {0};
+        EXPECT_TRUE(get_value(deep_path, f_host, 0, deep_host, (int)sizeof(deep_host), 0) == ft_string &&
+                        strcmp(host, deep_host) == 0,
+                    "A file inside the snapshot inherits the snapshot statistics");
+
+        FILETIME when = {0, 0};
+        EXPECT_TRUE(get_value(ansi_path, f_time, 0, &when, (int)sizeof(when), 0) == ft_datetime &&
+                        (when.dwHighDateTime != 0 || when.dwLowDateTime != 0),
+                    "Snapshot time is published as a FILETIME");
+
+        char short_id[16] = {0};
+        char expected_id[16] = {0};
+        const WCHAR* open = wcschr(snap_names[i], L'[');
+        EXPECT_TRUE(open != NULL, "Snapshot folder name carries the short ID");
+        for (int c = 0; c < 8 && open[1 + c] != L']' && open[1 + c] != L'\0'; ++c) {
+            expected_id[c] = (char)open[1 + c];
+        }
+        EXPECT_TRUE(get_value(ansi_path, f_sid, 0, short_id, (int)sizeof(short_id), 0) == ft_string &&
+                        strcmp(short_id, expected_id) == 0,
+                    "The cached record is the one of the folder (short ID matches)");
+
+        LONGLONG files = -1;
+        int files_type = get_value(ansi_path, f_files, 0, &files, (int)sizeof(files), 0);
+        int has_sum    = 0;
+        get_value(ansi_path, f_sum, 0, &has_sum, (int)sizeof(has_sum), 0);
+        EXPECT_TRUE(has_sum ? (files_type == ft_numeric_64 && files > 0) : (files_type == ft_fieldempty),
+                    "File count is published exactly when Restic stored a summary");
+    }
+
+    char other[128] = {0};
+    char other_path[MAX_PATH * 2] = {0};
+    WCHAR other_wide[MAX_PATH * 2];
+    swprintf_s(other_wide, _countof(other_wide), L"\\SecondRepo\\%ls", snap_names[0]);
+    WideCharToMultiByte(CP_ACP, 0, other_wide, -1, other_path, (int)sizeof(other_path), NULL, NULL);
+    EXPECT_TRUE(get_value(other_path, f_host, 0, other, (int)sizeof(other), 0) == ft_fieldempty,
+                "A repository that was not enumerated yet has no statistics (no hidden restic run)");
+}
+
+/* Statistics are cached per alias: SecondRepo gets its own entry once it has been enumerated */
+static void test_e2e_second_repo_columns(const Plugin* p_in, const WCHAR* snapshot_name) {
+    const Plugin p = *p_in;
+    PFN_ContentGetValue get_value =
+        (PFN_ContentGetValue)(void*)GetProcAddress(p.module, "FsContentGetValue");
+    int f_host = find_content_field(p.module, "hostname");
+    char path_a[MAX_PATH * 2] = {0};
+    WCHAR path_w[MAX_PATH * 2];
+    char host[128] = {0};
+    swprintf_s(path_w, _countof(path_w), L"\\SecondRepo\\%ls", snapshot_name);
+    WideCharToMultiByte(CP_ACP, 0, path_w, -1, path_a, (int)sizeof(path_a), NULL, NULL);
+    EXPECT_TRUE(get_value(path_a, f_host, 0, host, (int)sizeof(host), 0) == ft_string && host[0] != '\0',
+                "Enumerating a second repository fills its own statistics entry");
+}
+
 static void test_live_end_to_end_navigation(void) {
     if (GetFileAttributesW(L"tmp\\restic.exe") == INVALID_FILE_ATTRIBUTES ||
         GetFileAttributesW(L"tmp\\test_fixture\\repo\\config") == INVALID_FILE_ATTRIBUTES) {
@@ -817,13 +940,17 @@ static void test_live_end_to_end_navigation(void) {
     EXPECT_TRUE(g_e2e_msg_dialogs == 0, "No error dialog when retry succeeds");
 
     WCHAR latest_snap[MAX_PATH] = {0};
+    WCHAR snap_names[2][MAX_PATH] = {{0}};
     size_t snap_count = 0;
     do {
+        if (snap_count < 2) wcsncpy_s(snap_names[snap_count], MAX_PATH, fd.cFileName, _TRUNCATE);
         snap_count++;
         wcsncpy_s(latest_snap, MAX_PATH, fd.cFileName, _TRUNCATE);
     } while (p.find_next_w(h, &fd));
     p.find_close(h);
     EXPECT_TRUE(snap_count == 2, "Both fixture snapshots returned at Level 1");
+
+    test_e2e_statistics_columns(&p, snap_names);
 
     /* 2. Level 2+ (\MainRepo\<snap>\...): session password cached in RAM (0 additional prompts) */
     g_e2e_pwd_prompts = 0;
@@ -877,6 +1004,8 @@ static void test_live_end_to_end_navigation(void) {
     EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "And again SecondRepo");
     p.find_close(h);
     EXPECT_TRUE(g_e2e_pwd_prompts == 1, "Alternating between two panels' repositories never re-prompts");
+
+    test_e2e_second_repo_columns(&p, snap_names[0]);
 
     /* 4. Exhausting all 3 password attempts returns ERROR_ACCESS_DENIED and shows an error dialog */
     g_e2e_pwd_mode    = 2;
@@ -994,6 +1123,171 @@ static void test_live_end_to_end_navigation(void) {
     RemoveDirectoryW(dir);
 }
 
+/* Custom columns surface: field enumeration, default view and empty values without cached data */
+static void test_content_fields(void) {
+    HMODULE m = LoadLibraryW(PLUGIN_DLL);
+    EXPECT_TRUE(m != NULL, "Plugin DLL loads for the content-column tests");
+
+    PFN_ContentGetSupportedField get_field =
+        (PFN_ContentGetSupportedField)(void*)GetProcAddress(m, "FsContentGetSupportedField");
+    PFN_ContentGetValue get_value =
+        (PFN_ContentGetValue)(void*)GetProcAddress(m, "FsContentGetValue");
+    PFN_ContentGetSupportedFieldFlags get_flags =
+        (PFN_ContentGetSupportedFieldFlags)(void*)GetProcAddress(m, "FsContentGetSupportedFieldFlags");
+    PFN_ContentGetDefaultSortOrder get_sort =
+        (PFN_ContentGetDefaultSortOrder)(void*)GetProcAddress(m, "FsContentGetDefaultSortOrder");
+    PFN_ContentGetDefaultView get_view =
+        (PFN_ContentGetDefaultView)(void*)GetProcAddress(m, "FsContentGetDefaultView");
+    PFN_ContentPluginUnloading unload =
+        (PFN_ContentPluginUnloading)(void*)GetProcAddress(m, "FsContentPluginUnloading");
+    EXPECT_TRUE(get_field && get_value && get_flags && get_sort && get_view && unload,
+                "All content-column entry points resolve");
+
+    /* Enumerate the fields: names must be unique and non-empty, types must be known */
+    char names[64][64];
+    int count = 0;
+    int type  = 0;
+    for (; count < 64; ++count) {
+        char name[64] = {0};
+        char units[64] = {0};
+        type = get_field(count, name, units, (int)sizeof(name));
+        if (type == ft_nomorefields) break;
+        if (strlen(name) == 0) {
+            printf("[FAIL] test_content_fields: empty field name at index %d\n", count);
+            g_tests_failed++;
+            FreeLibrary(m);
+            return;
+        }
+        strncpy_s(names[count], sizeof(names[count]), name, _TRUNCATE);
+    }
+    g_tests_run++;
+    if (count < 10) {
+        printf("[FAIL] test_content_fields: only %d fields published\n", count);
+        g_tests_failed++;
+        FreeLibrary(m);
+        return;
+    }
+    int unique = 1;
+    for (int i = 0; i < count && unique; ++i) {
+        for (int j = i + 1; j < count; ++j) {
+            if (strcmp(names[i], names[j]) == 0) unique = 0;
+        }
+    }
+    EXPECT_TRUE(unique, "Published field names are unique");
+
+    EXPECT_TRUE(get_field(count, NULL, NULL, 0) == ft_nomorefields,
+                "Enumeration terminates with ft_nomorefields");
+    EXPECT_TRUE(get_field(-1, NULL, NULL, 0) == ft_nomorefields,
+                "Negative field index terminates enumeration");
+    EXPECT_TRUE(get_flags(-1) == 0 && get_flags(0) == 0,
+                "No field is editable or substitutes a file property");
+
+    /* The default view must reference our own fields and match the number of headers */
+    /* Total Commander passes one maxlen for all four buffers: all of them must be that large */
+    char view_contents[1024] = {0};
+    char view_headers[1024]  = {0};
+    char view_widths[1024]   = {0};
+    char view_options[1024]  = {0};
+    EXPECT_TRUE(get_view(view_contents, view_headers, view_widths, view_options,
+                         (int)sizeof(view_contents)) != 0,
+                "A default custom-columns view is published");
+    /*
+     * The plugin references its own fields with the "<fs>" self name ("[=<fs>.field]"), the form
+     * Total Commander stores in wincmd.ini; hard-coding the display name would break whenever the
+     * plugin is registered under a different one.
+     */
+    EXPECT_TRUE(strstr(view_contents, "[=<fs>.") != NULL,
+                "Default view references the plugin content fields by self reference");
+    EXPECT_TRUE(strstr(view_contents, "[=restic.") == NULL,
+                "Default view does not hard-code a plugin name");
+    int content_fields = 0;
+    for (const char* p = view_contents; (p = strstr(p, "[=")) != NULL; ++p) ++content_fields;
+    int headers = 1;
+    for (const char* p = view_headers; (p = strstr(p, "\\n")) != NULL; ++p) ++headers;
+    EXPECT_TRUE(content_fields == headers && content_fields >= 3,
+                "Default view has one header per field");
+    EXPECT_TRUE(strstr(view_widths, ",") != NULL && strstr(view_options, "|") != NULL,
+                "Default view provides widths and options");
+
+    /* Values: unknown field, unknown path and unknown snapshot all answer consistently */
+    LONGLONG numeric = 0;
+    EXPECT_TRUE(get_value(NULL, count, 0, &numeric, (int)sizeof(numeric), 0) == ft_nosuchfield,
+                "Out-of-range field index returns ft_nosuchfield");
+    EXPECT_TRUE(get_value(NULL, 0, 0, &numeric, (int)sizeof(numeric), 0) == ft_fieldempty,
+                "Missing file name returns ft_fieldempty");
+    EXPECT_TRUE(get_value("\\NoSuchRepo", 0, 0, &numeric, (int)sizeof(numeric), 0) == ft_fieldempty,
+                "Alias row has no statistics");
+    EXPECT_TRUE(get_value("\\NoSuchRepo\\2026-10-18_16-28-15_[deadbeef]", 0, 0, &numeric,
+                          (int)sizeof(numeric), 0) == ft_fieldempty,
+                "Unknown snapshot (no cached data) returns ft_fieldempty");
+    EXPECT_TRUE(get_sort(0) == -1 && get_sort(1) == 1,
+                "Date sorts descending by default, text ascending");
+
+    unload();
+    FreeLibrary(m);
+}
+
+/*
+ * Unicode content entry points. Total Commander calls the W variants when they are exported
+ * (falling back to the ANSI ones only when they are missing), so a Unicode plugin must provide
+ * them; this test drives them exactly like Total Commander would and checks the wide text.
+ */
+static void test_content_unicode_entry_points(void) {
+    HMODULE m = LoadLibraryW(PLUGIN_DLL);
+    EXPECT_TRUE(m != NULL, "Plugin DLL loads for the Unicode content tests");
+
+    PFN_ContentGetValueW get_value_w =
+        (PFN_ContentGetValueW)(void*)GetProcAddress(m, "FsContentGetValueW");
+    PFN_ContentGetDefaultViewW get_view_w =
+        (PFN_ContentGetDefaultViewW)(void*)GetProcAddress(m, "FsContentGetDefaultViewW");
+    PFN_ContentStopGetValueW stop_w =
+        (PFN_ContentStopGetValueW)(void*)GetProcAddress(m, "FsContentStopGetValueW");
+    PFN_ContentGetSupportedField get_field =
+        (PFN_ContentGetSupportedField)(void*)GetProcAddress(m, "FsContentGetSupportedField");
+    PFN_ContentPluginUnloading unload =
+        (PFN_ContentPluginUnloading)(void*)GetProcAddress(m, "FsContentPluginUnloading");
+    EXPECT_TRUE(get_value_w && get_view_w && stop_w && get_field && unload,
+                "Unicode content entry points are exported");
+
+    /* The default view is returned as wide text, separated by a literal backslash + n */
+    WCHAR contents[512] = {0};
+    WCHAR headers[512]  = {0};
+    WCHAR widths[512]   = {0};
+    WCHAR options[512]  = {0};
+    EXPECT_TRUE(get_view_w(contents, headers, widths, options, (int)sizeof(contents)) != 0,
+                "Unicode default view is published");
+    EXPECT_TRUE(wcsstr(contents, L"[=<fs>.time]") != NULL, "Unicode default view lists the fields");
+    EXPECT_TRUE(wcsstr(contents, L"\\n") != NULL, "Unicode default view keeps the literal separator");
+    EXPECT_TRUE(wcsstr(headers, L"Date") != NULL && wcschr(widths, L',') != NULL &&
+                    wcschr(options, L'|') != NULL,
+                "Unicode default view provides headers, widths and options");
+
+    /* Same answer as the ANSI entry point for a path with no cached data */
+    LONGLONG numeric = 0;
+    EXPECT_TRUE(get_value_w(L"\\NoSuchRepo\\2026-10-18_16-28-15_[deadbeef]", 0, 0, &numeric,
+                            (int)sizeof(numeric), 0) == ft_fieldempty,
+                "Unicode value of an unknown snapshot is empty");
+    EXPECT_TRUE(get_value_w(NULL, 0, 0, &numeric, (int)sizeof(numeric), 0) == ft_fieldempty,
+                "Unicode value rejects a NULL path");
+    EXPECT_TRUE(get_value_w(L"\\RepoA", (int)1 << 20, 0, &numeric, (int)sizeof(numeric), 0) ==
+                    ft_nosuchfield,
+                "Unicode value rejects an out-of-range field index");
+    EXPECT_TRUE(get_value_w(L"\\RepoA", 0, 0, NULL, (int)sizeof(numeric), 0) == ft_fileerror,
+                "Unicode value rejects a NULL buffer");
+
+    /* A wide buffer only large enough for one character must not be overrun */
+    WCHAR tiny[2] = {0x1234, 0x5678};
+    get_value_w(L"\\RepoA\\2026-10-18_16-28-15_[5e395062]", 1, 0, tiny, (int)sizeof(tiny), 0);
+    g_tests_run++; /* Reaching this line without a crash is the assertion */
+
+    stop_w(L"\\RepoA");
+    stop_w(NULL);
+    g_tests_run++; /* The no-op stop entry points must accept anything */
+
+    unload();
+    FreeLibrary(m);
+}
+
 int main(void) {
     printf("Running Restic WFX plugin DLL smoke tests...\n");
     if (GetFileAttributesW(PLUGIN_DLL) == INVALID_FILE_ATTRIBUTES) {
@@ -1002,6 +1296,8 @@ int main(void) {
     }
 
     test_export_surface();
+    test_content_fields();
+    test_content_unicode_entry_points();
     test_primary_ini_next_to_dll();
     test_fallback_ini_from_default_params();
     test_live_end_to_end_navigation();

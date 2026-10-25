@@ -18,6 +18,9 @@
 #include "fsplugin.h"
 #include "config.h"
 #include "restic_cli.h"
+#include "restic_stats.h"
+#include "wfx_path.h"
+#include "wfx_trace.h"
 
 #define SESSION_MAX_PASSWORD  512
 #define SESSION_SLOTS         8
@@ -54,26 +57,6 @@ typedef struct {
     size_t count;            /* Total number of entries in items */
     size_t current_index;    /* Next entry index to return in FsFindNextW */
 } ResticFindHandle;
-
-/**
- * Virtual path hierarchy levels inside the WFX plugin.
- */
-typedef enum {
-    WFX_PATH_ROOT = 0,     /* "\" -> list configured repository aliases */
-    WFX_PATH_REPO,         /* "\<RepoAlias>" -> list snapshots */
-    WFX_PATH_SNAPSHOT_DIR, /* "\<RepoAlias>\<SnapshotDir>[\<SubPath>]" -> list directory */
-    WFX_PATH_INVALID       /* Malformed path or invalid snapshot directory name */
-} WfxPathLevel;
-
-/**
- * Decomposed components of a WFX virtual path.
- */
-typedef struct {
-    WfxPathLevel level;
-    WCHAR repo_alias[MAX_PATH];
-    char snapshot_id[65];
-    const WCHAR* subpath; /* Points into the caller's Path buffer (or L"") */
-} WfxParsedPath;
 
 /**
  * Context forwarded to the cancellation polling callback while restic.exe runs.
@@ -225,65 +208,6 @@ static BOOL wfx_cancel_callback(void* user_data) {
     return g_ProgressProc(g_PluginNr, src, dst, 0) != 0;
 }
 
-/* Splits a WFX path into its hierarchy level, repository alias, snapshot ID, and subpath */
-static BOOL parse_wfx_path(const WCHAR* path, WfxParsedPath* out) {
-    if (!out) return FALSE;
-    memset(out, 0, sizeof(*out));
-    out->level   = WFX_PATH_INVALID;
-    out->subpath = L"";
-
-    if (!path) return FALSE;
-
-    const WCHAR* p = path;
-    while (*p == L'\\') {
-        p++;
-    }
-    if (*p == L'\0') {
-        out->level = WFX_PATH_ROOT;
-        return TRUE;
-    }
-
-    /* Segment 1: <RepoAlias> */
-    const WCHAR* seg_start = p;
-    while (*p != L'\0' && *p != L'\\') {
-        p++;
-    }
-    size_t seg_len = (size_t)(p - seg_start);
-    if (seg_len == 0 || seg_len >= MAX_PATH) {
-        return FALSE;
-    }
-    wcsncpy_s(out->repo_alias, MAX_PATH, seg_start, seg_len);
-
-    while (*p == L'\\') {
-        p++;
-    }
-    if (*p == L'\0') {
-        out->level = WFX_PATH_REPO;
-        return TRUE;
-    }
-
-    /* Segment 2: <SnapshotDir> ("YYYY-MM-DD_HH-MM-SS_[short_id]") */
-    seg_start = p;
-    while (*p != L'\0' && *p != L'\\') {
-        p++;
-    }
-    seg_len = (size_t)(p - seg_start);
-    if (seg_len == 0 || seg_len >= MAX_PATH) {
-        return FALSE;
-    }
-
-    WCHAR snapshot_dirname[MAX_PATH] = {0};
-    wcsncpy_s(snapshot_dirname, MAX_PATH, seg_start, seg_len);
-    if (!restic_extract_snapshot_id(snapshot_dirname, out->snapshot_id, sizeof(out->snapshot_id))) {
-        return FALSE;
-    }
-
-    /* Remainder (empty or starting with '\') is the subpath inside the snapshot */
-    out->subpath = p;
-    out->level   = WFX_PATH_SNAPSHOT_DIR;
-    return TRUE;
-}
-
 /* Wraps a heap-allocated WIN32_FIND_DATAW array into a ResticFindHandle */
 static HANDLE wrap_find_items(
     WIN32_FIND_DATAW* items,
@@ -377,6 +301,44 @@ static BOOL password_worth_caching(ResticResult res) {
            res == RESTIC_ERR_CANCELLED || res == RESTIC_ERR_TIMEOUT;
 }
 
+/*
+ * Runs `restic snapshots --json` once and feeds both parsers: the directory listing returned to
+ * Total Commander and the snapshot statistics kept in the per-alias cache for the content columns.
+ * A cache failure is not fatal: the listing still succeeds and the columns stay empty.
+ */
+static ResticResult list_snapshots_and_cache_stats(
+    const WCHAR* restic_exe,
+    const ResticRepoEntry* repo,
+    const WCHAR* password,
+    const ResticExecOptions* exec_opts,
+    WIN32_FIND_DATAW** items,
+    size_t* count,
+    WCHAR* err_msg,
+    size_t err_cap
+) {
+    char* json          = NULL;
+    ResticResult res    = restic_fetch_snapshots_json(
+        restic_exe, repo->target, password, exec_opts, &json, err_msg, err_cap
+    );
+    if (res != RESTIC_OK) {
+        return res;
+    }
+
+    ResticSnapshotInfo* stats      = NULL;
+    size_t stats_count             = 0;
+    ResticResult stats_res         = restic_parse_snapshot_list(json, &stats, &stats_count);
+    if (stats_res == RESTIC_OK) {
+        snapshot_stats_store(repo->alias, stats, stats_count);
+    } else {
+        snapshot_stats_invalidate(repo->alias);
+    }
+    restic_free_snapshot_list(stats);
+
+    res = restic_parse_snapshots_json(json, items, count);
+    free(json);
+    return res;
+}
+
 /* Executes a Level 1 (snapshots) or Level 2 (directory) query with password prompt/retry */
 static HANDLE execute_repo_query(
     const WCHAR* virtual_path,
@@ -417,8 +379,8 @@ static HANDLE execute_repo_query(
 
         err_msg[0] = L'\0';
         if (parsed->level == WFX_PATH_REPO) {
-            res = restic_list_snapshots(
-                restic_exe, repo->target, password, &exec_opts, &items, &count, err_msg, _countof(err_msg)
+            res = list_snapshots_and_cache_stats(
+                restic_exe, repo, password, &exec_opts, &items, &count, err_msg, _countof(err_msg)
             );
         } else {
             res = restic_list_directory(
@@ -462,8 +424,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
         config_set_plugin_dir_from_module((HMODULE)hinstDLL);
+        wfx_trace_init(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         clear_password_session();
+        snapshot_stats_clear();
     }
     return TRUE;
 }
@@ -494,16 +458,19 @@ int __stdcall FsInitW(
     tRequestProcW pRequestProcW
 ) {
     clear_password_session();
+    snapshot_stats_clear();
     g_PluginNr     = PluginNr;
     g_ProgressProc = pProgressProcW;
     g_LogProc      = pLogProcW;
     g_RequestProc  = pRequestProcW;
+    wfx_trace_printf("FsInitW plugin no=%d", PluginNr);
     return 0;
 }
 
 void __stdcall FsSetDefaultParams(FsDefaultParamStruct* dps) {
     if (dps != NULL) {
         config_set_fallback_from_default_params(dps->DefaultIniName);
+        wfx_trace_printf("default ini: %s", dps->DefaultIniName);
     }
 }
 
@@ -551,10 +518,13 @@ HANDLE __stdcall FsFindFirstW(WCHAR* Path, WIN32_FIND_DATAW* FindData) {
     memset(FindData, 0, sizeof(WIN32_FIND_DATAW));
 
     WfxParsedPath parsed;
-    if (!parse_wfx_path(Path, &parsed)) {
+    if (!wfx_parse_path(Path, &parsed)) {
+        wfx_trace_path("findfirst rejected", Path);
         SetLastError(ERROR_PATH_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
+    wfx_trace_printf("findfirst level=%d", (int)parsed.level);
+    wfx_trace_path("findfirst", Path);
 
     /* Level 0: Plugin Root "\" -> list configured repository aliases */
     if (parsed.level == WFX_PATH_ROOT) {
@@ -654,7 +624,7 @@ int __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, Rem
     }
 
     WfxParsedPath parsed;
-    if (!parse_wfx_path(RemoteName, &parsed) || parsed.level != WFX_PATH_SNAPSHOT_DIR ||
+    if (!wfx_parse_path(RemoteName, &parsed) || parsed.level != WFX_PATH_SNAPSHOT_DIR ||
         !parsed.subpath) {
         return FS_FILE_NOTFOUND;
     }
