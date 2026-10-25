@@ -50,6 +50,38 @@
 #define FS_SET_TIME_UNKNOWN(ft) \
     do { (ft).dwHighDateTime = 0xFFFFFFFF; (ft).dwLowDateTime = 0xFFFFFFFE; } while (0)
 
+/* Content field types returned by FsContentGetSupportedField / FsContentGetValue.
+ * Values follow the Total Commander content plugin SDK (contentplugin.h); ft_nomorefields (0) ends
+ * the enumeration. ft_delayed / ft_ondemand are deliberately NOT defined: this plugin never
+ * returns them (every value comes from an in-memory cache) and their numeric values could not be
+ * verified against the SDK headers, so an unused-but-wrong constant would be a trap. */
+#define ft_nomorefields     0
+#define ft_numeric_32       1
+#define ft_numeric_64       2
+#define ft_numeric_floating 3
+#define ft_date             4
+#define ft_time             5
+#define ft_boolean          6
+#define ft_multiplechoice   7
+#define ft_string           8
+#define ft_fulltext         9  /* Not supported in file system plugins */
+#define ft_datetime        10
+#define ft_stringw         11 /* "Should only be returned by Unicode function" (SDK header) */
+
+/* Error values for FsContentGetValue */
+#define ft_nosuchfield (-1)
+#define ft_fileerror    (-2)
+#define ft_fieldempty   (-3)
+
+/* Flags passed to FsContentGetValue */
+#define CONTENT_DELAYIFSLOW 1 /* TC would re-request a deliberately delayed field in a worker thread */
+
+/* Unit indexes offered for the size-like fields (UnitIndex parameter of FsContentGetValue) */
+#define CONTENT_UNIT_BYTES  0
+#define CONTENT_UNIT_KBYTES 1
+#define CONTENT_UNIT_MBYTES 2
+#define CONTENT_UNIT_GBYTES 3
+
 /* ANSI and Unicode host callback function types */
 typedef int  (__stdcall *tProgressProc)(int PluginNr, char* SourceName, char* TargetName, int PercentDone);
 typedef int  (__stdcall *tProgressProcW)(int PluginNr, WCHAR* SourceName, WCHAR* TargetName, int PercentDone);
@@ -86,3 +118,19 @@ BOOL   __stdcall FsFindNextW(HANDLE Hdl, WIN32_FIND_DATAW* FindData);
 int    __stdcall FsFindClose(HANDLE Hdl);
 int    __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri);
 int    __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, RemoteInfoStruct* ri);
+
+/* Optional custom-columns surface (read-only: no FsContentSetValue).
+ * The W variants are the ones Total Commander calls on NT-based systems (they only fall back to the
+ * ANSI versions when the W exports are missing); FsContentGetSupportedField,
+ * FsContentGetSupportedFieldFlags, FsContentGetDefaultSortOrder and FsContentPluginUnloading exist
+ * in ANSI form only, as required by the SDK. */
+int  __stdcall FsContentGetSupportedField(int FieldIndex, char* FieldName, char* Units, int maxlen);
+int  __stdcall FsContentGetValue(char* FileName, int FieldIndex, int UnitIndex, void* FieldValue, int maxlen, int flags);
+int  __stdcall FsContentGetValueW(WCHAR* FileName, int FieldIndex, int UnitIndex, void* FieldValue, int maxlen, int flags);
+int  __stdcall FsContentGetSupportedFieldFlags(int FieldIndex);
+int  __stdcall FsContentGetDefaultSortOrder(int FieldIndex);
+BOOL __stdcall FsContentGetDefaultView(char* ViewContents, char* ViewHeaders, char* ViewWidths, char* ViewOptions, int maxlen);
+BOOL __stdcall FsContentGetDefaultViewW(WCHAR* ViewContents, WCHAR* ViewHeaders, WCHAR* ViewWidths, WCHAR* ViewOptions, int maxlen);
+void __stdcall FsContentStopGetValue(char* FileName);
+void __stdcall FsContentStopGetValueW(WCHAR* FileName);
+void __stdcall FsContentPluginUnloading(void);

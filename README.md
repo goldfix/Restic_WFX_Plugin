@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX64-orange.svg" alt="Total Commander WFX64" />
-  <img src="https://img.shields.io/badge/Version-1.0.0-success.svg" alt="Version: 1.0.0" />
+  <img src="https://img.shields.io/badge/Version-1.1.0-success.svg" alt="Version: 1.1.0" />
 </p>
 
 ---
@@ -47,6 +47,7 @@ It turns Total Commander's **Network Neighborhood** (`\\\Restic Backups\`) into 
 - **Strictly Read-Only by Design:** Every Restic command runs with `--no-lock`. Repository modification entry points (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally not exported, and `F6` (Move) is rejected.
 - **Zero Passwords on Disk:** Repository passwords are requested interactively via Total Commander's native password dialog (`RequestProcW`), kept only in volatile RAM per repository alias for the active session, passed to `restic.exe` via an isolated environment block (`RESTIC_PASSWORD`), and wiped with `SecureZeroMemory`.
 - **Responsive Cancellation (`ESC`):** Long operations on remote backends can be aborted with `ESC` and use a 30-minute **inactivity** timeout (so slow multi-gigabyte transfers are never cut off as long as bytes keep flowing).
+- **Backup Statistics as Native Columns:** Entering `Restic Backups` automatically switches the panel to a custom columns view showing the snapshot **date, host, tags, file count, size, added data and duration**. 27 fields are available (IDs, parent, user, source paths, new/changed/unmodified files and directories, blobs, packing ratio, ...), all taken from the JSON already fetched to list the snapshots: no extra `restic.exe` run, no extra password prompt.
 
 ---
 
@@ -176,6 +177,71 @@ GoogleDrive=rclone:gdrive:Backups/restic_repo
 | **View File (`F3` / `Ctrl+Q`)** | Press **`F3`** (Lister) or **`Ctrl+Q`** (Quick View) on any file to stream it to a temporary location and view its contents. |
 | **Restore / Extract (`F5`)** | Select one or more files or directories and press **`F5`** to copy them to the target panel, preserving original `LastWriteTime` timestamps. Standard Total Commander overwrite prompts are supported. |
 | **Cancel Operation (`ESC`)** | Press **`ESC`** in Total Commander's progress dialog to terminate the underlying `restic.exe` child process and clean up any temporary file. |
+| **Backup Statistics (Columns)** | Enter a repository: Total Commander switches to the plugin's custom columns view automatically. Add or reorder columns via **Configuration -> Options -> Custom columns** (see below). |
+
+---
+
+## Backup Statistics (Custom Columns)
+
+While a panel displays `Restic Backups`, Total Commander can show Restic's own backup statistics as columns. The plugin publishes those as *content fields* (`FsContent*`), so they can be used in a custom columns view, in the multi-rename tool and in sorting.
+
+**Default view:** when you enter `Restic Backups` Total Commander switches the panel to a ready-made view (you can change or replace it at any time):
+
+| Column | Example | Source |
+| --- | --- | --- |
+| Date | `2026-10-18 16:28` | snapshot time |
+| Host | `GOLDFIX-PC` | `hostname` |
+| Tags | `daily, home` | `tags` |
+| Files | `12480` | `summary.total_files_processed` |
+| Size | `1873` | `summary.total_bytes_processed` (MB) |
+| Added | `42` | `summary.data_added` (MB of new data written to the repository, before compression) |
+| Duration | `95` | backup end minus backup start (seconds) |
+
+To build your own view: **Configuration -> Options -> Custom columns -> New**, add a column and pick a field from the plugin. In the field reference, `<plugin name>` is the key shown in **Configuration -> Options -> Plugins -> File system plugins** (the installer proposes `restic`, but it can differ - the test machine uses "Restic Backups"):
+
+```text
+[=<plugin name>.size.Mbytes]
+[=<plugin name>.files_new]
+[=<plugin name>.packed_ratio]
+```
+
+All published fields:
+
+| Field | Meaning |
+| --- | --- |
+| `time`, `backup_start`, `backup_end`, `duration` | Snapshot time, backup window and its length (`s` or `min`) |
+| `hostname`, `username`, `tags`, `paths`, `program_version` | Who/what produced the snapshot and which paths it covers |
+| `id`, `short_id`, `parent` | Snapshot identifiers (the parent is empty for the first snapshot) |
+| `files`, `size` | Files processed and bytes processed (`bytes`, `kbytes`, `Mbytes`, `Gbytes`) |
+| `data_added`, `data_added_packed`, `packed_ratio` | New data added to the repository (uncompressed) and the size actually stored (compressed), and their ratio |
+| `files_new`, `files_changed`, `files_unmodified`, `dirs_new`, `dirs_changed`, `dirs_unmodified` | What the backup actually changed |
+| `data_blobs`, `tree_blobs`, `avg_file_size`, `has_summary` | Blob counts, average file size, and whether Restic stored a summary |
+
+Notes:
+
+- Columns are filled for snapshot folders **and** for every entry inside them (files inherit the statistics of their snapshot); the root and the repository rows stay empty.
+- Snapshots created by older Restic versions (or by other clients) may have no summary: those columns stay empty instead of showing wrong zeros.
+- Nothing is computed in the background, so there is no delay, no extra `restic.exe` invocation and no password prompt while browsing.
+- Text is shown with full Unicode support: Total Commander calls the Unicode entry points of the plugin, so host names, tags and source paths keep their original characters.
+- The columns are filled when a repository's snapshot list is opened (`\<Alias>`). If you jump straight into a snapshot folder without having opened its repository in the current session, go up one level (or refresh the repository folder) to populate them.
+- Fields that require an additional Restic run (real deduplicated repository size, diff against the parent snapshot) are not published yet.
+
+### If the columns stay empty
+
+Total Commander shows the statistics columns only when the column definition points at this plugin. Two situations look identical (visible headers, blank values), so check them in this order:
+
+1. **Open the repository folder once** (`\<Alias>`): the statistics are read while that folder is listed, so a snapshot folder reached directly shows empty columns until you refresh its repository.
+2. **Check the column definition**: in **Configuration** -> **Options** -> **Custom columns** the fields must be written as `[=<plugin name>.size.Mbytes]`, where `<plugin name>` is the key shown in **Configuration** -> **Options** -> **Plugins** -> **File system plugins** (the installer proposes `restic`, but you can change it). The built-in default view does not depend on it, because it references its own fields with the special name `<fs>`, e.g. `[=<fs>.time]`, `[=<fs>.size.Mbytes]`, ...
+3. **Clear a stale default view** if Total Commander has already saved one: it stores the default view in `wincmd.ini` under `[CustomFields_<plugin name>]` with `AutoLoad=1` and then never asks the plugin again. If that stored view references the wrong name (for example `Contents1=[=restic.time]...` from an older version, while the plugin is registered as "Restic Backups"), the columns stay empty. Close Total Commander, edit `wincmd.ini` and either delete the whole `[CustomFields_<plugin name>]` section, or change every `[=restic.` in its `Contentsx` line to `[=<fs>.`; then start Total Commander again.
+4. **Turn on the diagnostic trace** if the columns are still empty:
+   - either set the environment variable `RESTIC_WFX_TRACE=1` **before** starting Total Commander (starting a second instance only activates the running one, so use the *Start menu* shortcut from a shell where you ran `set RESTIC_WFX_TRACE=1`, or `setx RESTIC_WFX_TRACE 1` followed by a full restart of Total Commander),
+   - or create an empty file named `restic_wfx_trace.on` next to `restic.wfx64`, then restart Total Commander (or reload the plugins with `cm_UnloadPlugins`).
+   The log is written to `%TEMP%\restic_wfx_trace.log` (max 400 lines, recreated each time the plugin is loaded) and tells the cases apart:
+   - **no file at all** -> the plugin was not loaded, or an older DLL is still in place;
+   - the file lists `FsInitW`/`findfirst` but **no `value` lines** -> Total Commander never asks for the fields: the column definition does not point at this plugin (step 2) or a stale default view is stored in `wincmd.ini` (step 3);
+   - `value '...' field=N unit=N -> -3 (unresolved)` -> the path spelling is still not recognised; the log contains the exact string, please report it;
+   - `-> -3` together with `cache: []` -> the repository was never listed in this session (step 1).
+   Remove the file or unset the variable when you are done.
 
 ---
 
@@ -195,8 +261,8 @@ Using the Git Bash / MSYS2 wrapper (`build.sh`) or directly via `nmake`:
 ```bash
 ./build.sh release       # Build optimized Release DLL (build/restic.wfx64, static CRT /MT) + copy build/restic_plugin.ini
 ./build.sh debug         # Build Debug DLL (build/restic.wfx64, /MTd + CRT debug heap)
-./build.sh test          # Build & run all 3 test suites in Debug mode (with CRT memory-leak verification)
-./build.sh release-test  # Build & run all 3 test suites against the Release build
+./build.sh test          # Build & run all 4 test suites in Debug mode (with CRT memory-leak verification)
+./build.sh release-test  # Build & run all 4 test suites against the Release build
 ./build.sh analyze       # Run MSVC Static Code Analyzer (/analyze) with warnings-as-errors (/W4 /WX)
 ./build.sh asan          # Run unit tests under MSVC AddressSanitizer (/fsanitize=address)
 ./build.sh package       # Clean, build Release, run tests and create build/wfx_restic_<version>_x64.zip

@@ -28,13 +28,18 @@ The primary goal of Phase 1 (MVP) is to provide interactive, read-only browsing 
    - Uses line-by-line NDJSON streaming/parsing for `restic ls --json` output.
 
 4. **Caching Policy (MVP)**
-   - **No persistent or in-memory directory cache.**
+   - **No persistent or in-memory directory cache** (the only cache is the volatile snapshot statistics table of item 6).
    - Every directory navigation queries the CLI directly to keep the codebase minimal, deterministic, and free from cache invalidation complexity.
 
 5. **Credential Lifecycle**
    - No passwords are stored on disk (neither in `restic_plugin.ini` nor in external files).
    - Credentials are requested at runtime when entering a repository via Total Commander's `RequestProcW` (`RT_Password`) callback.
    - Credentials remain in RAM only, in a small per-repository session table (8 slots, so two panels can browse two repositories without being re-prompted). Entries are wiped on wrong password, on `FsInitW` and on DLL unload; the oldest slot is recycled when the table is full.
+
+6. **Backup Statistics as Native Custom Columns**
+   - The `FsContent*` surface exposes the metadata of `restic snapshots --json` as Total Commander custom columns (`FsContentGetSupportedField`/`FsContentGetValue`), and `FsContentGetDefaultView` switches the panel to a ready-made column set when the plugin is entered.
+   - Every value comes from the JSON that was **already downloaded** while enumerating the snapshot list: no field ever spawns `restic.exe`, no field is delayed (`ft_delayed`/`ft_ondemand` are never returned and deliberately not even defined in `include/fsplugin.h`) and no password prompt can be triggered from a background thread.
+   - Parsed records live in a small volatile per-alias cache (8 slots, `SRWLOCK`, copies handed out, cleared on `FsContentPluginUnloading`/`FsInitW`/DLL unload). It is a *statistics* cache, not a directory cache: the `FsFindFirstW`/`FsFindNextW` listing path still queries the CLI on every navigation.
 
 ---
 
@@ -92,7 +97,7 @@ Total Commander passes backslash-delimited paths rooted at `\`. The plugin maps 
 
 ---
 
-## 5. Implemented WFX API (Read-Only Browsing + File Extraction)
+## 5. Implemented WFX API (Read-Only Browsing, File Extraction & Statistics Columns)
 
 All exported functions use the `__stdcall` calling convention. Both Unicode (`W`) entry points and mandatory ANSI stubs are exported for full compatibility with the Total Commander plugin loader:
 
@@ -118,13 +123,79 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
 
 *Note:* Modification, deletion, and move functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally omitted to enforce strict read-only repository access.
 
+The plugin exports **21 functions**: the 11 browsing/extraction entry points above plus the 10 optional content-column functions of §5.2 (7 ANSI + 3 Unicode variants). `FsContentSetValue` is *not* exported (no field is editable).
+
+### 5.2 Custom Columns (`FsContent*`, read-only)
+
+Total Commander calls these functions to display plugin fields in a custom columns view. All of them are cheap: the data is read from the snapshot statistics cache (`restic_stats.c`), which is filled when the snapshot list of an alias is enumerated.
+
+| Function | Behaviour |
+| --- | --- |
+| `FsContentGetSupportedField` | Enumerates the 27 fields of the table below; returns `ft_nomorefields` after the last one. Field names avoid `.`, `\|` and `:` as required by the interface. |
+| `FsContentGetValueW` / `FsContentGetValue` | Returns one field for the entry named by `FileName`. A **canonical** path (`<Alias>\<SnapshotDir>[\<SubPath>]`, resolved with `wfx_parse_path()`) is looked up in the cache of *that* alias only, so **files and folders inside a snapshot inherit the statistics of their snapshot**. Any other spelling (path relative to the current directory, plugin root name prepended, bare snapshot folder name - Total Commander's exact form is not documented) is resolved by scanning the path segments from the right (`lookup_loose`): a segment that parses as a snapshot folder name is accepted when `snapshot_stats_lookup_any()` finds exactly one cached snapshot, with two different snapshots sharing a short ID treated as ambiguous. Rows of the root and of an alias return `ft_fieldempty`; `CONTENT_DELAYIFSLOW` is ignored because nothing is slow. |
+| `FsContentGetDefaultViewW` | Unicode variant of the default view: the four definitions are converted with `MultiByteToWideChar` into buffers of `maxlen` **bytes** (`maxlen / sizeof(WCHAR)` characters). |
+| `FsContentStopGetValueW` | Unicode no-op, like `FsContentStopGetValue`. |
+| `FsContentGetSupportedFieldFlags` | Always `0`: no field is editable (`contflags_edit`) and none substitutes a file property. |
+| `FsContentGetDefaultSortOrder` | `-1` (newest/largest first) for the date, size and count fields, `1` otherwise. |
+| `FsContentGetDefaultView` | Publishes `Date, Host, Tags, Files, Size (Mbytes), Added (Mbytes), Duration` with headers, widths (`200,60,110,120,140,-60,-70,-70,-60`; the first two are the name/extension columns) and options `0\|1`. The plugin's own fields are referenced with the **`<fs>` self name** (`[=<fs>.time]`, `[=<fs>.size.Mbytes]`), the form Total Commander stores in `wincmd.ini` for a file system plugin (see `[CustomFields_PluginName]` in the TC help and the `svn_wfx` sample plugin). The plugin's display name ("Restic Backups", proposed by TC at install time) is irrelevant to the built-in view and must never be hard-coded. |
+| `FsContentStopGetValue` | No-op (no value is ever computed in the background). |
+| `FsContentPluginUnloading` | Clears the snapshot statistics cache. |
+
+Fields published (order = enumeration order):
+
+| # | Field | Type | Units | Source in `snapshots --json` |
+| --- | --- | --- | --- | --- |
+| 0 | `time` | `ft_datetime` | - | `time` |
+| 1 | `hostname` | `ft_string` | - | `hostname` |
+| 2 | `tags` | `ft_string` | - | `tags` (joined with `, `) |
+| 3 | `files` | `ft_numeric_64` | - | `summary.total_files_processed` |
+| 4 | `size` | `ft_numeric_64` | `bytes\|kbytes\|Mbytes\|Gbytes` | `summary.total_bytes_processed` |
+| 5 | `data_added` | `ft_numeric_64` | byte units | `summary.data_added` |
+| 6 | `duration` | `ft_numeric_64` | `s\|min` | `backup_end - backup_start` |
+| 7 | `short_id` | `ft_string` | - | `short_id` |
+| 8 | `id` | `ft_string` | - | `id` |
+| 9 | `parent` | `ft_string` | - | `parent` |
+| 10 | `username` | `ft_string` | - | `username` |
+| 11 | `paths` | `ft_string` | - | `paths` (joined with `; `) |
+| 12 | `program_version` | `ft_string` | - | `program_version` |
+| 13 | `backup_start` | `ft_datetime` | - | `summary.backup_start` |
+| 14 | `backup_end` | `ft_datetime` | - | `summary.backup_end` |
+| 15 | `files_new` | `ft_numeric_64` | - | `summary.files_new` |
+| 16 | `files_changed` | `ft_numeric_64` | - | `summary.files_changed` |
+| 17 | `files_unmodified` | `ft_numeric_64` | - | `summary.files_unmodified` |
+| 18 | `dirs_new` | `ft_numeric_64` | - | `summary.dirs_new` |
+| 19 | `dirs_changed` | `ft_numeric_64` | - | `summary.dirs_changed` |
+| 20 | `dirs_unmodified` | `ft_numeric_64` | - | `summary.dirs_unmodified` |
+| 21 | `data_blobs` | `ft_numeric_64` | - | `summary.data_blobs` |
+| 22 | `tree_blobs` | `ft_numeric_64` | - | `summary.tree_blobs` |
+| 23 | `data_added_packed` | `ft_numeric_64` | byte units | `summary.data_added_packed` |
+| 24 | `avg_file_size` | `ft_numeric_64` | byte units | `total_bytes_processed / total_files_processed` |
+| 25 | `packed_ratio` | `ft_numeric_floating` | - | `data_added / data_added_packed` |
+| 26 | `has_summary` | `ft_boolean` | - | `summary` object present |
+
+Rules and limitations:
+
+- `FsContentGetDefaultView` receives **one `maxlen` for all four buffers**; the implementation writes each non-NULL buffer with `strncpy_s(dest, maxlen, src, _TRUNCATE)`, so every buffer supplied by the caller must be at least `maxlen` bytes long (both tests are sized accordingly and also assert the truncated-`maxlen` path).
+- **Every summary-derived field degrades to `ft_fieldempty`** when the snapshot carries no `summary` object (snapshots written by older Restic versions or by other clients); the metadata fields stay available.
+- **Text encoding:** Restic prints UTF-8, but the content interface of file system plugins is ANSI-only (no `W` variant exists), so every text field is converted to the active code page (`CP_ACP`); characters the code page cannot represent become `?`. When the caller's buffer is too small the text is cut on a character boundary (the longest prefix that fits), never in the middle of a multi-byte sequence.
+- **Numbers:** Total Commander reads `ft_numeric_64` as *signed*. Counters are therefore saturated at `RESTIC_STATS_COUNTER_MAX` (`LLONG_MAX`) both when parsed (converting a `double` beyond the integer range is undefined behaviour) and when written, so absurd values can never show up as negative numbers.
+- **Aliases outside the ANSI code page:** the path reaches `FsContentGetValue` as ANSI text, so an alias such as `バックアップ` arrives as `?????`. Each cache slot therefore also stores the ANSI-degraded spelling of its alias; a lookup first tries the exact (case-insensitive) alias and only then the degraded spelling, and **only when exactly one slot matches**. If two aliases degrade to the same text the columns stay empty rather than showing the statistics of the wrong repository.
+- **Known limitation (cold start):** the cache is filled when `\<Alias>` is enumerated. If Total Commander shows a snapshot directory without that level having been listed in the current session (e.g. a path typed directly into the address bar), the columns stay empty until the user goes up to the alias level or refreshes it. Filling it implicitly would need an extra `restic snapshots` run from a UI-thread callback, which was rejected on purpose (see "no hidden restic run" above).
+- **Unicode vs ANSI entry points:** Total Commander is Unicode and, per the SDK, "will call the Unicode functions on all NT-based systems if they are present. If not, it will call the ANSI functions". Only `FsContentGetSupportedField`, `FsContentGetSupportedFieldFlags`, `FsContentGetDefaultSortOrder` and `FsContentPluginUnloading` exist in ANSI form only; `FsContentGetValueW`, `FsContentGetDefaultViewW` and `FsContentStopGetValueW` are therefore exported too. That is not cosmetic: with only the ANSI variants exported, a real Total Commander session showed the field list (ANSI-only function) but produced neither a default view nor any value, while an in-process harness calling the ANSI functions directly worked. The W entry points return `ft_stringw` for text fields and take the path as `WCHAR*` (no code-page round trip), so non-ANSI host names, tags and source paths are shown correctly; the `maxlen` of a W buffer counts **bytes**, so wide capacity is `maxlen / sizeof(WCHAR)`.
+- **Default view is stored verbatim, once:** Total Commander calls `FsContentGetDefaultView`, saves the returned `ViewContents` into `wincmd.ini` under `[CustomFields_<PluginName>]` with `AutoLoad=1`, and then reuses that stored view without calling the function again. A stored view is therefore as authoritative as the DLL: the first real test left `Contents1=[=restic.time]...` (written by an earlier build that hard-coded `restic`), which does not resolve because the plugin is registered as "Restic Backups". The fix is to delete the `[CustomFields_<PluginName>]` section (TC then re-asks the plugin) or rewrite its `Contentsx`; never hard-code the display name, use `[=<fs>.field]`.
+- **Path spellings:** the SDK only says "the name of the file (in plugin namespace)", so both the canonical form and the loose segment scan above are supported (`test_content_path_spellings` covers `Alias\Snap`, `\Alias\Snap`, `\\Restic Backups\Alias\Snap`, `...\sub\file.txt`, `Snap`, `Snap\sub\file.txt`, a trailing backslash). The loose scan is a *fallback*: when the canonical parse succeeds the alias is authoritative, so a snapshot ID cached under another alias never leaks into a different repository's rows.
+- **Diagnostic trace (opt-in, `src/wfx_trace.c`):** enabled by `RESTIC_WFX_TRACE=1` **or** by a file named `restic_wfx_trace.on` next to the plugin DLL (the file works even when the variable was not inherited, which is the common case: Total Commander is single-instance, so starting it again only activates the running copy). Every event is appended to `%TEMP%
+estic_wfx_trace.log` (fallback: the plugin directory), max 400 lines, file recreated by the first write of a *plugin load* (Total Commander loads the DLL once, so a normal session keeps everything; reloading the plugin starts a new file). Recorded: `FsInitW` (plugin number), `FsSetDefaultParams` (INI path), every `FsFindFirstW` (level + path, or "rejected"), the field enumeration, the default-view request and every `FsContentGetValue` (`value '<path>' field=N unit=N -> code`, with `(unresolved)` plus a `cache: [Alias(count) ...]` line when a value cannot be resolved). Reading the log: (1) **no file** -> plugin not loaded, trace not enabled, or an older DLL is in use; (2) `FsInitW`/`findfirst` but **no `value` lines** -> Total Commander never asks for the fields, so the column definition does not point at this plugin (wrong plugin name) or the panel is not showing such a view; (3) `value ... -> -3 (unresolved)` -> the path spelling is still not recognised, and the log contains the exact string to support; (4) `-> -3` with `cache: []` -> the repository was never enumerated (cold start). `fscontent_trace_reset()` (delegating to `wfx_trace_reset()`) forgets the cached settings for the tests; production code never calls it.
+- The column reference name for **user-created** views is the plugin key shown in **Configuration -> Options -> Plugins -> File system plugins** ("Restic Backups" on the test machine); the built-in default view uses `[=<fs>.field]` instead, so it does not depend on that key.
+- Fields that need an extra Restic run (`restic stats --mode raw-data\|restore-size`, `restic diff` against the parent snapshot) are intentionally **not** published yet: they would turn a zero-cost column into one child process per refresh. They are recorded as future work in `MEMORY.md`.
+
 ### 5.1 Plugin Icon Specification (Total Commander WFX Standard)
 
 - **Network Neighborhood Root Icon (implemented):** Total Commander automatically displays the **first `ICON` resource (by index)** embedded inside `restic.wfx64` to the left of `"Restic Backups"` in Network Neighborhood (no extra exported function is required). Per the official WFX specification:
   - Format: `logo\restic_wfx.ico` linked into `restic.wfx64` via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
   - Included frames inside `logo\restic_wfx.ico` (5 resolutions): **16×16, 24×24, 32×32, 48×48** (32-bit BGRA uncompressed BMP/DIB frames) plus **256×256** (32-bit RGBA PNG-compressed), built from `logo\logo_16x16.ico`, `logo\logo_24x24.ico`, `logo\logo_32x32.ico`, `logo\logo_48x48.ico`, and `logo\logo_256x256.png`.
 - **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
-- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.0.0.0` / `"1.0.0"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
+- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.1.0.0` / `"1.1.0"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
 
 ---
 
@@ -144,18 +215,27 @@ Restic_WFX_Plugin/
 │   ├── cJSON.h                 # cJSON parser header
 │   └── cJSON.c                 # cJSON parser implementation
 ├── include/
-│   ├── fsplugin.h              # Total Commander WFX API declarations (+ FS_SET_TIME_UNKNOWN macro)
+│   ├── fsplugin.h              # Total Commander WFX API declarations (+ FS_SET_TIME_UNKNOWN, ft_* constants)
+│   ├── fscontent.h             # Content-column plugin name macro, field-count helper, trace reset hook
+│   ├── wfx_trace.h             # Opt-in diagnostic trace interface (environment variable or switch file)
 │   ├── config.h                # INI configuration & binary resolution interface
 │   ├── restic_cli.h            # Restic CLI child process & JSON/NDJSON parser interface
-│   └── version.h               # Single source of truth for plugin version macros (1.0.0)
+│   ├── restic_stats.h          # ResticSnapshotInfo, snapshots --json parser, per-alias cache API
+│   ├── wfx_path.h              # Plugin-namespace path decomposition (WfxParsedPath)
+│   └── version.h               # Single source of truth for plugin version macros (1.1.0)
 ├── src/
 │   ├── main.c                  # DllMain, WFX entry points, virtual path routing
 │   ├── config.c                # restic_plugin.ini resolution & parsing
 │   ├── restic_cli.c            # Child process execution, Win32 pipes, JSON/NDJSON parsing
+│   ├── restic_stats.c          # Snapshot statistics parser + per-alias LRU cache (SRWLOCK)
+│   ├── wfx_path.c              # Path decomposition shared by routing and content columns
+│   ├── fscontent.c             # FsContent* custom columns (field table, values, default view)
+│   ├── wfx_trace.c             # Diagnostic trace: session header, %TEMP% log, switch file, 400-line cap
 │   └── restic_wfx.rc           # Windows resource script (ICON #1 + VS_VERSION_INFO metadata)
 └── tests/
     ├── test_config.c           # Configuration, PATH-lookup security, 300-repo scaling, root enumeration
     ├── test_restic_cli.c       # Parsers, quoting, process execution (cmd.exe stand-in) + live restic.exe tests
+    ├── test_stats.c            # Path decomposition, statistics parser, cache, FsContent* columns
     └── test_plugin_dll.c       # Black-box smoke test: LoadLibrary(restic.wfx64) + exported WFX surface
 ```
 
@@ -204,7 +284,7 @@ typedef struct {
 
 ### 7.5 Virtual Path Routing, Password Session & Host Callbacks (`src/main.c`)
 
-- **Path decomposition (`parse_wfx_path`):** splits the backslash-delimited `Path` passed to `FsFindFirstW` into:
+- **Path decomposition (`wfx_parse_path`, `src/wfx_path.c`):** splits the backslash-delimited path passed to `FsFindFirstW` into:
   - `WFX_PATH_ROOT` (`\`): calls `enumerate_root_repositories()`.
   - `WFX_PATH_REPO` (`\<RepoAlias>`): resolves `RepoAlias` via `config_find_repo()` and calls `restic_list_snapshots()`.
   - `WFX_PATH_SNAPSHOT_DIR` (`\<RepoAlias>\<SnapshotDir>[\<SubPath>]`): extracts the hexadecimal `snapshot_id` via `restic_extract_snapshot_id()` (rejecting malformed folder names before prompting or spawning) and calls `restic_list_directory()`.
@@ -213,6 +293,14 @@ typedef struct {
 - **Password prompt & retry:** when no password is cached for the alias, `prompt_repository_password()` calls `RequestProcW(RT_Password)` with `ReturnedText[0] = 0` (the buffer is the dialog's default text). An **empty** password or a cancelled dialog yields `ERROR_CANCELLED` without any popup (Restic rejects empty passwords, and accepting one would only produce a confusing generic failure). Up to `MAX_PASSWORD_ATTEMPTS` (3) prompts are shown when Restic keeps answering `RESTIC_ERR_WRONG_PASSWORD` (exit code 12); a stale cached password counts as the first attempt and is forgotten.
 - **User abort (`ESC`):** `wfx_cancel_callback()` polls `ProgressProcW` every ~100 ms while Restic runs and terminates `restic.exe` on a non-zero result (`ERROR_CANCELLED`, no popup, a valid cached password is kept). Per the WFX SDK, calls made during the `FsFindFirst/Next/Close` loop are ignored by Total Commander for the first 5 seconds and only then show a progress dialog, so fast listings never flicker. The call uses `PercentDone = 0` (indeterminate) and passes the **alias, never the repository URL**, as `TargetName`: the URL can embed credentials (`rest:https://user:pass@host`) and would be shown on screen. A 30-minute `WFX_RESTIC_TIMEOUT_MS` is a safety net against hung commands.
 - **Win32 error mapping:** empty listings (`RESTIC_OK` with `count == 0`) set `ERROR_NO_MORE_FILES`; missing paths or repositories set `ERROR_PATH_NOT_FOUND`; wrong passwords after retries set `ERROR_ACCESS_DENIED`; locked repositories set `ERROR_LOCK_VIOLATION`. User-facing errors are reported via both `g_LogProc(MSGTYPE_IMPORTANTERROR)` and `g_RequestProc(RT_MsgOK)`.
+
+### 7.6 Snapshot Statistics Cache & Content Columns (`restic_stats.c`, `fscontent.c`)
+
+- **One child process, two parsers:** `restic_fetch_snapshots_json()` returns the raw stdout of `restic snapshots --json --no-lock`; `list_snapshots_and_cache_stats()` (in `main.c`) feeds it to `restic_parse_snapshots_json()` (directory entries) **and** to `restic_parse_snapshot_list()` (statistics records). The records are stored with `snapshot_stats_store()` before the directory handle is returned, so the columns are already populated when Total Commander starts asking for values. A statistics parse failure never fails the listing: the alias cache entry is invalidated instead.
+- **`ResticSnapshotInfo`** (fixed-size arrays, no pointers) holds `id`, `short_id`, `parent`, `hostname`, `username`, `program_version`, joined `tags`/`paths` (with their element counts), `time`, the whole `summary` block and the derived `duration_seconds`. Fixed arrays make a record trivially copyable across threads without lock lifetime issues.
+- **Parser rules:** a literal `null` is an empty repository; entries without a parsable `time` or with a missing/non-hexadecimal ID are skipped exactly like in the listing parser (so both results stay index-aligned; this is unit-tested by comparing the two parsers on the same mixed input); `short_id` falls back to the first 8 characters of `id`; numbers are read from `valuedouble`: negative, missing, non-numeric (e.g. `"7"`) values stay `0` and values at or above 2^63 saturate at `RESTIC_STATS_COUNTER_MAX`; joined `tags`/`paths` are cut at their fixed buffer without leaving a dangling separator while `tag_count`/`path_count` keep counting every element.
+- **Cache:** `g_Cache[8]` slots keyed by repository alias (`_wcsicmp`), guarded by a statically initialized `SRWLOCK` (usable in unit tests where `DllMain` never runs); writers (`store`, `invalidate`, `clear`) take it exclusively, the many readers (`lookup`, `lookup_alias`, `cached_aliases` -> one call per visible cell) take it **shared**; `store`/`invalidate` only ever match the exact alias, never the ANSI-degraded spelling. `snapshot_stats_lookup()` returns a **copy** of one record; `snapshot_stats_lookup_alias()` copies up to `capacity` records and reports the total (used by tests). `snapshot_stats_invalidate`/`snapshot_stats_clear` free the arrays; `FsContentPluginUnloading`, `FsInitW` and `DllMain(DLL_PROCESS_DETACH)` clear the whole table. When all slots are busy the least recently stored alias is recycled with `GetTickCount64()` as the stamp.
+- **Field rendering (`fscontent.c`):** a static `ContentField` table holds name, `ft_*` type and units; `render_field()` validates the buffer size (`maxlen`) before every write, scales byte counts to the requested unit (1024-based) and returns `ft_fieldempty` for missing values (`ft_nosuchfield` for an unknown index, `ft_fileerror` for a NULL buffer). `resolve_snapshot()` converts the ANSI `FileName` to UTF-16 (`CP_ACP`), decomposes it with `wfx_parse_path()` and only accepts `WFX_PATH_SNAPSHOT_DIR` (deeper paths inherit the snapshot).
 
 ---
 
@@ -250,7 +338,7 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 ```bash
 ./build.sh debug     # Incremental Debug build (build/restic.wfx64, /MTd)
 ./build.sh release   # Optimized Release build (build/restic.wfx64, /MT)
-./build.sh test      # Build plugin + run all three test programs (CRT heap & leak verification)
+./build.sh test      # Build plugin + run all four test programs (CRT heap & leak verification)
 ./build.sh release-test  # Same tests against the optimized /MT /O2 build
 ./build.sh asan      # Rebuild and run unit tests under MSVC AddressSanitizer (DLL smoke test is skipped)
 ./build.sh analyze   # Rebuild plugin & tests with MSVC Static Analyzer (/analyze)
@@ -269,7 +357,8 @@ If Total Commander still has `build/restic.wfx64` loaded, `build.sh` renames the
 | --- | --- |
 | `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty), and verification that the staged `build\restic_plugin.ini` sample template is valid and has 0 active repositories (79-80 assertions). |
 | `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe` including `restic_dump_file` streaming extraction, mtime preservation, 0-byte and 100 KB files, overwrite protection, binary fidelity (`00/0A/0D/1A` bytes), existing target preserved on every failure or abort, no leftover `~rp*.tmp`, local-side failures, argument validation, plus `test_dump_with_fake_restic` (a fake `restic` batch file that deterministically covers exit codes 10/11/12/other, stderr classification, partial output then failure, empty stderr, environment injection and the inactivity timeout: a silent child is killed, a slow but steady one survives) (273 assertions). |
-| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 11-function export surface (`FsGetFile`/`FsGetFileW` included; write/delete/move functions forbidden), embedded `RT_GROUP_ICON` #1 + 5 `RT_ICON` frames (`16x16`..`256x256`), embedded `RT_VERSION` (`VS_VERSION_INFO` / `VS_FIXEDFILEINFO` matching `include/version.h`), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads (160 assertions). |
+| `test_stats.c` | Path decomposition (`wfx_parse_path`: root, alias, snapshot, deep path, malformed/non-hex/empty IDs), statistics parser (`ResticSnapshotInfo` from a fixture with/without `summary`, tags/paths joining and counts, derived duration, `short_id` fallback, skipped entries, `null`/empty/malformed payloads, NULL arguments), per-alias cache (store/lookup/invalidate/clear, case-insensitive alias, replaced entries, 12-alias eviction, empty record list), and the `FsContent*` surface (field enumeration and naming rules, unit strings, values per field with unit scaling, fields inherited by files inside a snapshot, empty alias/root/unknown paths, `ft_nosuchfield`/`ft_fileerror`/`ft_fieldempty` edge cases, buffer truncation, delayed flag, default view/headers/widths/options consistency, NULL buffers, truncated `maxlen`, sort order, no field flags, unloading clears the cache) and the **Code Review 4 hardening tests** (statistics parser vs. listing parser stay index-aligned on non-hex/empty/non-ASCII IDs and bad dates, counters saturate at 2^63-1 for `1e30`/`2^64-1`/negative/string values and never turn negative through `FsContentGetValue`, 200-tag lists are cut without a dangling separator and still counted, UTF-8 host/tag/path text is converted to the ANSI code page and cut on a character boundary, emoji aliases resolve through their ANSI spelling, ambiguous spellings are refused, a literal `?` alias never overwrites a Unicode alias, 4 reader threads + 1 writer thread hammering the cache for 16 000 lookups), plus the **path-spelling and diagnostic tests** (8 accepted spellings of the same snapshot folder - relative, plugin root prepended, bare name, deep file, trailing backslash - with the canonical form still refusing another alias; `snapshot_stats_lookup_any` unique/unknown/NULL/duplicate-alias/conflicting-ID cases and the `snapshot_stats_describe` format; the `RESTIC_WFX_TRACE` switch writing nothing when unset and a full call record when set) (415 assertions). |
+| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 21-function export surface (`FsGetFile`/`FsGetFileW` and the 7 `FsContent*` columns included; write/delete/move functions forbidden), custom-column surface through `GetProcAddress` (field enumeration terminates, names unique, default view references `[=restic.` with one header per column, empty values for unknown paths, sort order, unloading), embedded `RT_GROUP_ICON` #1 + 5 `RT_ICON` frames (`16x16`..`256x256`), embedded `RT_VERSION` (`VS_VERSION_INFO` / `VS_FIXEDFILEINFO` matching `include/version.h`), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads, plus the statistics columns end to end on the live fixture (host name, `FILETIME`, short ID, file count vs. `has_summary`, inheritance for files inside a snapshot, empty columns for a repository that was not enumerated yet, independent entry per alias) (214 assertions in Debug/Release; skipped in ASan runs). |
 
 The live test needs only `tmp\restic.exe` (git-ignored; reported as `[SKIP]` when absent). On every run it rebuilds `tmp\test_fixture\{data,repo}` from scratch (300-file directory, Unicode and shell-metacharacter names, empty directory, 100 KB file, fixed mtime), initializes a repository whose password contains quotes, `%PATH%` and CJK text, takes two snapshots and verifies per-snapshot listings, timestamps and the error mapping (wrong password, missing repository, unknown snapshot, missing path, file used as directory, quote-injection attempt). The fixture stays on disk for inspection.
 

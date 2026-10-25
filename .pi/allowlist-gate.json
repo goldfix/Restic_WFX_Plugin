@@ -31,7 +31,12 @@
     "shell:cat -n *",
     "shell:sed -n *",
     "shell:sed *",
-    "shell:cut *"
+    "shell:cut *",
+    "shell:cd *",
+    "shell:head *",
+    "shell:python *",
+    "shell:od *",
+    "shell:python - <<'PY' *"
   ],
   "deny": []
 }

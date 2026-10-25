@@ -162,6 +162,21 @@ ResticResult restic_list_snapshots(
 );
 
 /**
+ * Runs `restic snapshots --json --no-lock` and hands over the raw UTF-8 JSON so that a single
+ * child process can feed more than one parser (directory listing + snapshot statistics).
+ * Caller must release `*out_json` with free(). On failure `*out_json` is NULL.
+ */
+ResticResult restic_fetch_snapshots_json(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const ResticExecOptions* options,
+    char** out_json,
+    WCHAR* out_error_msg,
+    size_t err_capacity
+);
+
+/**
  * Runs `restic ls --json --no-lock <snapshot_id> <subpath>` and returns Level 2 directory
  * entries. `snapshot_id` must be hexadecimal. On failure `out_error_msg` (optional) receives
  * the reason reported by Restic.

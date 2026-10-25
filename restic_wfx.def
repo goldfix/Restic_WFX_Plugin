@@ -10,3 +10,13 @@ EXPORTS
     FsFindClose
     FsGetFile
     FsGetFileW
+    FsContentGetSupportedField
+    FsContentGetValue
+    FsContentGetValueW
+    FsContentGetSupportedFieldFlags
+    FsContentGetDefaultSortOrder
+    FsContentGetDefaultView
+    FsContentGetDefaultViewW
+    FsContentStopGetValue
+    FsContentStopGetValueW
+    FsContentPluginUnloading
