@@ -21,11 +21,31 @@ void wfx_trace_init(HINSTANCE self);
 /** Returns TRUE when the trace is enabled (result cached; also checks the switch file). */
 BOOL wfx_trace_enabled(void);
 
-/** Appends one formatted line (ignored when the trace is disabled). */
+/**
+ * Appends one formatted line (ignored when the trace is disabled).
+ *
+ * Format contract: use `%s` with `char*` (UTF-8 is passed through unchanged) and the numeric
+ * conversions only. Never use `%ls`: the line is formatted with the narrow CRT, whose `%ls`
+ * conversion fails in the "C" locale as soon as the wide string contains a character outside
+ * ASCII, which would drop the whole line - exactly the case this trace has to survive. Use
+ * wfx_trace_wide_to_utf8() to turn a WCHAR* into a `%s` argument.
+ */
 void wfx_trace_printf(const char* format, ...);
 
 /** Appends `tag: <path>` for a wide path (ignored when the trace is disabled). */
 void wfx_trace_path(const char* tag, const WCHAR* path);
+
+/**
+ * Converts a wide string into UTF-8 for the trace (never fails; `out` is always terminated).
+ * Returns the number of bytes written, 0 for a NULL/empty input or an unusable buffer.
+ */
+size_t wfx_trace_wide_to_utf8(const WCHAR* src, char* out, size_t capacity);
+
+/**
+ * Same as wfx_trace_wide_to_utf8() for an ANSI (code page) string, e.g. the `DefaultIniName`
+ * Total Commander passes in `FsDefaultParamStruct`.
+ */
+size_t wfx_trace_ansi_to_utf8(const char* src, char* out, size_t capacity);
 
 /** Forgets the cached settings so the next call re-reads the environment (tests only). */
 void wfx_trace_reset(void);

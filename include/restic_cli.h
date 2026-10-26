@@ -89,6 +89,8 @@ BOOL restic_extract_snapshot_id(
 /**
  * Normalizes a WFX wide subpath (e.g. L"", L"\\", L"\\C\\Users\\Docs\\") into the canonical
  * UTF-8 forward-slash absolute path required by Restic (e.g. "/", "/C/Users/Docs").
+ * A first segment that starts with two RESTIC_UNC_SEPARATOR_DISPLAY characters is the display
+ * name of a UNC volume and maps back to its real name ("/\\host\share/dir").
  */
 BOOL restic_normalize_filter_path(
     const WCHAR* subpath_w,
@@ -124,6 +126,26 @@ ResticResult restic_parse_ls_ndjson(
     const char* filter_path,
     WIN32_FIND_DATAW** out_items,
     size_t* out_count
+);
+
+/**
+ * Character shown instead of '\' in the name of a UNC volume (U+FF3C FULLWIDTH REVERSE SOLIDUS).
+ * A backup started from a network share (`restic backup \\host\share\dir`) has a root node named
+ * "\\host\share"; the name contains path separators, which a Total Commander file name cannot, so
+ * it is listed as "<FF3C><FF3C>host<FF3C>share" and mapped back by restic_normalize_filter_path().
+ */
+#define RESTIC_UNC_SEPARATOR_DISPLAY ((WCHAR)0xFF3C)
+
+/**
+ * Adds the UNC volumes found in the `paths` of a `restic snapshots --json` result to a root
+ * listing (`*items`/`*count`, allocated with malloc/realloc). Needed because `restic ls <snapshot> /`
+ * prints nothing for snapshots whose root node is a UNC volume. Names already present are not
+ * duplicated. Returns RESTIC_ERR_JSON_PARSE for text that is not a JSON array.
+ */
+ResticResult restic_add_unc_volumes(
+    const char* snapshots_json,
+    WIN32_FIND_DATAW** items,
+    size_t* count
 );
 
 /**

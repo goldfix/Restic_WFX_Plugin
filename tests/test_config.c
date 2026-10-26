@@ -70,8 +70,7 @@ static BOOL make_temp_dir(const WCHAR* prefix, WCHAR* out_dir, size_t capacity) 
 }
 
 /* Test 1: Directory normalization and FsSetDefaultParams extraction */
-static void test_plugin_and_fallback_dirs(void) {
-    config_set_plugin_dir(L"  \"C:\\TotalCmd\\plugins\\wfx\\restic\\\"  ");
+static void test_plugin_and_fallback_dirs(void) {    config_set_plugin_dir(L"  \"C:\\TotalCmd\\plugins\\wfx\\restic\\\"  ");
     EXPECT_WSTR_EQ(config_get_plugin_dir(), L"C:\\TotalCmd\\plugins\\wfx\\restic", "Trim and strip trailing backslash");
 
     config_set_plugin_dir(L"C:\\");
@@ -89,6 +88,49 @@ static void test_plugin_and_fallback_dirs(void) {
         L"C:\\Users\\TestUser\\AppData\\Roaming\\GHISLER",
         "Extract parent directory from DefaultIniName"
     );
+}
+
+/* Test 9: the fallback directory survives an ANSI-unmappable DefaultIniName (TC 11.03+) */
+static void test_fallback_unicode_env(void) {
+    /* Save whatever the build machine may have defined, so the test cannot leak into others */
+    WCHAR saved[CONFIG_MAX_PATH] = {0};
+    DWORD saved_len = GetEnvironmentVariableW(
+        L"COMMANDER_INI_PATH", saved, (DWORD)_countof(saved)
+    );
+
+    EXPECT_TRUE(SetEnvironmentVariableW(L"COMMANDER_INI_PATH", L"C:\\Users\\Mario\\AppData\\Roaming\\GHISLER"),
+                "Define COMMANDER_INI_PATH");
+
+    /* A '?' in the converted name means the ANSI code page lost characters, so the fallback must
+       come from the UTF-16 environment variable instead of a wrong directory */
+    config_set_fallback_from_default_params("C:\\Users\\??\\AppData\\Roaming\\GHISLER\\fsplugin.ini");
+    EXPECT_WSTR_EQ(config_get_fallback_dir(), L"C:\\Users\\Mario\\AppData\\Roaming\\GHISLER",
+                   "Unmappable ANSI path falls back to %COMMANDER_INI_PATH%");
+
+    /* A trailing separator in the variable must not produce a double backslash */
+    SetEnvironmentVariableW(L"COMMANDER_INI_PATH", L"C:\\TotalCmd\\ini\\");
+    FsDefaultParamStruct dps;
+    memset(&dps, 0, sizeof(dps));
+    dps.size = sizeof(dps);
+    FsSetDefaultParams(&dps); /* DefaultIniName empty -> only the environment variable is left */
+    EXPECT_WSTR_EQ(config_get_fallback_dir(), L"C:\\TotalCmd\\ini",
+                   "Empty DefaultIniName uses the environment variable, separators stripped");
+
+    /* A usable DefaultIniName still wins over the variable */
+    strncpy_s(dps.DefaultIniName, sizeof(dps.DefaultIniName),
+              "C:\\TotalCmd\\fromdps\\fsplugin.ini", _TRUNCATE);
+    FsSetDefaultParams(&dps);
+    EXPECT_WSTR_EQ(config_get_fallback_dir(), L"C:\\TotalCmd\\fromdps",
+                   "Mappable DefaultIniName takes precedence over %COMMANDER_INI_PATH%");
+
+    /* Without the variable and without a usable name nothing is derived */
+    SetEnvironmentVariableW(L"COMMANDER_INI_PATH", NULL);
+    config_set_fallback_from_default_params(NULL);
+    EXPECT_WSTR_EQ(config_get_fallback_dir(), L"", "No source -> empty fallback directory");
+
+    if (saved_len > 0 && saved_len < _countof(saved)) {
+        SetEnvironmentVariableW(L"COMMANDER_INI_PATH", saved);
+    }
 }
 
 /* Test 2: INI path resolution (primary plugin dir vs fallback dir) */
@@ -573,6 +615,7 @@ int main(void) {
     test_large_repository_list();
     test_wfx_routing_and_callbacks();
     test_missing_ini_is_harmless();
+    test_fallback_unicode_env();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     EXPECT_TRUE(_CrtCheckMemory(), "CRT heap integrity check must pass");

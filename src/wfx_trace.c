@@ -101,56 +101,115 @@ static void write_line(const char* text) {
     const LONG number = InterlockedIncrement(&g_Lines);
     if (number > WFX_TRACE_MAX_LINES) return;
 
+    /* The whole open/append/close sequence runs under the lock: two worker threads logging at the
+       same time must not interleave, and the CREATE_ALWAYS of the first line must not truncate a
+       line written by another thread. Contention is irrelevant for a diagnostic. */
     AcquireSRWLockExclusive(&g_Lock);
     if (g_FilePath[0] == L'\0') {
         build_file_path(g_FilePath, _countof(g_FilePath));
     }
-    const WCHAR* path = g_FilePath;
-    const BOOL first  = (number == 1);
+    if (g_FilePath[0] != L'\0') {
+        /* CREATE_ALWAYS on the first line truncates a file left over by a previous session */
+        HANDLE file = CreateFileW(
+            g_FilePath,
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            (number == 1) ? CREATE_ALWAYS : OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(file, text, (DWORD)strlen(text), &written, NULL);
+            WriteFile(file, "\r\n", 2, &written, NULL);
+            CloseHandle(file);
+        }
+    }
     ReleaseSRWLockExclusive(&g_Lock);
-    if (path[0] == L'\0') return;
+}
 
-    /* CREATE_ALWAYS on the first line truncates a file left over by a previous session */
-    HANDLE file = CreateFileW(
-        path,
-        FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        first ? CREATE_ALWAYS : OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
+size_t wfx_trace_wide_to_utf8(const WCHAR* src, char* out, size_t capacity) {
+    if (out == NULL || capacity == 0) return 0;
+    out[0] = '\0';
+    if (src == NULL || src[0] == L'\0') return 0;
+
+    /* Fast path: the whole text fits (the common case, and exact for ASCII paths) */
+    int written = WideCharToMultiByte(
+        CP_UTF8, 0, src, -1, out, (int)capacity, NULL, NULL
     );
-    if (file == INVALID_HANDLE_VALUE) return;
+    if (written > 0) {
+        return (size_t)(written - 1); /* Exclude the NUL terminator */
+    }
 
-    DWORD written = 0;
-    WriteFile(file, text, (DWORD)strlen(text), &written, NULL);
-    WriteFile(file, "\r\n", 2, &written, NULL);
-    CloseHandle(file);
+    /* WideCharToMultiByte fails (instead of truncating) when the buffer is too small, so the
+       input is limited: UTF-8 needs at most 3 bytes per UTF-16 unit (a surrogate pair is 4
+       bytes for 2 units). A pair is never split at the cut. */
+    size_t units = wcslen(src);
+    if (units > (capacity - 1) / 3) {
+        units = (capacity - 1) / 3;
+        if (units > 0 && src[units - 1] >= 0xD800 && src[units - 1] <= 0xDBFF) {
+            --units;
+        }
+    }
+    if (units == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+
+    written = WideCharToMultiByte(
+        CP_UTF8, 0, src, (int)units, out, (int)(capacity - 1), NULL, NULL
+    );
+    if (written <= 0) {
+        out[0] = '\0';
+        return 0;
+    }
+    out[written] = '\0';
+    return (size_t)written;
+}
+
+size_t wfx_trace_ansi_to_utf8(const char* src, char* out, size_t capacity) {
+    if (out == NULL || capacity == 0) return 0;
+    out[0] = '\0';
+    if (src == NULL || src[0] == '\0') return 0;
+
+    WCHAR wide[MAX_PATH * 4 + 1] = {0};
+    if (MultiByteToWideChar(CP_ACP, 0, src, -1, wide, (int)_countof(wide)) <= 0) {
+        return 0;
+    }
+    return wfx_trace_wide_to_utf8(wide, out, capacity);
 }
 
 void wfx_trace_init(HINSTANCE self) {
     remember_plugin_dir(self);
     if (!wfx_trace_enabled()) return;
 
-    char line[512] = {0};
+    char line[MAX_PATH * 3 + 128] = {0};
+    char path_utf8[MAX_PATH * 3 + 1] = {0};
     WCHAR path[MAX_PATH] = {0};
     build_file_path(path, _countof(path));
+    if (path[0] != L'\0') {
+        wfx_trace_wide_to_utf8(path, path_utf8, sizeof(path_utf8));
+    }
     _snprintf_s(
         line,
         _countof(line),
         _TRUNCATE,
-        "--- restic wfx trace, pid=%lu, temp=%ls",
+        "--- restic wfx trace, pid=%lu, temp=%s",
         (unsigned long)GetCurrentProcessId(),
-        (path[0] != L'\0') ? path : L"<unavailable>"
+        (path_utf8[0] != '\0') ? path_utf8 : "<unavailable>"
     );
     write_line(line);
-    wfx_trace_printf("plugin dir: %ls", (g_DirKnown ? g_PluginDir : L"<unknown>"));
+
+    path_utf8[0] = '\0';
+    wfx_trace_wide_to_utf8(g_DirKnown ? g_PluginDir : L"<unknown>", path_utf8, sizeof(path_utf8));
+    wfx_trace_printf("plugin dir: %s", path_utf8);
 }
 
 void wfx_trace_printf(const char* format, ...) {
     if (format == NULL || !wfx_trace_enabled()) return;
 
-    char text[1024] = {0};
+    char text[2048] = {0};
     va_list args;
     va_start(args, format);
     _vsnprintf_s(text, _countof(text), _TRUNCATE, format, args);
@@ -160,7 +219,12 @@ void wfx_trace_printf(const char* format, ...) {
 
 void wfx_trace_path(const char* tag, const WCHAR* path) {
     if (!wfx_trace_enabled()) return;
-    wfx_trace_printf("%s: %ls", (tag != NULL) ? tag : "path", (path != NULL) ? path : L"<null>");
+
+    /* Wide paths are converted here and printed with %s: a narrow %ls conversion would fail (and
+       drop the line) for any character outside the "C" locale, e.g. an accented user name. */
+    char path_utf8[2048] = {0};
+    wfx_trace_wide_to_utf8(path != NULL ? path : L"<null>", path_utf8, sizeof(path_utf8));
+    wfx_trace_printf("%s: %s", (tag != NULL) ? tag : "path", path_utf8);
 }
 
 void wfx_trace_reset(void) {
@@ -175,8 +239,11 @@ void wfx_trace_file_path(WCHAR* out, size_t capacity) {
     if (out == NULL || capacity == 0) return;
     out[0] = L'\0';
     if (!wfx_trace_enabled()) return;
+
+    AcquireSRWLockExclusive(&g_Lock);
     if (g_FilePath[0] == L'\0') {
         build_file_path(g_FilePath, _countof(g_FilePath));
     }
     wcsncpy_s(out, capacity, g_FilePath, _TRUNCATE);
+    ReleaseSRWLockExclusive(&g_Lock);
 }

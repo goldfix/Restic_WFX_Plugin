@@ -42,6 +42,7 @@ static int g_tests_failed = 0;
 /* Local copies of the WFX constants and prototypes (the plugin is only reachable through GetProcAddress) */
 #define RT_Password            2
 #define RT_MsgOK               8
+#define MSGTYPE_TRANSFERCOMPLETE 4
 #define MSGTYPE_IMPORTANTERROR 6
 
 #define FS_FILE_OK             0
@@ -348,6 +349,8 @@ static void test_fallback_ini_from_default_params(void) {
 static int   g_e2e_pwd_prompts      = 0;
 static int   g_e2e_msg_dialogs      = 0;
 static int   g_e2e_error_logs       = 0;
+static int   g_e2e_transfer_logs    = 0;
+static WCHAR g_e2e_last_transfer[512] = {0};
 static int   g_e2e_progress_calls   = 0;
 static BOOL  g_e2e_force_abort      = FALSE;
 static BOOL  g_e2e_abort_after_start = FALSE; /* abort once the transfer reports progress above 0 % */
@@ -375,6 +378,9 @@ static void __stdcall e2e_log_proc(int PluginNr, int MsgType, WCHAR* LogString) 
     (void)PluginNr;
     if (MsgType == MSGTYPE_IMPORTANTERROR && LogString) {
         g_e2e_error_logs++;
+    } else if (MsgType == MSGTYPE_TRANSFERCOMPLETE && LogString) {
+        g_e2e_transfer_logs++;
+        wcsncpy_s(g_e2e_last_transfer, _countof(g_e2e_last_transfer), LogString, _TRUNCATE);
     }
 }
 
@@ -508,9 +514,19 @@ static void test_e2e_file_and_folder_extraction(const Plugin* p, const WCHAR* di
 
     RemoteInfo ri = {5, 0, {0x802D2000, 0x01D5EF01}, FILE_ATTRIBUTE_READONLY};
     g_e2e_progress_percent = -1;
+    g_e2e_transfer_logs    = 0;
+    g_e2e_last_transfer[0] = L'\0';
     EXPECT_TRUE(p->get_file_w(remote_readme, local_readme, 0, &ri) == FS_FILE_OK,
                 "FsGetFileW extracts readme.txt");
     EXPECT_TRUE(g_e2e_progress_percent == 100, "FsGetFileW reports 100% completion to ProgressProcW");
+    /* WFX SDK, LogProc: a completed download is logged as
+       "Download complete: \\Filesystem\\dir1\\file1.txt -> c:\\localdir\\file1.txt" */
+    EXPECT_TRUE(g_e2e_transfer_logs == 1, "FsGetFileW reports one MSGTYPE_TRANSFERCOMPLETE");
+    EXPECT_TRUE(wcsncmp(g_e2e_last_transfer, L"Download complete: ", 19) == 0,
+                "Transfer log starts with the documented prefix");
+    EXPECT_TRUE(wcsstr(g_e2e_last_transfer, L" -> ") != NULL &&
+                    wcsstr(g_e2e_last_transfer, L"readme.txt") != NULL,
+                "Transfer log contains both names separated by \" -> \"");
 
     /* Calling FsGetFileW again without FS_COPYFLAGS_OVERWRITE returns FS_FILE_EXISTS (TC overwrite prompt) */
     EXPECT_TRUE(p->get_file_w(remote_readme, local_readme, 0, &ri) == FS_FILE_EXISTS,
@@ -863,7 +879,44 @@ static void test_e2e_statistics_columns(const Plugin* p_in, WCHAR (*snap_names)[
     swprintf_s(other_wide, _countof(other_wide), L"\\SecondRepo\\%ls", snap_names[0]);
     WideCharToMultiByte(CP_ACP, 0, other_wide, -1, other_path, (int)sizeof(other_path), NULL, NULL);
     EXPECT_TRUE(get_value(other_path, f_host, 0, other, (int)sizeof(other), 0) == ft_fieldempty,
-                "A repository that was not enumerated yet has no statistics (no hidden restic run)");
+                "A repository that was never listed has no statistics until a snapshot folder is entered");
+}
+
+/*
+ * Cold start: Total Commander can jump straight into a snapshot folder (address bar, Ctrl+D,
+ * history) without ever listing \<Alias>. The plugin then runs one `restic snapshots --json`
+ * after the directory listing succeeded, so the columns are filled anyway.
+ */
+static void test_e2e_cold_start_statistics(const Plugin* p_in, const WCHAR* snapshot_name) {
+    const Plugin p = *p_in;
+    PFN_ContentGetValue get_value =
+        (PFN_ContentGetValue)(void*)GetProcAddress(p.module, "FsContentGetValue");
+    int f_host = find_content_field(p.module, "hostname");
+    EXPECT_TRUE(get_value && f_host >= 0, "Content fields resolve in the loaded plugin");
+
+    char path_a[MAX_PATH * 2] = {0};
+    char host[128] = {0};
+    WCHAR path_w[MAX_PATH * 2];
+    swprintf_s(path_w, _countof(path_w), L"\\ColdRepo\\%ls", snapshot_name);
+    WideCharToMultiByte(CP_ACP, 0, path_w, -1, path_a, (int)sizeof(path_a), NULL, NULL);
+    EXPECT_TRUE(get_value(path_a, f_host, 0, host, (int)sizeof(host), 0) == ft_fieldempty,
+                "ColdRepo starts cold (no statistics before its level 2 is listed)");
+
+    /* Enter the snapshot folder directly: the listing runs `restic ls`, the cache fill runs
+       `restic snapshots` a second time with the password that just worked */
+    g_e2e_pwd_mode    = 1;
+    g_e2e_pwd_prompts = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = p.find_first_w(path_w, &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "A snapshot folder can be listed without listing its alias level");
+    if (h != INVALID_HANDLE_VALUE) {
+        p.find_close(h);
+    }
+    EXPECT_TRUE(g_e2e_pwd_prompts == 1, "Only the directory listing prompts; the statistics run reuses the password");
+
+    host[0] = '\0';
+    EXPECT_TRUE(get_value(path_a, f_host, 0, host, (int)sizeof(host), 0) == ft_string && host[0] != '\0',
+                "Cold start fills the statistics cache of that repository");
 }
 
 /* Statistics are cached per alias: SecondRepo gets its own entry once it has been enumerated */
@@ -879,6 +932,73 @@ static void test_e2e_second_repo_columns(const Plugin* p_in, const WCHAR* snapsh
     WideCharToMultiByte(CP_ACP, 0, path_w, -1, path_a, (int)sizeof(path_a), NULL, NULL);
     EXPECT_TRUE(get_value(path_a, f_host, 0, host, (int)sizeof(host), 0) == ft_string && host[0] != '\0',
                 "Enumerating a second repository fills its own statistics entry");
+}
+
+/* Adds the optional UNC-share repository (created by test_restic_cli.exe) to the E2E INI text */
+static BOOL append_unc_repo_to_ini(char* ini_text, size_t capacity, int* ini_len) {
+    WCHAR repo_abs[MAX_PATH] = {0}, config_path[MAX_PATH] = {0};
+    GetFullPathNameW(L"tmp\\test_fixture\\repo_unc", MAX_PATH, repo_abs, NULL);
+    swprintf_s(config_path, _countof(config_path), L"%ls\\config", repo_abs);
+    if (GetFileAttributesW(config_path) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    char repo_a[MAX_PATH] = {0};
+    WideCharToMultiByte(CP_ACP, 0, repo_abs, -1, repo_a, sizeof(repo_a), NULL, NULL);
+    *ini_len += snprintf(ini_text + *ini_len, capacity - (size_t)*ini_len, "UncRepo=%s\r\n", repo_a);
+    return TRUE;
+}
+
+/*
+ * A backup started from a network share has a root node named "\\host\share". It is shown as a
+ * folder whose name uses full-width solidus characters and must navigate and extract through the
+ * real entry points. The repository is created by test_restic_cli.exe (skipped when absent).
+ */
+static void test_e2e_unc_share(const Plugin* p_in) {
+    const Plugin p = *p_in;
+    WIN32_FIND_DATAW fd;
+    WCHAR data_abs[MAX_PATH] = {0};
+    GetFullPathNameW(L"tmp\\test_fixture\\data", MAX_PATH, data_abs, NULL);
+
+    g_e2e_pwd_mode    = 1;
+    g_e2e_pwd_prompts = 0;
+    HANDLE h = p.find_first_w(L"\\UncRepo", &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "The UNC repository lists its snapshot");
+    WCHAR snap[MAX_PATH] = {0};
+    wcsncpy_s(snap, MAX_PATH, fd.cFileName, _TRUNCATE);
+    p.find_close(h);
+
+    WCHAR path[MAX_PATH * 4];
+    swprintf_s(path, _countof(path), L"\\UncRepo\\%ls", snap);
+    h = p.find_first_w(path, &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "The snapshot root of a UNC backup is not empty");
+    WCHAR volume[MAX_PATH] = {0};
+    wcsncpy_s(volume, MAX_PATH, fd.cFileName, _TRUNCATE);
+    EXPECT_TRUE(volume[0] == 0xFF3C && volume[1] == 0xFF3C && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+                "The UNC volume is a folder named with full-width solidus characters");
+    EXPECT_TRUE(!p.find_next_w(h, &fd), "The snapshot root holds only the UNC volume");
+    p.find_close(h);
+
+    swprintf_s(path, _countof(path), L"\\UncRepo\\%ls\\%ls%ls", snap, volume, data_abs + 2);
+    h = p.find_first_w(path, &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "The backed up directory below the UNC volume can be opened");
+    BOOL saw_readme = FALSE;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L"readme.txt") == 0) saw_readme = TRUE;
+        } while (p.find_next_w(h, &fd));
+        p.find_close(h);
+    }
+    EXPECT_TRUE(saw_readme, "readme.txt is listed below the UNC volume");
+
+    WCHAR remote[MAX_PATH * 4], local[MAX_PATH];
+    swprintf_s(remote, _countof(remote), L"%ls\\readme.txt", path);
+    GetFullPathNameW(L"tmp\\test_fixture\\unc_dll_readme.txt", MAX_PATH, local, NULL);
+    DeleteFileW(local);
+    RemoteInfo ri = {5, 0, {0, 0}, FILE_ATTRIBUTE_READONLY};
+    EXPECT_TRUE(p.get_file_w(remote, local, 0, &ri) == FS_FILE_OK, "A file below the UNC volume is extracted");
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    EXPECT_TRUE(GetFileAttributesExW(local, GetFileExInfoStandard, &fad) && fad.nFileSizeLow == 5,
+                "The extracted file has the original size");
+    DeleteFileW(local);
 }
 
 static void test_live_end_to_end_navigation(void) {
@@ -906,9 +1026,9 @@ static void test_live_end_to_end_navigation(void) {
         ini_text,
         sizeof(ini_text),
         "[Settings]\r\nResticPath=%s\r\n[Repositories]\r\nMainRepo=%s\r\nSecondRepo=%s\r\nThirdRepo=%s\r\n"
-        "ExtractRepo=%s\r\n"
-        "MissingRepo=C:\\no_such_restic_repo_999\r\n%s=C:\\no_such_restic_repo_999\r\n",
+        "ColdRepo=%s\r\nExtractRepo=%s\r\nMissingRepo=C:\\no_such_restic_repo_999\r\n%s=C:\\no_such_restic_repo_999\r\n",
         restic_a,
+        repo_a,
         repo_a,
         repo_a,
         repo_a,
@@ -918,6 +1038,7 @@ static void test_live_end_to_end_navigation(void) {
     for (int i = 1; i <= 10; ++i) { /* More aliases than session slots (8) */
         ini_len += snprintf(ini_text + ini_len, sizeof(ini_text) - (size_t)ini_len, "Slot%02d=%s\r\n", i, repo_a);
     }
+    const BOOL have_unc = append_unc_repo_to_ini(ini_text, sizeof(ini_text), &ini_len);
     EXPECT_TRUE(ini_len > 0 && (size_t)ini_len < sizeof(ini_text), "E2E INI fits its buffer");
     EXPECT_TRUE(write_file(ini, ini_text), "Write E2E INI");
 
@@ -951,6 +1072,7 @@ static void test_live_end_to_end_navigation(void) {
     EXPECT_TRUE(snap_count == 2, "Both fixture snapshots returned at Level 1");
 
     test_e2e_statistics_columns(&p, snap_names);
+    test_e2e_cold_start_statistics(&p, snap_names[0]);
 
     /* 2. Level 2+ (\MainRepo\<snap>\...): session password cached in RAM (0 additional prompts) */
     g_e2e_pwd_prompts = 0;
@@ -1006,6 +1128,11 @@ static void test_live_end_to_end_navigation(void) {
     EXPECT_TRUE(g_e2e_pwd_prompts == 1, "Alternating between two panels' repositories never re-prompts");
 
     test_e2e_second_repo_columns(&p, snap_names[0]);
+    if (have_unc) {
+        test_e2e_unc_share(&p);
+    } else {
+        printf("[SKIP] tmp\\test_fixture\\repo_unc not found: UNC share E2E skipped.\n");
+    }
 
     /* 4. Exhausting all 3 password attempts returns ERROR_ACCESS_DENIED and shows an error dialog */
     g_e2e_pwd_mode    = 2;

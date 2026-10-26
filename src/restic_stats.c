@@ -94,6 +94,11 @@ static unsigned int json_join_string_array(
         size_t copy_len = text_len;
         if (copy_len > capacity - used - 1) {
             copy_len = capacity - used - 1;
+            /* Never cut in the middle of a multi-byte UTF-8 sequence: drop the partial character
+               entirely, otherwise the column would end with a broken character. */
+            while (copy_len > 0 && ((unsigned char)text[copy_len] & 0xC0) == 0x80) {
+                --copy_len;
+            }
         }
         memcpy(out + used, text, copy_len);
         used += copy_len;
@@ -448,14 +453,28 @@ size_t snapshot_stats_describe(char* out, size_t capacity) {
     size_t length = 0;
     AcquireSRWLockShared(&g_CacheLock);
     for (size_t i = 0; i < SNAPSHOT_CACHE_SLOTS; ++i) {
+        if (g_Cache[i].used) {
+            ++used;
+        }
+    }
+    for (size_t i = 0; i < SNAPSHOT_CACHE_SLOTS && length + 1 < capacity; ++i) {
         if (!g_Cache[i].used) continue;
-        ++used;
+
+        /* Aliases are Unicode and the summary is written to a file, so the alias is converted to
+           UTF-8: a narrow %ls conversion fails in the "C" locale for any non-ASCII character and
+           would truncate the rest of the diagnostic line. */
+        char alias_utf8[MAX_PATH * 3 + 1] = {0};
+        if (WideCharToMultiByte(CP_UTF8, 0, g_Cache[i].alias, -1, alias_utf8, sizeof(alias_utf8),
+                                NULL, NULL) <= 0) {
+            strncpy_s(alias_utf8, sizeof(alias_utf8), "?", _TRUNCATE);
+        }
+
         int written = _snprintf_s(
             out + length,
             capacity - length,
             _TRUNCATE,
-            "%ls(%zu) ",
-            g_Cache[i].alias,
+            "%s(%zu) ",
+            alias_utf8,
             g_Cache[i].count
         );
         if (written <= 0) break;

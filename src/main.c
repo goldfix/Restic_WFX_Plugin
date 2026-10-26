@@ -339,6 +339,36 @@ static ResticResult list_snapshots_and_cache_stats(
     return res;
 }
 
+/*
+ * Fills the statistics cache on demand. Total Commander may enter a snapshot folder directly
+ * (address bar, Ctrl+D directory hotlist, history) without ever listing \<Alias>, and every
+ * custom column of that level would stay empty. Once a directory listing of a repository whose
+ * cache is still cold has succeeded, run exactly the same `restic snapshots --json` the alias
+ * level would have run. It happens at most once per alias and session, needs no extra password
+ * (the one that just worked is reused) and a failure is ignored: the listing already succeeded.
+ */
+static void ensure_snapshot_stats_cached(
+    const WCHAR* restic_exe,
+    const ResticRepoEntry* repo,
+    const WCHAR* password,
+    const ResticExecOptions* exec_opts
+) {
+    size_t cached = 0;
+    if (snapshot_stats_lookup_alias(repo->alias, NULL, 0, &cached) && cached > 0) {
+        return; /* Warm cache: nothing to do */
+    }
+
+    WIN32_FIND_DATAW* snap_items = NULL;
+    size_t snap_count            = 0;
+    WCHAR err_msg[256]           = {0};
+    ResticResult res             = list_snapshots_and_cache_stats(
+        restic_exe, repo, password, exec_opts, &snap_items, &snap_count, err_msg, _countof(err_msg)
+    );
+    if (res == RESTIC_OK) {
+        free(snap_items);
+    }
+}
+
 /* Executes a Level 1 (snapshots) or Level 2 (directory) query with password prompt/retry */
 static HANDLE execute_repo_query(
     const WCHAR* virtual_path,
@@ -395,6 +425,9 @@ static HANDLE execute_repo_query(
                 err_msg,
                 _countof(err_msg)
             );
+            if (res == RESTIC_OK) {
+                ensure_snapshot_stats_cached(restic_exe, repo, password, &exec_opts);
+            }
         }
 
         if (res == RESTIC_ERR_WRONG_PASSWORD) {
@@ -470,7 +503,11 @@ int __stdcall FsInitW(
 void __stdcall FsSetDefaultParams(FsDefaultParamStruct* dps) {
     if (dps != NULL) {
         config_set_fallback_from_default_params(dps->DefaultIniName);
-        wfx_trace_printf("default ini: %s", dps->DefaultIniName);
+        char ini_utf8[MAX_PATH * 4 + 1] = {0};
+        if (wfx_trace_enabled()) {
+            wfx_trace_ansi_to_utf8(dps->DefaultIniName, ini_utf8, sizeof(ini_utf8));
+        }
+        wfx_trace_printf("default ini: %s", ini_utf8);
     }
 }
 
@@ -723,6 +760,20 @@ int __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, Rem
     int ret = FS_FILE_READERROR;
     switch (res) {
         case RESTIC_OK:
+            /* LogProc protocol (WFX SDK): both names separated by " -> " and prefixed with the
+               operation, so the FTP log window / log file shows what has been copied */
+            if (g_LogProc != NULL) {
+                WCHAR done_msg[2 * MAX_PATH + 64] = {0};
+                _snwprintf_s(
+                    done_msg,
+                    _countof(done_msg),
+                    _TRUNCATE,
+                    L"Download complete: %ls -> %ls",
+                    RemoteName,
+                    LocalName
+                );
+                g_LogProc(g_PluginNr, MSGTYPE_TRANSFERCOMPLETE, done_msg);
+            }
             if (g_ProgressProc) {
                 g_ProgressProc(g_PluginNr, RemoteName, LocalName, 100);
             }
