@@ -1127,6 +1127,20 @@ static void test_content_trace_is_opt_in(void) {
     EXPECT_TRUE(strstr(log, "field=") != NULL, "Trace records the requested field");
     EXPECT_TRUE(strstr(log, "-> -3") != NULL, "Trace records the ft_fieldempty result code");
 
+    /* Non-ASCII paths are converted to UTF-8 before formatting: a narrow %ls conversion fails in
+       the "C" locale and would silently drop the whole line, which is exactly the case where the
+       trace is needed */
+    FILETIME when = {0};
+    FsContentGetValueW(L"\\Jos\u00e9\\\u65e5\u672c\\2026-10-18_16-28-15_[5e395062]", 0, 0, &when,
+                       (int)sizeof(when), 0);
+    memset(log, 0, sizeof(log));
+    read_trace_into(log, sizeof(log));
+    EXPECT_TRUE(strstr(log, "Jos\xC3\xA9") != NULL,
+                "A wide path with an accent is recorded as UTF-8");
+    EXPECT_TRUE(strstr(log, "\xE6\x97\xA5\xE6\x9C\xAC") != NULL,
+                "A wide path with CJK characters is recorded as UTF-8");
+    EXPECT_TRUE(strstr(log, "valueW '") != NULL, "The Unicode entry point names itself in the trace");
+
     /* "0" disables the trace again, exactly like an unset variable */
     SetEnvironmentVariableW(L"RESTIC_WFX_TRACE", L"0");
     wfx_trace_reset();
@@ -1253,6 +1267,137 @@ static void test_content_unicode_values(void) {
     restic_free_snapshot_list(items);
 }
 
+/* UTF-8 truncation never cuts a multi-byte sequence in half (tags and diagnostic summary) */
+static void test_utf8_truncation_boundaries(void) {
+    /* A single tag of 200 x U+20AC (3 bytes each): the joined text has to be cut at the 512-byte
+       buffer limit, which lands inside the 2nd byte of a character with a naive memcpy */
+    char json[1024] = {0};
+    int len = snprintf(
+        json, sizeof(json),
+        "[{\"time\":\"2026-10-18T16:28:15Z\",\"id\":\"aabbccdd\",\"tags\":[\""
+    );
+    for (int i = 0; i < 200; ++i) {
+        len += snprintf(json + len, sizeof(json) - (size_t)len, "\xE2\x82\xAC");
+    }
+    snprintf(json + len, sizeof(json) - (size_t)len, "\"]}]");
+
+    ResticSnapshotInfo* items = NULL;
+    size_t count              = 0;
+    EXPECT_TRUE(restic_parse_snapshot_list(json, &items, &count) == RESTIC_OK && count == 1,
+                "Snapshot with a 600-byte multi-byte tag is parsed");
+    const size_t used = strlen(items[0].tags);
+    EXPECT_TRUE(used > 0 && used < RESTIC_STATS_TAGS_MAX, "Truncated tag text fits the buffer");
+    EXPECT_TRUE(used % 3 == 0, "Truncated tag text ends on a complete 3-byte character");
+    EXPECT_TRUE(used >= 3 * 160, "Truncation keeps the longest prefix that still fits");
+    EXPECT_TRUE(strcmp(items[0].tags + used - 3, "\xE2\x82\xAC") == 0, "Last kept character is complete");
+    restic_free_snapshot_list(items);
+
+    /* Aliases outside ASCII are printed as UTF-8 in the diagnostic summary, and every occupied
+       slot is counted even when the text does not fit in the caller's buffer */
+    ResticSnapshotInfo* fixture = NULL;
+    size_t fixture_count        = 0;
+    load_fixture(&fixture, &fixture_count);
+    snapshot_stats_clear();
+    EXPECT_TRUE(snapshot_stats_store(L"\u65e5\u672c\u8a9e", fixture, fixture_count),
+                "Non-ASCII alias is cached");
+    EXPECT_TRUE(snapshot_stats_store(L"\u4e2d\u6587", fixture, fixture_count),
+                "Second non-ASCII alias is cached");
+
+    char description[256] = {0};
+    EXPECT_I64_EQ(snapshot_stats_describe(description, sizeof(description)), 2,
+                  "Describe reports both aliases");
+    EXPECT_TRUE(strstr(description, "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E") != NULL,
+                "Alias is written as UTF-8 instead of being dropped by a narrow %ls conversion");
+    EXPECT_TRUE(strstr(description, "\xE4\xB8\xAD\xE6\x96\x87") != NULL,
+                "Every non-ASCII alias survives the summary");
+
+    char tiny[8] = {0};
+    EXPECT_I64_EQ(snapshot_stats_describe(tiny, sizeof(tiny)), 2,
+                  "Every slot is counted although the text does not fit");
+    EXPECT_TRUE(strlen(tiny) < sizeof(tiny), "Truncated summary stays terminated");
+
+    snapshot_stats_clear();
+    restic_free_snapshot_list(fixture);
+}
+
+/* The trace converter truncates instead of failing, and never splits a character or a pair */
+static void test_trace_utf8_conversion_limits(void) {
+    char out[16] = {0};
+
+    /* 10 x U+65E5 need 30 bytes; 15 usable bytes hold 5 complete characters */
+    size_t n = wfx_trace_wide_to_utf8(L"\u65e5\u65e5\u65e5\u65e5\u65e5\u65e5\u65e5\u65e5\u65e5\u65e5",
+                                      out, sizeof(out));
+    EXPECT_I64_EQ(n, 15, "Too long input is truncated to the characters that fit");
+    EXPECT_I64_EQ(strlen(out), 15, "Truncated text is terminated");
+    EXPECT_TRUE(memcmp(out, "\xE6\x97\xA5\xE6\x97\xA5\xE6\x97\xA5\xE6\x97\xA5\xE6\x97\xA5", 15) == 0,
+                "Truncation lands on a character boundary");
+
+    /* U+1F600 is a surrogate pair (4 bytes). 2 + 4 + 4 bytes + terminator do not fit in 10 bytes and
+       the worst-case cut (3 units) would end on the high half of the first pair: drop it whole */
+    char tiny[10] = {0};
+    n = wfx_trace_wide_to_utf8(L"ab\xD83D\xDE00\xD83D\xDE00", tiny, sizeof(tiny));
+    EXPECT_I64_EQ(n, 2, "A pair that would be cut in half is not encoded");
+    EXPECT_TRUE(strncmp(tiny, "ab", 2) == 0 && tiny[2] == '\0', "Only the complete characters remain");
+
+    EXPECT_I64_EQ(wfx_trace_wide_to_utf8(NULL, out, sizeof(out)), 0, "NULL input gives an empty string");
+    EXPECT_TRUE(out[0] == '\0', "NULL input terminates the buffer");
+    EXPECT_I64_EQ(wfx_trace_wide_to_utf8(L"abc", NULL, 4), 0, "NULL output is refused");
+    EXPECT_I64_EQ(wfx_trace_wide_to_utf8(L"abc", out, 1), 0, "A one byte buffer holds only the terminator");
+    EXPECT_TRUE(out[0] == '\0', "One byte buffer is terminated");
+
+    char ansi_out[32] = {0};
+    EXPECT_I64_EQ(wfx_trace_ansi_to_utf8("C:\\TC\\fsplugin.ini", ansi_out, sizeof(ansi_out)), 18,
+                  "ANSI text is converted to UTF-8");
+    EXPECT_STR_EQ(ansi_out, "C:\\TC\\fsplugin.ini", "ASCII survives the ANSI conversion unchanged");
+}
+
+/*
+ * Loose path spellings prefer the segment in front of the snapshot as repository alias: when two
+ * repositories cache a snapshot with the same short ID, the cross-repository fallback is
+ * ambiguous, but the alias resolves the row unambiguously.
+ */
+static void test_loose_lookup_prefers_the_alias(void) {
+    ResticSnapshotInfo* items = NULL;
+    size_t count              = 0;
+    load_fixture(&items, &count);
+
+    /* A different snapshot that reuses the short ID of the fixture's first entry */
+    ResticSnapshotInfo clash[1];
+    memset(clash, 0, sizeof(clash));
+    _snprintf_s(clash[0].id, sizeof(clash[0].id), _TRUNCATE, "ffffffff%056d", 1);
+    _snprintf_s(clash[0].short_id, sizeof(clash[0].short_id), _TRUNCATE, "5e395062");
+    strcpy_s(clash[0].hostname, sizeof(clash[0].hostname), "OTHER");
+
+    snapshot_stats_clear();
+    EXPECT_TRUE(snapshot_stats_store(L"RepoA", items, count), "Fixture is cached as RepoA");
+    EXPECT_TRUE(snapshot_stats_store(L"RepoC", clash, 1), "Conflicting record is cached as RepoC");
+    ResticSnapshotInfo found;
+    EXPECT_TRUE(!snapshot_stats_lookup_any("5e395062", &found),
+                "Cross-repository lookup is ambiguous for the shared short ID");
+
+    /* "<plugin name>\<alias>\<snapshot>" is not the canonical plugin path, so it reaches the
+       loose scan, which must use the alias segment instead of the ambiguous fallback */
+    char host[64] = {0};
+    EXPECT_TRUE(FsContentGetValue("\\\\Restic Backups\\RepoA\\2026-10-18_16-28-15_[5e395062]",
+                                  field_index("hostname"), 0, host, (int)sizeof(host), 0) == ft_string,
+                "Loose spelling resolves through the alias segment");
+    EXPECT_STR_EQ(host, "GOLDFIX-PC", "The alias selects the right repository");
+
+    char other[64] = {0};
+    EXPECT_TRUE(FsContentGetValue("\\\\Restic Backups\\RepoC\\2026-10-18_16-28-15_[5e395062]",
+                                  field_index("hostname"), 0, other, (int)sizeof(other), 0) == ft_string,
+                "The same spelling resolves for the other repository");
+    EXPECT_STR_EQ(other, "OTHER", "Each alias keeps its own record");
+
+    /* Without an alias segment the ambiguous fallback stays empty instead of guessing */
+    EXPECT_TRUE(FsContentGetValue("\\\\Restic Backups\\2026-10-18_16-28-15_[5e395062]",
+                                  field_index("hostname"), 0, host, (int)sizeof(host), 0) == ft_fieldempty,
+                "A bare snapshot segment stays empty when the ID is ambiguous");
+
+    snapshot_stats_clear();
+    restic_free_snapshot_list(items);
+}
+
 int main(void) {
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -1291,8 +1436,11 @@ int main(void) {
     test_cache_concurrent_access();
     test_content_path_spellings();
     test_cache_lookup_any();
+    test_loose_lookup_prefers_the_alias();
     test_content_trace_is_opt_in();
     test_trace_switch_file();
+    test_utf8_truncation_boundaries();
+    test_trace_utf8_conversion_limits();
     test_content_unicode_values();
 
     if (g_tests_failed == 0) {

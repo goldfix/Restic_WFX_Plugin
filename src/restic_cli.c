@@ -54,7 +54,14 @@ static void utf8_to_wide_trunc(const char* src, WCHAR* dst, size_t cap) {
     if (!src) return;
 
     size_t len = strlen(src);
-    if (len > cap - 1) len = cap - 1;
+    if (len > cap - 1) {
+        len = cap - 1;
+        /* Never cut in the middle of a multi-byte sequence: step back to the first byte of the
+           partial character, which then belongs entirely to the dropped tail. */
+        while (len > 0 && ((unsigned char)src[len] & 0xC0) == 0x80) {
+            --len;
+        }
+    }
     int n = MultiByteToWideChar(CP_UTF8, 0, src, (int)len, dst, (int)(cap - 1));
     dst[n > 0 ? n : 0] = L'\0';
 }
@@ -202,9 +209,18 @@ BOOL restic_extract_snapshot_id(
     }
     out_id[0] = '\0';
 
-    const WCHAR* open_bracket  = wcsrchr(snapshot_dirname, L'[');
-    const WCHAR* close_bracket = wcsrchr(snapshot_dirname, L']');
-    if (!open_bracket || !close_bracket || close_bracket <= open_bracket + 1) {
+    const WCHAR* open_bracket = wcsrchr(snapshot_dirname, L'[');
+    if (!open_bracket) {
+        return FALSE;
+    }
+    /* Only the folder name produced by restic_format_snapshot_dirname()
+       ("YYYY-MM-DD_HH-MM-SS_[<hex>]") identifies a snapshot: a backup file such as
+       "report_[deadbeef].txt" or "file[deadbeef]" must never be mistaken for one. */
+    if (open_bracket > snapshot_dirname && open_bracket[-1] != L'_') {
+        return FALSE;
+    }
+    const WCHAR* close_bracket = wcschr(open_bracket + 1, L']');
+    if (!close_bracket || close_bracket == open_bracket + 1 || close_bracket[1] != L'\0') {
         return FALSE;
     }
 
@@ -225,6 +241,10 @@ BOOL restic_extract_snapshot_id(
     out_id[len] = '\0';
     return TRUE;
 }
+
+/* U+FF3C FULLWIDTH REVERSE SOLIDUS in UTF-8, and the pair that marks a UNC volume display name */
+#define UNC_DISPLAY_CHAR_UTF8 "\xEF\xBC\xBC"
+#define UNC_DISPLAY_PAIR_UTF8 "\xEF\xBC\xBC\xEF\xBC\xBC"
 
 BOOL restic_normalize_filter_path(
     const WCHAR* subpath_w,
@@ -247,8 +267,26 @@ BOOL restic_normalize_filter_path(
     size_t out_idx = 0;
     out_utf8[out_idx++] = '/';
 
-    for (const char* p = raw_utf8; *p != '\0'; ++p) {
+    for (const char* p = raw_utf8; *p != '\0'; ) {
+        /* First segment written with two full-width reverse solidus characters: it is the display
+           name of a UNC volume (see node_to_find_data) and maps back to "\\host\share" */
+        if (out_idx == 1 && strncmp(p, UNC_DISPLAY_PAIR_UTF8, 6) == 0) {
+            while (*p != '\0' && *p != '\\' && *p != '/') {
+                char c = *p;
+                if (strncmp(p, UNC_DISPLAY_CHAR_UTF8, 3) == 0) {
+                    c = '\\';
+                    p += 3;
+                } else {
+                    ++p;
+                }
+                if (out_idx + 1 >= out_capacity) return FALSE;
+                out_utf8[out_idx++] = c;
+            }
+            continue;
+        }
+
         char c = (*p == '\\') ? '/' : *p;
+        ++p;
         if (c == '/' && out_utf8[out_idx - 1] == '/') {
             continue; /* Collapse consecutive separators */
         }
@@ -402,7 +440,7 @@ static BOOL is_direct_child_path(const char* node_path, const char* filter_path)
 }
 
 /* Fills a WIN32_FIND_DATAW from one `restic ls --json` node object. Returns FALSE to skip it. */
-static BOOL node_to_find_data(const cJSON* obj, WIN32_FIND_DATAW* fd) {
+static BOOL node_to_find_data(const cJSON* obj, BOOL at_root, WIN32_FIND_DATAW* fd) {
     const cJSON* j_name  = cJSON_GetObjectItemCaseSensitive(obj, "name");
     const cJSON* j_type  = cJSON_GetObjectItemCaseSensitive(obj, "type");
     const cJSON* j_size  = cJSON_GetObjectItemCaseSensitive(obj, "size");
@@ -415,9 +453,21 @@ static BOOL node_to_find_data(const cJSON* obj, WIN32_FIND_DATAW* fd) {
         MultiByteToWideChar(CP_UTF8, 0, j_name->valuestring, -1, fd->cFileName, MAX_PATH) <= 0) {
         return FALSE;
     }
-    /* Empty names and "."/".." would break Total Commander's navigation: never report them */
+    /* Empty names and "."/".." would break Total Commander's navigation: never report them.
+       A UNC volume ("\\host\share", the root node of a backup started from a network share) is
+       the one name with separators that is legitimate: it is shown with full-width reverse
+       solidus characters, which restic_normalize_filter_path() maps back. Any other name with a
+       path separator (a Linux/macOS file can contain one) is skipped, because Total Commander
+       would treat it as a directory boundary (and the recursive F5 copy would extract it outside
+       the target directory). */
+    if (at_root && fd->cFileName[0] == L'\\' && fd->cFileName[1] == L'\\') {
+        for (WCHAR* c = fd->cFileName; *c != L'\0'; ++c) {
+            if (*c == L'\\') *c = RESTIC_UNC_SEPARATOR_DISPLAY;
+        }
+    }
     if (fd->cFileName[0] == L'\0' || wcscmp(fd->cFileName, L".") == 0 ||
-        wcscmp(fd->cFileName, L"..") == 0) {
+        wcscmp(fd->cFileName, L"..") == 0 || wcschr(fd->cFileName, L'\\') != NULL ||
+        wcschr(fd->cFileName, L'/') != NULL) {
         return FALSE;
     }
 
@@ -463,6 +513,7 @@ ResticResult restic_parse_ls_ndjson(
     ResticResult result = RESTIC_OK;
     size_t capacity = 0;
     size_t parsed_objects = 0;
+    const BOOL at_root = (strcmp(filter_path, "/") == 0);
     BOOL self_found = FALSE; /* Restic emits the filtered directory node itself before its children */
     BOOL self_is_dir = FALSE;
     const char* line_start = ndjson_text;
@@ -498,7 +549,8 @@ ResticResult restic_parse_ls_ndjson(
                         const cJSON* j_type = cJSON_GetObjectItemCaseSensitive(obj, "type");
                         self_found = TRUE;
                         self_is_dir = cJSON_IsString(j_type) && strcmp(j_type->valuestring, "dir") == 0;
-                    } else if (is_direct_child_path(path, filter_path) && node_to_find_data(obj, &fd)) {
+                    } else if (is_direct_child_path(path, filter_path) &&
+                               node_to_find_data(obj, at_root, &fd)) {
                         if (!append_find_data(out_items, out_count, &capacity, &fd)) {
                             result = RESTIC_ERR_OUT_OF_MEMORY;
                         }
@@ -964,6 +1016,85 @@ ResticResult restic_list_snapshots(
     return res;
 }
 
+/*
+ * Extracts the UNC volume ("\\host\share") of a snapshot source path. Device paths such as
+ * "\\?\C:\..." or "\\.\..." are not network volumes and are refused.
+ */
+static BOOL unc_volume_of_path(const char* path, char* out, size_t capacity) {
+    if (path == NULL || path[0] != '\\' || path[1] != '\\') return FALSE;
+
+    const char* host      = path + 2;
+    const char* host_end  = strchr(host, '\\');
+    if (host_end == NULL || host_end == host || *host == '?' || *host == '.') return FALSE;
+
+    const char* share     = host_end + 1;
+    const char* share_end = strchr(share, '\\');
+    size_t share_len      = (share_end != NULL) ? (size_t)(share_end - share) : strlen(share);
+    if (share_len == 0) return FALSE;
+
+    size_t volume_len = (size_t)(share + share_len - path);
+    if (volume_len + 1 > capacity) return FALSE;
+    memcpy(out, path, volume_len);
+    out[volume_len] = '\0';
+    return TRUE;
+}
+
+ResticResult restic_add_unc_volumes(
+    const char* snapshots_json,
+    WIN32_FIND_DATAW** items,
+    size_t* count
+) {
+    if (!snapshots_json || !items || !count) return RESTIC_ERR_INVALID_ARG;
+
+    cJSON* root = cJSON_Parse(snapshots_json);
+    if (!root) return RESTIC_ERR_JSON_PARSE;
+    if (!cJSON_IsArray(root)) {
+        cJSON_Delete(root);
+        return RESTIC_ERR_JSON_PARSE;
+    }
+
+    ResticResult result = RESTIC_OK;
+    const cJSON* snapshot = NULL;
+    cJSON_ArrayForEach(snapshot, root) {
+        const cJSON* paths = cJSON_GetObjectItemCaseSensitive(snapshot, "paths");
+        const cJSON* path  = NULL;
+        cJSON_ArrayForEach(path, paths) {
+            char volume[MAX_PATH * 3] = {0};
+            WIN32_FIND_DATAW fd;
+            if (!cJSON_IsString(path) || !unc_volume_of_path(path->valuestring, volume, sizeof(volume))) {
+                continue;
+            }
+
+            memset(&fd, 0, sizeof(fd));
+            if (MultiByteToWideChar(CP_UTF8, 0, volume, -1, fd.cFileName, MAX_PATH) <= 0) continue;
+            for (WCHAR* c = fd.cFileName; *c != L'\0'; ++c) {
+                if (*c == L'\\') *c = RESTIC_UNC_SEPARATOR_DISPLAY;
+            }
+
+            BOOL known = FALSE;
+            for (size_t i = 0; i < *count && !known; ++i) {
+                known = (_wcsicmp((*items)[i].cFileName, fd.cFileName) == 0);
+            }
+            if (known) continue;
+
+            fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY;
+            FS_SET_TIME_UNKNOWN(fd.ftLastWriteTime);
+            WIN32_FIND_DATAW* grown =
+                (WIN32_FIND_DATAW*)realloc(*items, (*count + 1) * sizeof(WIN32_FIND_DATAW));
+            if (!grown) {
+                result = RESTIC_ERR_OUT_OF_MEMORY;
+                break;
+            }
+            *items = grown;
+            (*items)[(*count)++] = fd;
+        }
+        if (result != RESTIC_OK) break;
+    }
+
+    cJSON_Delete(root);
+    return result;
+}
+
 ResticResult restic_list_directory(
     const WCHAR* restic_exe,
     const WCHAR* repo_target,
@@ -984,7 +1115,9 @@ ResticResult restic_list_directory(
     }
 
     char filter_utf8[MAX_UTF8_PATH] = {0};
-    WCHAR filter_w[MAX_UTF8_PATH] = {0};
+    /* Total Commander limits a plugin path to 1023 characters, so the UTF-16 form of the UTF-8
+       filter never needs more than MAX_WFX_PATH + 1 units (the UTF-8 buffer is the larger one) */
+    WCHAR filter_w[MAX_WFX_PATH + 1] = {0};
     WCHAR snap_w[65] = {0};
     if (!restic_normalize_filter_path(subpath_w, filter_utf8, sizeof(filter_utf8)) ||
         MultiByteToWideChar(CP_UTF8, 0, filter_utf8, -1, filter_w, (int)_countof(filter_w)) <= 0) {
@@ -1012,7 +1145,31 @@ ResticResult restic_list_directory(
 
     res = restic_parse_ls_ndjson(cmd_out.output, filter_utf8, out_items, out_count);
     restic_free_command_output(&cmd_out);
-    return res;
+    if (res != RESTIC_OK || strcmp(filter_utf8, "/") != 0) return res;
+
+    /*
+     * Restic quirk: `restic ls <snapshot> /` prints nothing for a snapshot whose root node is a
+     * UNC volume (the Windows path functions of restic read "/\\host\share" as a volume of its
+     * own), although the volume itself and everything below it can be listed and dumped. The
+     * volumes are therefore taken from the snapshot's source paths. Best effort: a failure here
+     * leaves the listing exactly as restic printed it.
+     */
+    WCHAR snapshots_args[160] = {0};
+    swprintf_s(snapshots_args, _countof(snapshots_args), L"snapshots --json --no-lock %ls", snap_w);
+    ResticCommandOutput snapshots_out;
+    ResticResult snapshots_res =
+        run_and_check(restic_exe, repo_target, password, snapshots_args, options, &snapshots_out, NULL, 0);
+    if (snapshots_res == RESTIC_ERR_CANCELLED) {
+        free(*out_items);
+        *out_items = NULL;
+        *out_count = 0;
+        return snapshots_res;
+    }
+    if (snapshots_res == RESTIC_OK) {
+        restic_add_unc_volumes(snapshots_out.output, out_items, out_count);
+        restic_free_command_output(&snapshots_out);
+    }
+    return RESTIC_OK;
 }
 
 #define DUMP_CHUNK_BYTES (64u * 1024u)
@@ -1175,7 +1332,7 @@ ResticResult restic_dump_file(
     }
 
     char filter_utf8[MAX_UTF8_PATH] = {0};
-    WCHAR filter_w[MAX_UTF8_PATH]   = {0};
+    WCHAR filter_w[MAX_WFX_PATH + 1] = {0}; /* See restic_list_directory() for the sizing rule */
     WCHAR snap_w[65]                = {0};
     if (!restic_normalize_filter_path(subpath_w, filter_utf8, sizeof(filter_utf8)) ||
         strcmp(filter_utf8, "/") == 0 ||

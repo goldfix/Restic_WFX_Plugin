@@ -146,6 +146,19 @@ static void test_snapshot_naming(void) {
     EXPECT_TRUE(!restic_extract_snapshot_id(L"empty_[]", id, sizeof(id)), "Reject empty brackets");
     EXPECT_TRUE(!restic_extract_snapshot_id(L"reversed_]abcd[", id, sizeof(id)), "Reject reversed brackets");
     EXPECT_TRUE(!restic_extract_snapshot_id(L"long_[0123456789abcdef]", id, 8), "Reject ID larger than buffer");
+
+    /* Only "<date>_[<hex>]" identifies a snapshot folder: files that merely contain a bracketed
+       hexadecimal string must never be mistaken for one (neither by the path parser nor by the
+       loose content-column lookup) */
+    EXPECT_TRUE(!restic_extract_snapshot_id(L"report_[deadbeef].txt", id, sizeof(id)),
+                "Reject a bracketed ID followed by more text");
+    EXPECT_TRUE(!restic_extract_snapshot_id(L"file[deadbeef]", id, sizeof(id)),
+                "Reject a '[' that does not follow '_'");
+    EXPECT_TRUE(!restic_extract_snapshot_id(L"2026-10-18_16-28-15_[29095f00].bak", id, sizeof(id)),
+                "Reject a snapshot-like name with a suffix");
+    EXPECT_TRUE(restic_extract_snapshot_id(L"2026-10-18_16-28-15_[29095f00]", id, sizeof(id)) &&
+                    strcmp(id, "29095f00") == 0,
+                "Accept the exact directory format");
 }
 
 /* WFX path -> Restic filter path, and command-line quoting */
@@ -308,10 +321,16 @@ static void test_parse_ls_ndjson(void) {
         "{\"name\":\"\",\"type\":\"file\",\"path\":\"/x\",\"message_type\":\"node\"}\r\n"
         "{\"name\":\".\",\"type\":\"dir\",\"path\":\"/.\",\"message_type\":\"node\"}\r\n"
         "{\"name\":\"..\",\"type\":\"dir\",\"path\":\"/..\",\"message_type\":\"node\"}\r\n"
+        "{\"name\":\"evil\\\\sep.txt\",\"type\":\"file\",\"path\":\"/evil\\\\sep.txt\",\"message_type\":\"node\"}\r\n"
+        "{\"name\":\"sub/dir\",\"type\":\"dir\",\"path\":\"/sub_div\",\"message_type\":\"node\"}\r\n"
         "{\"name\":\"ok.txt\",\"type\":\"file\",\"path\":\"/ok.txt\",\"message_type\":\"node\"}\r\n",
         "/", &items, &count);
     EXPECT_TRUE(res == RESTIC_OK && count == 1 && wcscmp(items[0].cFileName, L"ok.txt") == 0,
                 "Empty, '.' and '..' node names are skipped");
+    EXPECT_TRUE(find_entry(items, count, L"evil\\sep.txt") == NULL,
+                "A name containing a backslash is skipped (a Linux/macOS backup can contain one)");
+    EXPECT_TRUE(find_entry(items, count, L"sub/dir") == NULL,
+                "A name containing a forward slash is skipped");
     free(items);
 
     /* Existing but empty directory vs. missing path vs. file used as directory */
@@ -685,6 +704,197 @@ static BOOL dump_progress_cb(ULONGLONG bytes_written, void* user_data) {
     return g_abort_dump && (bytes_written > 0);
 }
 
+/*
+ * Backups started from a network share (`restic backup \\host\share\dir`) have a root node named
+ * "\\host\share". Name and ls behaviour are covered here without a network: in the test text a '|'
+ * stands for one JSON-escaped backslash so the fixtures stay readable.
+ */
+static void bars_to_json(const char* text, char* out, size_t capacity) {
+    size_t used = 0;
+    for (; *text != '\0' && used + 3 < capacity; ++text) {
+        if (*text == '|') {
+            out[used++] = '\\';
+            out[used++] = '\\';
+        } else {
+            out[used++] = *text;
+        }
+    }
+    out[used] = '\0';
+}
+
+static void test_unc_volume_names(void) {
+    char norm[256] = {0};
+
+    /* Display name -> real name, only for the first segment */
+    EXPECT_TRUE(restic_normalize_filter_path(L"\\\uFF3C\uFF3Chost\uFF3Cshare\\dir\\sub", norm, sizeof(norm)),
+                "UNC display path");
+    EXPECT_STR_EQ(norm, "/\\\\host\\share/dir/sub", "Display name maps back to the UNC volume");
+    EXPECT_TRUE(restic_normalize_filter_path(L"\uFF3C\uFF3Chost\uFF3Cshare\\", norm, sizeof(norm)),
+                "UNC volume alone, no leading separator");
+    EXPECT_STR_EQ(norm, "/\\\\host\\share", "Volume without separators around it");
+    EXPECT_TRUE(restic_normalize_filter_path(L"\\dir\uFF3C\uFF3Cx", norm, sizeof(norm)),
+                "Full-width characters below the first segment");
+    EXPECT_STR_EQ(norm, "/dir\xEF\xBC\xBC\xEF\xBC\xBCx", "Only the first segment is mapped");
+    EXPECT_TRUE(restic_normalize_filter_path(L"\\\uFF3Chost\\x", norm, sizeof(norm)), "Single full-width character");
+    EXPECT_STR_EQ(norm, "/\xEF\xBC\xBChost/x", "A real name with one U+FF3C is left alone");
+
+    /* Old restic versions printed the volume as a child of "/": it is shown, not dropped */
+    char text[1024] = {0};
+    char json[1024] = {0};
+    WIN32_FIND_DATAW* items = NULL;
+    size_t count = 0;
+    snprintf(text, sizeof(text),
+             HEADER_LINE
+             "{\"name\":\"||host|share\",\"type\":\"dir\",\"path\":\"/||host|share\",\"message_type\":\"node\"}\n"
+             "{\"name\":\"a|b\",\"type\":\"file\",\"path\":\"/a|b\",\"message_type\":\"node\"}\n");
+    bars_to_json(text, json, sizeof(json));
+    ResticResult res = restic_parse_ls_ndjson(json, "/", &items, &count);
+    EXPECT_TRUE(res == RESTIC_OK && count == 1, "UNC volume at the root is listed, other names with '\\' are not");
+    EXPECT_WSTR_EQ(items[0].cFileName, L"\uFF3C\uFF3Chost\uFF3Cshare", "Root volume is shown with full-width solidus");
+    EXPECT_TRUE(is_dir_entry(&items[0]), "UNC volume is a directory");
+    free(items);
+
+    /* Below the volume: ordinary names, direct children of the (backslash containing) filter */
+    snprintf(text, sizeof(text),
+             HEADER_LINE
+             "{\"name\":\"||host|share\",\"type\":\"dir\",\"path\":\"/||host|share\",\"message_type\":\"node\"}\n"
+             "{\"name\":\"dir\",\"type\":\"dir\",\"path\":\"/||host|share/dir\",\"message_type\":\"node\"}\n"
+             "{\"name\":\"f.txt\",\"type\":\"file\",\"path\":\"/||host|share/dir/f.txt\",\"size\":3,\"message_type\":\"node\"}\n");
+    bars_to_json(text, json, sizeof(json));
+    res = restic_parse_ls_ndjson(json, "/\\\\host\\share", &items, &count);
+    EXPECT_TRUE(res == RESTIC_OK && count == 1 && wcscmp(items[0].cFileName, L"dir") == 0,
+                "Children of a UNC volume are listed with their own names");
+    free(items);
+}
+
+/* Volumes recovered from `restic snapshots --json` (restic prints nothing for `ls <id> /`) */
+static void test_unc_volumes_from_snapshots(void) {
+    char text[1024] = {0};
+    char json[1024] = {0};
+    snprintf(text, sizeof(text),
+             "[{\"paths\":[\"||host|share|dir\",\"C:|data\"]},"
+             "{\"paths\":[\"||HOST|Share|other\",\"||?|C:|x\",\"||nohost\",\"||other|s2\",\"||h|\"]}]");
+    bars_to_json(text, json, sizeof(json));
+
+    WIN32_FIND_DATAW* items = (WIN32_FIND_DATAW*)calloc(1, sizeof(WIN32_FIND_DATAW));
+    EXPECT_TRUE(items != NULL, "Allocate the existing root entry");
+    wcscpy_s(items[0].cFileName, MAX_PATH, L"C");
+    items[0].dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+    size_t count = 1;
+
+    EXPECT_TRUE(restic_add_unc_volumes(json, &items, &count) == RESTIC_OK, "UNC volumes are added");
+    EXPECT_TRUE(count == 3, "Drive entry plus two distinct UNC volumes (duplicates, device paths and incomplete paths ignored)");
+    EXPECT_TRUE(find_entry(items, count, L"\uFF3C\uFF3Chost\uFF3Cshare") != NULL, "host\\share is listed (case-insensitive duplicate dropped)");
+    EXPECT_TRUE(find_entry(items, count, L"\uFF3C\uFF3Cother\uFF3Cs2") != NULL, "Second share is listed");
+    EXPECT_TRUE(find_entry(items, count, L"C") != NULL, "Existing entries are kept");
+    const WIN32_FIND_DATAW* volume = find_entry(items, count, L"\uFF3C\uFF3Chost\uFF3Cshare");
+    EXPECT_TRUE(volume != NULL && is_dir_entry(volume) && (volume->dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0,
+                "Volumes are read-only directories");
+
+    /* Running it again changes nothing, and bad input is refused without touching the list */
+    EXPECT_TRUE(restic_add_unc_volumes(json, &items, &count) == RESTIC_OK && count == 3, "Idempotent");
+    EXPECT_TRUE(restic_add_unc_volumes("{\"not\":\"an array\"}", &items, &count) == RESTIC_ERR_JSON_PARSE && count == 3,
+                "A non-array result is refused");
+    EXPECT_TRUE(restic_add_unc_volumes("not json", &items, &count) == RESTIC_ERR_JSON_PARSE && count == 3,
+                "Garbage is refused");
+    EXPECT_TRUE(restic_add_unc_volumes(NULL, &items, &count) == RESTIC_ERR_INVALID_ARG, "NULL json is an invalid argument");
+    free(items);
+
+    WIN32_FIND_DATAW* none = NULL;
+    size_t none_count = 0;
+    EXPECT_TRUE(restic_add_unc_volumes("[{\"paths\":[\"C:/data\"]}]", &none, &none_count) == RESTIC_OK,
+                "Drive-only snapshots are accepted");
+    EXPECT_TRUE(none == NULL && none_count == 0, "Drive-only snapshots add nothing");
+}
+
+/*
+ * Live: a backup started from a network share. Uses the administrative share of this machine
+ * (\\localhost\C$\...) so no real network is needed; skipped when it cannot be reached.
+ */
+static void test_live_unc_share(void) {
+    WCHAR restic_bin[MAX_PATH] = {0}, data_abs[MAX_PATH] = {0}, repo[MAX_PATH] = {0}, dest[MAX_PATH] = {0};
+    GetFullPathNameW(L"tmp\\restic.exe", MAX_PATH, restic_bin, NULL);
+    const DWORD data_len = GetFullPathNameW(L"tmp\\test_fixture\\data", MAX_PATH, data_abs, NULL);
+    GetFullPathNameW(L"tmp\\test_fixture\\repo_unc", MAX_PATH, repo, NULL);
+    GetFullPathNameW(L"tmp\\test_fixture\\unc_readme.txt", MAX_PATH, dest, NULL);
+    if (data_len < 3 || data_len >= MAX_PATH || GetFileAttributesW(restic_bin) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(data_abs) == INVALID_FILE_ATTRIBUTES) {
+        printf("[SKIP] tmp\\restic.exe or the live fixture is missing: UNC share test skipped.\n");
+        return;
+    }
+
+    WCHAR unc[2 * MAX_PATH];
+    swprintf_s(unc, _countof(unc), L"\\\\localhost\\%c$%ls", data_abs[0], data_abs + 2);
+    if (GetFileAttributesW(unc) == INVALID_FILE_ATTRIBUTES) {
+        printf("[SKIP] %lc$ administrative share not reachable: UNC share test skipped.\n", data_abs[0]);
+        return;
+    }
+
+    const WCHAR* password = L"p@ss \"w0rd\" \u00fc %PATH% \u65e5\u672c"; /* Same as the DLL fixture */
+    WCHAR err[512] = {0};
+    ResticCommandOutput out;
+    remove_tree(repo);
+    ResticResult res = restic_exec_command(restic_bin, repo, password, L"init --json --repository-version 2", NULL, &out);
+    EXPECT_TRUE(res == RESTIC_OK, "Init the UNC test repository");
+    restic_free_command_output(&out);
+
+    WCHAR* q_unc = restic_quote_arg(unc);
+    WCHAR args[2 * MAX_PATH + 64];
+    swprintf_s(args, _countof(args), L"backup %ls --json --quiet", q_unc);
+    free(q_unc);
+    res = restic_exec_command(restic_bin, repo, password, args, NULL, &out);
+    EXPECT_TRUE(res == RESTIC_OK, "Backup started from a UNC path");
+    restic_free_command_output(&out);
+
+    WIN32_FIND_DATAW* items = NULL;
+    size_t count = 0;
+    res = restic_list_snapshots(restic_bin, repo, password, NULL, &items, &count, err, _countof(err));
+    char snap[32] = {0};
+    EXPECT_TRUE(res == RESTIC_OK && count == 1 && restic_extract_snapshot_id(items[0].cFileName, snap, sizeof(snap)),
+                "The UNC snapshot is listed");
+    free(items);
+    items = NULL;
+
+    /* Root: restic prints nothing for "/", the volume comes from the snapshot's paths */
+    res = restic_list_directory(restic_bin, repo, password, snap, L"\\", NULL, &items, &count, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && count == 1, "Snapshot root lists the UNC volume");
+    WCHAR volume[MAX_PATH] = {0};
+    swprintf_s(volume, _countof(volume), L"\uFF3C\uFF3Clocalhost\uFF3C%c$", data_abs[0]);
+    EXPECT_TRUE(_wcsicmp(items[0].cFileName, volume) == 0 && is_dir_entry(&items[0]),
+                "The volume is shown as a folder named with full-width solidus characters");
+    wcscpy_s(volume, _countof(volume), items[0].cFileName); /* Keep the exact spelling restic stored */
+    free(items);
+    items = NULL;
+
+    /* The display name navigates: volume level, then the original directory, then a file */
+    WCHAR sub[2 * MAX_PATH];
+    swprintf_s(sub, _countof(sub), L"\\%ls", volume);
+    res = restic_list_directory(restic_bin, repo, password, snap, sub, NULL, &items, &count, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && count >= 1, "The UNC volume can be opened");
+    free(items);
+    items = NULL;
+
+    swprintf_s(sub, _countof(sub), L"\\%ls%ls", volume, data_abs + 2);
+    res = restic_list_directory(restic_bin, repo, password, snap, sub, NULL, &items, &count, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && find_entry(items, count, L"readme.txt") != NULL,
+                "The backed up directory below the UNC volume lists its files");
+    free(items);
+    items = NULL;
+
+    swprintf_s(sub, _countof(sub), L"\\%ls%ls\\readme.txt", volume, data_abs + 2);
+    DeleteFileW(dest);
+    res = restic_dump_file(restic_bin, repo, password, snap, sub, dest, TRUE, NULL, 0, NULL, NULL, err, _countof(err));
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    EXPECT_TRUE(res == RESTIC_OK && GetFileAttributesExW(dest, GetFileExInfoStandard, &fad) &&
+                    fad.nFileSizeLow == 5 && fad.nFileSizeHigh == 0,
+                "A file below the UNC volume can be extracted");
+    DeleteFileW(dest);
+
+    res = restic_list_directory(restic_bin, repo, password, snap, L"\\\uFF3C\uFF3Cnohost\uFF3Cnoshare", NULL,
+                                &items, &count, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_PATH_NOT_FOUND, "A volume that is not in the snapshot is reported as missing");
+}
+
 static void test_live_restic_cli(void) {
     WCHAR restic_bin[MAX_PATH], base[MAX_PATH], data[MAX_PATH], repo[MAX_PATH];
     GetFullPathNameW(L"tmp\\restic.exe", MAX_PATH, restic_bin, NULL);
@@ -711,6 +921,27 @@ static void test_live_restic_cli(void) {
     res = restic_list_snapshots(restic_bin, repo, password, NULL, &items, &count, err, _countof(err));
     EXPECT_TRUE(res == RESTIC_ERR_REPO_NOT_FOUND, "Missing repository -> RESTIC_ERR_REPO_NOT_FOUND");
     EXPECT_TRUE(err[0] != L'\0', "Missing repository reports a reason");
+
+    /* A long non-ASCII repository path produces a message that does not fit the error buffer:
+       the UTF-8 -> UTF-16 truncation must stop on a character boundary, so the text must never end
+       with (or contain) the U+FFFD replacement character */
+    {
+        WCHAR long_repo[1024] = {0};
+        wcscpy_s(long_repo, _countof(long_repo), L"C:\\NoSuchRepo\\");
+        for (size_t i = 0; i < 300; ++i) {
+            wcscat_s(long_repo, _countof(long_repo), L"\u65e5");
+        }
+        WCHAR long_err[512] = {0};
+        res = restic_list_snapshots(restic_bin, long_repo, password, NULL, &items, &count,
+                                    long_err, _countof(long_err));
+        EXPECT_TRUE(res == RESTIC_ERR_REPO_NOT_FOUND, "Long non-ASCII repository path -> not found");
+        EXPECT_TRUE(long_err[0] != L'\0', "Long non-ASCII repository path reports a reason");
+        EXPECT_TRUE(wcschr(long_err, L'\uFFFD') == NULL,
+                    "Truncated UTF-8 error text contains no replacement character");
+        free(items);
+        items = NULL;
+        count = 0;
+    }
 
     WCHAR* q_data = restic_quote_arg(data);
     WCHAR args[2048];
@@ -1054,12 +1285,15 @@ int main(void) {
     test_path_and_quote_helpers();
     test_parse_snapshots_json();
     test_parse_ls_ndjson();
+    test_unc_volume_names();
+    test_unc_volumes_from_snapshots();
     test_exec_streams_and_exit_codes();
     test_exec_environment();
     test_exec_limits_and_failures();
     test_exec_large_output_and_long_args();
     test_dump_with_fake_restic();
     test_live_restic_cli();
+    test_live_unc_share();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)
     if (!_CrtCheckMemory()) {

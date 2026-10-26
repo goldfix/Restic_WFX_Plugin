@@ -24,8 +24,9 @@
  * Custom columns ("Content" part of the WFX interface).
  *
  * Every published column is backed by data already downloaded by `restic snapshots --json` while
- * the snapshot list of a repository is enumerated, so no field ever starts a Restic process and
- * no field is delayed. Values are read from the per-alias snapshot cache (see restic_stats.h),
+ * the snapshot list of a repository is enumerated (or filled once by the directory listing when a
+ * snapshot folder is entered directly), so no field ever starts a Restic process and no field is
+ * delayed. Values are read from the per-alias snapshot cache (see restic_stats.h),
  * which makes FsContentGetValue() cheap enough to be called once per visible entry.
  *
  * Fields are available for the snapshot folders and for every entry below them (files and
@@ -349,8 +350,24 @@ static BOOL lookup_loose(const WCHAR* path, ResticSnapshotInfo* out_info) {
         const WCHAR saved = *end;
         *end              = L'\0';
         char short_id[RESTIC_STATS_SHORT_ID_MAX] = {0};
-        const BOOL matched = restic_extract_snapshot_id(start, short_id, sizeof(short_id)) &&
-                             snapshot_stats_lookup_any(short_id, out_info);
+        BOOL matched = FALSE;
+        if (restic_extract_snapshot_id(start, short_id, sizeof(short_id))) {
+            /* A segment in front of the snapshot name is the repository alias: try it first, so a
+               snapshot ID cached under several aliases resolves to the row it belongs to. */
+            const WCHAR* prev_end = start;
+            while (prev_end > buffer && prev_end[-1] == L'\\') --prev_end;
+            const WCHAR* prev_start = prev_end;
+            while (prev_start > buffer && prev_start[-1] != L'\\') --prev_start;
+            const size_t alias_len = (size_t)(prev_end - prev_start);
+            if (alias_len > 0 && alias_len < MAX_PATH) {
+                WCHAR alias[MAX_PATH] = {0};
+                wcsncpy_s(alias, _countof(alias), prev_start, alias_len);
+                matched = snapshot_stats_lookup(alias, short_id, out_info);
+            }
+            if (!matched) {
+                matched = snapshot_stats_lookup_any(short_id, out_info);
+            }
+        }
         *end = saved;
         if (matched) return TRUE;
         if (start == buffer) break;
@@ -385,6 +402,22 @@ static BOOL resolve_snapshot(const char* file_name, ResticSnapshotInfo* out_info
         return FALSE;
     }
     return resolve_snapshot_w(wide, out_info);
+}
+
+/*
+ * Trace-only rendering of a path. The log is UTF-8, so the ANSI spelling of the ANSI entry point
+ * is converted back to Unicode first (otherwise non-ASCII names would be logged as mojibake).
+ */
+static void trace_ansi_path(const char* path, char* out, size_t capacity) {
+    if (out == NULL || capacity == 0) return;
+    out[0] = '\0';
+    if (path == NULL) {
+        strncpy_s(out, capacity, "<null>", _TRUNCATE);
+        return;
+    }
+    if (wfx_trace_ansi_to_utf8(path, out, capacity) == 0) {
+        strncpy_s(out, capacity, "<empty>", _TRUNCATE);
+    }
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -440,10 +473,12 @@ int __stdcall FsContentGetValue(
     }
 
     ResticSnapshotInfo info;
+    char shown[CONTENT_PATH_MAX * 3] = {0};
+    if (wfx_trace_enabled()) trace_ansi_path(FileName, shown, sizeof(shown));
     if (!resolve_snapshot(FileName, &info)) {
         wfx_trace_printf(
             "value '%s' field=%d unit=%d -> %d (unresolved)",
-            (FileName != NULL) ? FileName : "<null>",
+            shown,
             FieldIndex,
             UnitIndex,
             ft_fieldempty
@@ -454,11 +489,7 @@ int __stdcall FsContentGetValue(
 
     const int result = render_field(FieldIndex, &info, UnitIndex, FieldValue, maxlen, FALSE);
     wfx_trace_printf(
-        "value '%s' field=%d unit=%d -> %d",
-        (FileName != NULL) ? FileName : "<null>",
-        FieldIndex,
-        UnitIndex,
-        result
+        "value '%s' field=%d unit=%d -> %d", shown, FieldIndex, UnitIndex, result
     );
     return result;
 }
@@ -487,10 +518,14 @@ int __stdcall FsContentGetValueW(
     }
 
     ResticSnapshotInfo info;
+    char shown[CONTENT_PATH_MAX * 3] = {0};
+    if (wfx_trace_enabled()) {
+        wfx_trace_wide_to_utf8((FileName != NULL) ? FileName : L"<null>", shown, sizeof(shown));
+    }
     if (!resolve_snapshot_w(FileName, &info)) {
         wfx_trace_printf(
-            "valueW '%ls' field=%d unit=%d -> %d (unresolved)",
-            (FileName != NULL) ? FileName : L"<null>",
+            "valueW '%s' field=%d unit=%d -> %d (unresolved)",
+            shown,
             FieldIndex,
             UnitIndex,
             ft_fieldempty
@@ -501,11 +536,7 @@ int __stdcall FsContentGetValueW(
 
     const int result = render_field(FieldIndex, &info, UnitIndex, FieldValue, maxlen, TRUE);
     wfx_trace_printf(
-        "valueW '%ls' field=%d unit=%d -> %d",
-        (FileName != NULL) ? FileName : L"<null>",
-        FieldIndex,
-        UnitIndex,
-        result
+        "valueW '%s' field=%d unit=%d -> %d", shown, FieldIndex, UnitIndex, result
     );
     return result;
 }

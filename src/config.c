@@ -191,28 +191,42 @@ void config_set_fallback_dir(const WCHAR* dir_path) {
 }
 
 void config_set_fallback_from_default_params(const char* default_ini_name) {
-    if (!default_ini_name || default_ini_name[0] == '\0') {
-        g_fallback_dir[0] = L'\0';
-        return;
+    if (default_ini_name != NULL && default_ini_name[0] != '\0') {
+        WCHAR wide_ini_path[CONFIG_MAX_PATH] = {0};
+        int converted = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            default_ini_name,
+            -1,
+            wide_ini_path,
+            CONFIG_MAX_PATH
+        );
+        /* A '?' means the ANSI code page could not represent a character of the path (the user's
+           profile contains non-ACP Unicode), so the directory would be wrong. Such a path cannot
+           legitimately contain a literal '?' either, which makes this check unambiguous. */
+        if (converted > 0 && wcschr(wide_ini_path, L'?') == NULL) {
+            WCHAR parent_dir[CONFIG_MAX_PATH] = {0};
+            extract_parent_dir(wide_ini_path, parent_dir, CONFIG_MAX_PATH);
+            if (parent_dir[0] != L'\0') {
+                config_set_fallback_dir(parent_dir);
+                return;
+            }
+        }
     }
 
-    WCHAR wide_ini_path[CONFIG_MAX_PATH] = {0};
-    int converted = MultiByteToWideChar(
-        CP_ACP,
-        0,
-        default_ini_name,
-        -1,
-        wide_ini_path,
-        CONFIG_MAX_PATH
+    /* Total Commander 11.03+ publishes the directory of its settings file as a UTF-16
+       environment variable (without trailing backslash), which also survives a DefaultIniName
+       that lost characters to the code page conversion. */
+    WCHAR env_dir[CONFIG_MAX_PATH] = {0};
+    DWORD env_len = GetEnvironmentVariableW(
+        L"COMMANDER_INI_PATH", env_dir, (DWORD)_countof(env_dir)
     );
-    if (converted <= 0) {
-        g_fallback_dir[0] = L'\0';
+    if (env_len > 0 && env_len < _countof(env_dir)) {
+        config_set_fallback_dir(env_dir);
         return;
     }
 
-    WCHAR parent_dir[CONFIG_MAX_PATH] = {0};
-    extract_parent_dir(wide_ini_path, parent_dir, CONFIG_MAX_PATH);
-    config_set_fallback_dir(parent_dir);
+    config_set_fallback_dir(NULL);
 }
 
 const WCHAR* config_get_fallback_dir(void) {
