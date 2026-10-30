@@ -417,8 +417,26 @@ BOOL snapshot_stats_lookup_alias(
     return slot != NULL;
 }
 
-BOOL snapshot_stats_lookup_any(const char* short_id, ResticSnapshotInfo* out_info) {
-    if (short_id == NULL || short_id[0] == '\0' || out_info == NULL) return FALSE;
+BOOL snapshot_stats_lookup_latest(const WCHAR* alias, ResticSnapshotInfo* out_info) {
+    if (alias == NULL || out_info == NULL) return FALSE;
+
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&g_CacheLock);
+    const SnapshotCacheSlot* slot = cache_find_slot(alias, TRUE);
+    if (slot != NULL) {
+        for (size_t i = 0; i < slot->count; ++i) {
+            /* CompareFileTime: <0 first earlier, 0 equal, >0 first later */
+            if (!found || CompareFileTime(&slot->items[i].time, &out_info->time) > 0) {
+                *out_info = slot->items[i];
+                found     = TRUE;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_CacheLock);
+    return found;
+}
+
+BOOL snapshot_stats_lookup_any(const char* short_id, ResticSnapshotInfo* out_info) {    if (short_id == NULL || short_id[0] == '\0' || out_info == NULL) return FALSE;
 
     BOOL found = FALSE;
     ResticSnapshotInfo match;

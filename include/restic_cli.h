@@ -36,6 +36,13 @@ typedef BOOL (*ResticCancelProc)(void* user_data);
 typedef BOOL (*ResticDumpProgressProc)(ULONGLONG bytes_written, void* user_data);
 
 /**
+ * Receives one line (without its line terminator) of Restic's stdout, typically NDJSON.
+ * The buffer is only valid during the call. Return TRUE to continue, FALSE to abort the command
+ * (`RESTIC_ERR_CANCELLED`, the child process is terminated).
+ */
+typedef BOOL (*ResticLineProc)(const char* line, size_t length, void* user_data);
+
+/**
  * Optional execution controls. Pass NULL to use defaults (no timeout, not cancellable).
  */
 typedef struct {
@@ -167,6 +174,24 @@ ResticResult restic_exec_command(
  * Releases the buffers owned by a ResticCommandOutput.
  */
 void restic_free_command_output(ResticCommandOutput* result);
+
+/**
+ * Runs `restic_exe args` and hands every stdout line to `line_proc` instead of buffering the whole
+ * stream, so a listing of an arbitrarily large snapshot can be aggregated in constant memory.
+ * stderr is still collected to build the failure reason. A line callback returning FALSE, the
+ * cancellation callback or the timeout terminate the child process.
+ */
+ResticResult restic_exec_lines(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const WCHAR* args,
+    const ResticExecOptions* options,
+    ResticLineProc line_proc,
+    void* user_data,
+    WCHAR* out_error_msg,
+    size_t err_capacity
+);
 
 /**
  * Runs `restic snapshots --json --no-lock` and returns Level 1 directory entries.

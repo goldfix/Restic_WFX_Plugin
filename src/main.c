@@ -19,13 +19,17 @@
 #include "config.h"
 #include "restic_cli.h"
 #include "restic_stats.h"
+#include "restic_report.h"
 #include "wfx_path.h"
+#include "wfx_status.h"
 #include "wfx_trace.h"
 
 #define SESSION_MAX_PASSWORD  512
 #define SESSION_SLOTS         8
 #define MAX_PASSWORD_ATTEMPTS 3
 #define WFX_RESTIC_TIMEOUT_MS (30u * 60u * 1000u) /* Safety net if a hung command is never aborted */
+/* Maximum length of a WFX path in UTF-16 units (Total Commander allows 1023) */
+#define WFX_MAX_PATH_UNITS 1024
 
 /* Host callbacks supplied by Total Commander in FsInitW */
 static int            g_PluginNr     = 0;
@@ -369,6 +373,71 @@ static void ensure_snapshot_stats_cached(
     }
 }
 
+/* Context of the progress callback used while a statistics report is generated */
+typedef struct {
+    const WCHAR* remote_name;
+    const WCHAR* local_name;
+} WfxReportProgressContext;
+
+/* Forwards the report progress to Total Commander; returns TRUE on user abort */
+static BOOL wfx_report_progress_callback(int percent, void* user_data) {
+    if (!g_ProgressProc) return FALSE;
+    const WfxReportProgressContext* ctx = (const WfxReportProgressContext*)user_data;
+    WCHAR* src = (ctx && ctx->remote_name) ? (WCHAR*)ctx->remote_name : L"";
+    WCHAR* dst = (ctx && ctx->local_name) ? (WCHAR*)ctx->local_name : L"";
+    return g_ProgressProc(g_PluginNr, src, dst, percent) != 0;
+}
+
+/*
+ * Prepends the virtual statistics report to a repository or snapshot listing.
+ * Total Commander walks the whole tree for recursive copies, searches, folder size calculations and
+ * directory synchronisation; the report is hidden during those operations (FsStatusInfoW) so an
+ * extracted backup never gains a file the user does not have.
+ */
+static void inject_stats_report_item(
+    WIN32_FIND_DATAW** items,
+    size_t* count,
+    const WfxParsedPath* parsed,
+    const WCHAR* repo_alias
+) {
+    const BOOL expose = wfx_status_should_expose_report();
+    wfx_trace_printf("report entry %s (operation %d)", expose ? "listed" : "hidden",
+                     wfx_status_current_operation());
+    if (!expose) return;
+    if (parsed->level != WFX_PATH_REPO && parsed->level != WFX_PATH_SNAPSHOT_DIR) return;
+
+    const char* snapshot_id =
+        (parsed->level == WFX_PATH_SNAPSHOT_DIR) ? parsed->snapshot_id : NULL;
+    (void)restic_report_prepend_entry(items, count, repo_alias, snapshot_id);
+}
+
+/* Returns a single-entry handle holding the virtual report file, or INVALID_HANDLE_VALUE */
+static HANDLE find_stats_report(
+    const WCHAR* parent_path,
+    WIN32_FIND_DATAW* FindData
+) {
+    WfxParsedPath parsed;
+    if (!wfx_parse_path(parent_path, &parsed)) return INVALID_HANDLE_VALUE;
+    if (parsed.level != WFX_PATH_REPO && parsed.level != WFX_PATH_SNAPSHOT_DIR) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    const char* snapshot_id =
+        (parsed.level == WFX_PATH_SNAPSHOT_DIR) ? parsed.snapshot_id : NULL;
+    WIN32_FIND_DATAW fd;
+    if (!restic_report_fill_find_data(parsed.repo_alias, snapshot_id, &fd)) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    WIN32_FIND_DATAW* single = (WIN32_FIND_DATAW*)calloc(1, sizeof(WIN32_FIND_DATAW));
+    if (!single) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
+    *single = fd;
+    return wrap_find_items(single, 1, FindData);
+}
+
 /* Executes a Level 1 (snapshots) or Level 2 (directory) query with password prompt/retry */
 static HANDLE execute_repo_query(
     const WCHAR* virtual_path,
@@ -449,6 +518,7 @@ static HANDLE execute_repo_query(
         return INVALID_HANDLE_VALUE;
     }
 
+    inject_stats_report_item(&items, &count, parsed, repo->alias);
     return wrap_find_items(items, count, FindData);
 }
 
@@ -553,6 +623,19 @@ HANDLE __stdcall FsFindFirstW(WCHAR* Path, WIN32_FIND_DATAW* FindData) {
         return INVALID_HANDLE_VALUE;
     }
     memset(FindData, 0, sizeof(WIN32_FIND_DATAW));
+
+    /* A direct query for the virtual statistics report returns exactly that one entry */
+    {
+        WCHAR report_parent[WFX_MAX_PATH_UNITS + 1] = {0};
+        BOOL is_report                             = FALSE;
+        if (wfx_path_strip_report_segment(Path, report_parent, _countof(report_parent),
+                                          &is_report) &&
+            is_report) {
+            HANDLE hdl = find_stats_report(report_parent, FindData);
+            SetLastError(hdl == INVALID_HANDLE_VALUE ? ERROR_PATH_NOT_FOUND : ERROR_SUCCESS);
+            return hdl;
+        }
+    }
 
     WfxParsedPath parsed;
     if (!wfx_parse_path(Path, &parsed)) {
@@ -661,14 +744,36 @@ int __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, Rem
     }
 
     WfxParsedPath parsed;
-    if (!wfx_parse_path(RemoteName, &parsed) || parsed.level != WFX_PATH_SNAPSHOT_DIR ||
-        !parsed.subpath) {
+    BOOL is_report = FALSE;
+    WCHAR report_parent[WFX_MAX_PATH_UNITS + 1] = {0};
+    if (!wfx_path_strip_report_segment(RemoteName, report_parent, _countof(report_parent),
+                                       &is_report)) {
         return FS_FILE_NOTFOUND;
     }
-    const WCHAR* sp = parsed.subpath;
-    while (*sp == L'\\') sp++;
-    if (*sp == L'\0') {
-        return FS_FILE_NOTFOUND;
+
+    /* The listing never adds the report next to a real file of the same name, and Total Commander
+       hands over the size it was shown: a different, non-zero size means the real backed-up file */
+    if (is_report && ri != NULL) {
+        const ULONGLONG shown_size = ((ULONGLONG)ri->SizeHigh << 32) | ri->SizeLow;
+        if (shown_size != 0 && shown_size != RESTIC_REPORT_PLACEHOLDER_SIZE) is_report = FALSE;
+    }
+
+    if (is_report) {
+        /* Virtual statistics report: the title path must be a repository or a snapshot folder */
+        if (!wfx_parse_path(report_parent, &parsed) ||
+            (parsed.level != WFX_PATH_REPO && parsed.level != WFX_PATH_SNAPSHOT_DIR)) {
+            return FS_FILE_NOTFOUND;
+        }
+    } else {
+        if (!wfx_parse_path(RemoteName, &parsed) || parsed.level != WFX_PATH_SNAPSHOT_DIR ||
+            !parsed.subpath) {
+            return FS_FILE_NOTFOUND;
+        }
+        const WCHAR* sp = parsed.subpath;
+        while (*sp == L'\\') sp++;
+        if (*sp == L'\0') {
+            return FS_FILE_NOTFOUND;
+        }
     }
 
     /* Total Commander calls FsGetFileW first without FS_COPYFLAGS_OVERWRITE to probe for collisions */
@@ -711,6 +816,11 @@ int __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, Rem
     BOOL overwrite                  = (CopyFlags & FS_COPYFLAGS_OVERWRITE) != 0;
     WfxDumpProgressContext prog_ctx = {RemoteName, LocalName, total_size};
 
+    /* The report is generated by several restic runs: toggling ESC aborts them all */
+    WfxCancelContext report_cancel_ctx = {RemoteName, repo->alias};
+    ResticExecOptions exec_opts = {WFX_RESTIC_TIMEOUT_MS, wfx_cancel_callback, &report_cancel_ctx};
+    WfxReportProgressContext report_prog_ctx = {RemoteName, LocalName};
+
     WCHAR password[SESSION_MAX_PASSWORD] = {0};
     BOOL have_password                   = session_get(repo->alias, password, _countof(password));
     WCHAR err_msg[512]                   = {0};
@@ -727,21 +837,41 @@ int __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, Rem
         }
 
         err_msg[0] = L'\0';
-        res = restic_dump_file(
-            cfg.restic_path,
-            repo->target,
-            password,
-            parsed.snapshot_id,
-            parsed.subpath,
-            LocalName,
-            overwrite,
-            mtime,
-            WFX_RESTIC_TIMEOUT_MS,
-            wfx_dump_progress_callback,
-            &prog_ctx,
-            err_msg,
-            _countof(err_msg)
-        );
+        if (is_report) {
+            const char* snapshot_id = (parsed.level == WFX_PATH_SNAPSHOT_DIR) ? parsed.snapshot_id
+                                                                              : NULL;
+            const WCHAR* subpath = (parsed.level == WFX_PATH_SNAPSHOT_DIR) ? parsed.subpath : NULL;
+            res = restic_report_generate(
+                cfg.restic_path,
+                repo->target,
+                password,
+                repo->alias,
+                snapshot_id,
+                subpath,
+                LocalName,
+                &exec_opts,
+                wfx_report_progress_callback,
+                &report_prog_ctx,
+                err_msg,
+                _countof(err_msg)
+            );
+        } else {
+            res = restic_dump_file(
+                cfg.restic_path,
+                repo->target,
+                password,
+                parsed.snapshot_id,
+                parsed.subpath,
+                LocalName,
+                overwrite,
+                mtime,
+                WFX_RESTIC_TIMEOUT_MS,
+                wfx_dump_progress_callback,
+                &prog_ctx,
+                err_msg,
+                _countof(err_msg)
+            );
+        }
 
         if (res == RESTIC_ERR_WRONG_PASSWORD) {
             session_forget(repo->alias);

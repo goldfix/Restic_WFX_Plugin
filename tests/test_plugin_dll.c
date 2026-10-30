@@ -53,6 +53,14 @@ static int g_tests_failed = 0;
 #define FS_FILE_USERABORT      5
 #define FS_FILE_NOTSUPPORTED   6
 
+#define FS_STATUS_START        0
+#define FS_STATUS_END          1
+#define FS_STATUS_OP_LIST      1
+#define FS_STATUS_OP_GET_MULTI 3
+
+#define RESTIC_REPORT_NAME_W   L"!restic_stats.html"
+#define RESTIC_REPORT_SIZE     16384ULL
+
 #define FS_COPYFLAGS_OVERWRITE 1
 #define FS_COPYFLAGS_RESUME    2
 #define FS_COPYFLAGS_MOVE      4
@@ -106,6 +114,8 @@ typedef BOOL   (__stdcall *PFN_ContentGetDefaultViewW)(WCHAR*, WCHAR*, WCHAR*, W
 typedef void   (__stdcall *PFN_ContentStopGetValueW)(WCHAR*);
 typedef void   (__stdcall *PFN_ContentStopGetValue)(char*);
 typedef void   (__stdcall *PFN_ContentPluginUnloading)(void);
+typedef void   (__stdcall *PFN_StatusInfoW)(WCHAR*, int, int);
+typedef void   (__stdcall *PFN_StatusInfo)(char*, int, int);
 
 typedef struct {
     HMODULE module;
@@ -118,6 +128,8 @@ typedef struct {
     PFN_FindClose find_close;
     PFN_GetFile get_file;
     PFN_GetFileW get_file_w;
+    PFN_StatusInfoW status_info_w;
+    PFN_StatusInfo status_info;
 } Plugin;
 
 static BOOL make_unique_dir(const WCHAR* tag, WCHAR* out, size_t cap) {
@@ -152,6 +164,8 @@ static BOOL load_plugin_copy(const WCHAR* dir, Plugin* p) {
     p->find_close        = (PFN_FindClose)(void*)GetProcAddress(p->module, "FsFindClose");
     p->get_file          = (PFN_GetFile)(void*)GetProcAddress(p->module, "FsGetFile");
     p->get_file_w        = (PFN_GetFileW)(void*)GetProcAddress(p->module, "FsGetFileW");
+    p->status_info_w     = (PFN_StatusInfoW)(void*)GetProcAddress(p->module, "FsStatusInfoW");
+    p->status_info       = (PFN_StatusInfo)(void*)GetProcAddress(p->module, "FsStatusInfo");
     return TRUE;
 }
 
@@ -175,7 +189,7 @@ static void test_export_surface(void) {
                               "FsContentGetDefaultSortOrder", "FsContentGetDefaultView",
                               "FsContentStopGetValue", "FsContentPluginUnloading",
                               "FsContentGetValueW", "FsContentGetDefaultViewW",
-                              "FsContentStopGetValueW"};
+                              "FsContentStopGetValueW", "FsStatusInfo", "FsStatusInfoW"};
     for (size_t i = 0; i < _countof(required); ++i) {
         FARPROC fn = GetProcAddress(m, required[i]);
         g_tests_run++;
@@ -445,7 +459,8 @@ static DWORD WINAPI mt_list_worker(LPVOID param) {
         int entries = 1;
         while (job->plugin->find_next_w(h, &fd)) entries++;
         job->plugin->find_close(h);
-        if (entries != 2) InterlockedIncrement(&g_e2e_mt_failures); /* Fixture has two snapshots */
+        /* Fixture has two snapshots; the virtual statistics report is the third entry */
+        if (entries != 3) InterlockedIncrement(&g_e2e_mt_failures);
     }
     return 0;
 }
@@ -467,8 +482,14 @@ static BOOL tc_copy_folder_recursive(
     (*out_dirs)++;
 
     WIN32_FIND_DATAW fd;
+    /* Total Commander reports FS_STATUS_OP_GET_MULTI around a recursive copy: the virtual
+       statistics report must not appear in the extracted tree */
+    if (p->status_info_w) {
+        p->status_info_w((WCHAR*)remote_dir, FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
+    }
     HANDLE h = p->find_first_w((WCHAR*)remote_dir, &fd);
     if (h == INVALID_HANDLE_VALUE) {
+        if (p->status_info_w) p->status_info_w((WCHAR*)remote_dir, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
         return GetLastError() == ERROR_NO_MORE_FILES; /* Empty directory is valid */
     }
 
@@ -498,10 +519,144 @@ static BOOL tc_copy_folder_recursive(
     } while (p->find_next_w(h, &fd));
 
     p->find_close(h);
+    if (p->status_info_w) p->status_info_w((WCHAR*)remote_dir, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
     return ok;
 }
 
 static BOOL verify_pattern_file(const WCHAR* path, DWORD size);
+
+/* Reads a whole file and reports whether it contains `needle` (UTF-8 substring search) */
+static BOOL file_contains_text(const WCHAR* path, const char* needle) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+
+    LARGE_INTEGER size;
+    BOOL found = FALSE;
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart < (8LL * 1024 * 1024)) {
+        char* buffer = (char*)malloc((size_t)size.QuadPart + 1);
+        if (buffer != NULL) {
+            DWORD got = 0;
+            if (ReadFile(h, buffer, (DWORD)size.QuadPart, &got, NULL)) {
+                buffer[got] = '\0';
+                found = strstr(buffer, needle) != NULL;
+            }
+            free(buffer);
+        }
+    }
+    CloseHandle(h);
+    return found;
+}
+
+/* Enumerates a virtual directory and reports whether the virtual statistics report is among it */
+static BOOL listing_has_report(const Plugin* p, const WCHAR* path, BOOL* out_has_report,
+                               int* out_count) {
+    WIN32_FIND_DATAW fd;
+    *out_has_report = FALSE;
+    *out_count      = 0;
+    HANDLE h        = p->find_first_w((WCHAR*)path, &fd);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        (*out_count)++;
+        if (wcscmp(fd.cFileName, RESTIC_REPORT_NAME_W) == 0) *out_has_report = TRUE;
+    } while (p->find_next_w(h, &fd));
+    p->find_close(h);
+    return TRUE;
+}
+
+/* Virtual statistics report: listing, hiding during mass operations, F3 on all three levels */
+static void test_e2e_stats_report(const Plugin* p, const WCHAR* dir, const WCHAR* snapshot_root,
+                                  const WCHAR* data_path) {
+    BOOL has_report = FALSE;
+    int count       = 0;
+
+    EXPECT_TRUE(listing_has_report(p, L"\\MainRepo", &has_report, &count) && has_report,
+                "The repository level lists the virtual statistics report");
+    EXPECT_TRUE(listing_has_report(p, snapshot_root, &has_report, &count) && has_report,
+                "The snapshot level lists the virtual statistics report");
+    EXPECT_TRUE(listing_has_report(p, data_path, &has_report, &count) && has_report,
+                "A snapshot subfolder lists the virtual statistics report");
+
+    WCHAR report_path[MAX_PATH * 2];
+    swprintf_s(report_path, _countof(report_path), L"%ls\\%ls", data_path, RESTIC_REPORT_NAME_W);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = p->find_first_w(report_path, &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE && wcscmp(fd.cFileName, RESTIC_REPORT_NAME_W) == 0 &&
+                    (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                    (((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow) ==
+                        RESTIC_REPORT_SIZE,
+                "A direct query returns the virtual file with its placeholder size");
+    if (h != INVALID_HANDLE_VALUE) p->find_close(h);
+
+    /* Mass operations hide it so an extracted backup never gains a file */
+    p->status_info_w((WCHAR*)data_path, FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
+    EXPECT_TRUE(listing_has_report(p, data_path, &has_report, &count) && !has_report,
+                "Recursive copies, searches and size calculations do not see the report");
+    p->status_info_w((WCHAR*)data_path, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
+    EXPECT_TRUE(listing_has_report(p, data_path, &has_report, &count) && has_report,
+                "The report is visible again after the operation");
+
+    RemoteInfo ri;
+    memset(&ri, 0, sizeof(ri));
+    ri.SizeLow       = (DWORD)(RESTIC_REPORT_SIZE & 0xFFFFFFFFULL);
+    ri.LastWriteTime.dwLowDateTime = 0;
+    ri.Attr          = FILE_ATTRIBUTE_READONLY;
+
+    WCHAR local[MAX_PATH];
+    WCHAR remote[MAX_PATH * 2];
+    const int prompts_before = g_e2e_pwd_prompts;
+    g_e2e_msg_dialogs        = 0;
+
+    /* Repository level (F3 on \\MainRepo\\!restic_stats.html) */
+    swprintf_s(local, _countof(local), L"%ls\\report_repo.html", dir);
+    swprintf_s(remote, _countof(remote), L"\\MainRepo\\%ls", RESTIC_REPORT_NAME_W);
+    DeleteFileW(local);
+    EXPECT_TRUE(p->get_file_w(remote, local, 0, &ri) == FS_FILE_OK,
+                "The repository report is generated for F3");
+    EXPECT_TRUE(file_contains_text(local, "Restic repository report"),
+                "The repository report contains its headline");
+    EXPECT_TRUE(file_contains_text(local, "Snapshot history"),
+                "The repository report lists the snapshot history");
+    EXPECT_TRUE(file_contains_text(local, "</html>"), "The report is a complete HTML document");
+    DeleteFileW(local);
+
+    /* Total Commander hands over the size it was shown. A different, non-zero size means the file
+       is a real backed-up file that happens to have the report's name: it is not generated */
+    ri.SizeLow = 5;
+    EXPECT_TRUE(p->get_file_w(remote, local, 0, &ri) == FS_FILE_NOTFOUND &&
+                    GetFileAttributesW(local) == INVALID_FILE_ATTRIBUTES,
+                "A request carrying another size is not answered with the virtual report");
+    ri.SizeLow = 0; /* No size information at all still works */
+    EXPECT_TRUE(p->get_file_w(remote, local, 0, &ri) == FS_FILE_OK, "A request without size works");
+    DeleteFileW(local);
+    ri.SizeLow = (DWORD)(RESTIC_REPORT_SIZE & 0xFFFFFFFFULL);
+
+    /* Snapshot level */
+    swprintf_s(local, _countof(local), L"%ls\\report_snapshot.html", dir);
+    swprintf_s(remote, _countof(remote), L"%ls\\%ls", snapshot_root, RESTIC_REPORT_NAME_W);
+    DeleteFileW(local);
+    EXPECT_TRUE(p->get_file_w(remote, local, 0, &ri) == FS_FILE_OK,
+                "The snapshot report is generated for F3");
+    EXPECT_TRUE(file_contains_text(local, "Restic snapshot report"),
+                "The snapshot report contains its headline");
+    EXPECT_TRUE(file_contains_text(local, "Files and directories"),
+                "The snapshot report contains the summary");
+    DeleteFileW(local);
+
+    /* Subfolder level */
+    swprintf_s(local, _countof(local), L"%ls\\report_folder.html", dir);
+    swprintf_s(remote, _countof(remote), L"%ls\\%ls", data_path, RESTIC_REPORT_NAME_W);
+    DeleteFileW(local);
+    EXPECT_TRUE(p->get_file_w(remote, local, 0, &ri) == FS_FILE_OK,
+                "The folder report is generated for F3");
+    EXPECT_TRUE(file_contains_text(local, "Restic folder report"),
+                "The folder report contains its headline");
+    EXPECT_TRUE(file_contains_text(local, "Size by subfolder"),
+                "The folder report aggregates the subfolders");
+    DeleteFileW(local);
+
+    EXPECT_TRUE(g_e2e_pwd_prompts == prompts_before && g_e2e_msg_dialogs == 0,
+                "Generating reports reuses the cached password without dialogs");
+}
 
 /* Exercises FsGetFileW (single file, overwrite protocol, move rejection, missing file) and recursive folder copy */
 static void test_e2e_file_and_folder_extraction(const Plugin* p, const WCHAR* dir, const WCHAR* data_path) {
@@ -963,7 +1118,12 @@ static void test_e2e_unc_share(const Plugin* p_in) {
     HANDLE h = p.find_first_w(L"\\UncRepo", &fd);
     EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "The UNC repository lists its snapshot");
     WCHAR snap[MAX_PATH] = {0};
-    wcsncpy_s(snap, MAX_PATH, fd.cFileName, _TRUNCATE);
+    do {
+        if (wcscmp(fd.cFileName, RESTIC_REPORT_NAME_W) != 0) {
+            wcsncpy_s(snap, MAX_PATH, fd.cFileName, _TRUNCATE);
+            break;
+        }
+    } while (p.find_next_w(h, &fd));
     p.find_close(h);
 
     WCHAR path[MAX_PATH * 4];
@@ -971,10 +1131,14 @@ static void test_e2e_unc_share(const Plugin* p_in) {
     h = p.find_first_w(path, &fd);
     EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "The snapshot root of a UNC backup is not empty");
     WCHAR volume[MAX_PATH] = {0};
-    wcsncpy_s(volume, MAX_PATH, fd.cFileName, _TRUNCATE);
+    do {
+        if (wcscmp(fd.cFileName, RESTIC_REPORT_NAME_W) != 0) {
+            wcsncpy_s(volume, MAX_PATH, fd.cFileName, _TRUNCATE);
+            break;
+        }
+    } while (p.find_next_w(h, &fd));
     EXPECT_TRUE(volume[0] == 0xFF3C && volume[1] == 0xFF3C && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
                 "The UNC volume is a folder named with full-width solidus characters");
-    EXPECT_TRUE(!p.find_next_w(h, &fd), "The snapshot root holds only the UNC volume");
     p.find_close(h);
 
     swprintf_s(path, _countof(path), L"\\UncRepo\\%ls\\%ls%ls", snap, volume, data_abs + 2);
@@ -1063,13 +1227,19 @@ static void test_live_end_to_end_navigation(void) {
     WCHAR latest_snap[MAX_PATH] = {0};
     WCHAR snap_names[2][MAX_PATH] = {{0}};
     size_t snap_count = 0;
+    BOOL saw_report_level1 = FALSE;
     do {
+        if (wcscmp(fd.cFileName, RESTIC_REPORT_NAME_W) == 0) {
+            saw_report_level1 = TRUE;
+            continue;
+        }
         if (snap_count < 2) wcsncpy_s(snap_names[snap_count], MAX_PATH, fd.cFileName, _TRUNCATE);
         snap_count++;
         wcsncpy_s(latest_snap, MAX_PATH, fd.cFileName, _TRUNCATE);
     } while (p.find_next_w(h, &fd));
     p.find_close(h);
     EXPECT_TRUE(snap_count == 2, "Both fixture snapshots returned at Level 1");
+    EXPECT_TRUE(saw_report_level1, "The virtual statistics report is listed with the snapshots");
 
     test_e2e_statistics_columns(&p, snap_names);
     test_e2e_cold_start_statistics(&p, snap_names[0]);
@@ -1080,6 +1250,8 @@ static void test_live_end_to_end_navigation(void) {
     swprintf_s(snap_root, _countof(snap_root), L"\\MainRepo\\%ls", latest_snap);
     EXPECT_TRUE(descend_to_fixture_data(&p, snap_root, 0, data_path, _countof(data_path)),
                 "Descend snapshot directory tree down to fixture data folder");
+
+    test_e2e_stats_report(&p, dir, snap_root, data_path);
 
     h = p.find_first_w(data_path, &fd);
     EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "List data directory inside snapshot");
@@ -1093,12 +1265,21 @@ static void test_live_end_to_end_navigation(void) {
     p.find_close(h);
     EXPECT_TRUE(saw_readme && saw_empty_dir, "data folder contains readme.txt (5 B) and empty_dir");
 
-    /* Empty directory inside snapshot -> ERROR_NO_MORE_FILES, no error popup */
+    /* Empty directory inside snapshot: only the virtual report, and truly empty during copies */
     WCHAR empty_path[MAX_PATH * 2];
     swprintf_s(empty_path, _countof(empty_path), L"%ls\\empty_dir", data_path);
+    h = p.find_first_w(empty_path, &fd);
+    EXPECT_TRUE(h != INVALID_HANDLE_VALUE && wcscmp(fd.cFileName, RESTIC_REPORT_NAME_W) == 0 &&
+                    p.find_next_w(h, &fd) == FALSE,
+                "An empty snapshot directory only lists the statistics report");
+    if (h != INVALID_HANDLE_VALUE) p.find_close(h);
+
+    p.status_info_w(empty_path, FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
     SetLastError(0);
     EXPECT_TRUE(p.find_first_w(empty_path, &fd) == INVALID_HANDLE_VALUE &&
-                GetLastError() == ERROR_NO_MORE_FILES, "Empty snapshot directory returns ERROR_NO_MORE_FILES");
+                GetLastError() == ERROR_NO_MORE_FILES,
+                "A mass operation sees the empty directory as empty");
+    p.status_info_w(empty_path, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
 
     /* 2b. File extraction via FsGetFileW + recursive directory copy (as Total Commander does on F5) */
     test_e2e_file_and_folder_extraction(&p, dir, data_path);

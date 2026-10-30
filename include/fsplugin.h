@@ -37,6 +37,32 @@
 #define RT_MsgYesNo                 9
 #define RT_MsgOKCancel              10
 
+/* InfoStartEnd values passed to FsStatusInfo / FsStatusInfoW */
+#define FS_STATUS_START 0
+#define FS_STATUS_END   1
+
+/* InfoOperation values passed to FsStatusInfo / FsStatusInfoW (values from the WFX SDK) */
+#define FS_STATUS_OP_LIST              1
+#define FS_STATUS_OP_GET_SINGLE        2
+#define FS_STATUS_OP_GET_MULTI         3
+#define FS_STATUS_OP_PUT_SINGLE        4
+#define FS_STATUS_OP_PUT_MULTI         5
+#define FS_STATUS_OP_RENMOV_SINGLE     6
+#define FS_STATUS_OP_RENMOV_MULTI      7
+#define FS_STATUS_OP_DELETE            8
+#define FS_STATUS_OP_ATTRIB            9
+#define FS_STATUS_OP_MKDIR            10
+#define FS_STATUS_OP_EXEC             11
+#define FS_STATUS_OP_CALCSIZE         12
+#define FS_STATUS_OP_SEARCH           13
+#define FS_STATUS_OP_SEARCH_TEXT      14
+#define FS_STATUS_OP_SYNC_SEARCH      15
+#define FS_STATUS_OP_SYNC_GET         16
+#define FS_STATUS_OP_SYNC_PUT         17
+#define FS_STATUS_OP_SYNC_DELETE      18
+#define FS_STATUS_OP_GET_MULTI_THREAD 19
+#define FS_STATUS_OP_PUT_MULTI_THREAD 20
+
 /* Flags for tLogProc / tLogProcW */
 #define MSGTYPE_CONNECT             1
 #define MSGTYPE_DISCONNECT          2
@@ -116,6 +142,8 @@ HANDLE __stdcall FsFindFirstW(WCHAR* Path, WIN32_FIND_DATAW* FindData);
 BOOL   __stdcall FsFindNext(HANDLE Hdl, WIN32_FIND_DATAA* FindData);
 BOOL   __stdcall FsFindNextW(HANDLE Hdl, WIN32_FIND_DATAW* FindData);
 int    __stdcall FsFindClose(HANDLE Hdl);
+void   __stdcall FsStatusInfo(char* RemoteDir, int InfoStartEnd, int InfoOperation);
+void   __stdcall FsStatusInfoW(WCHAR* RemoteDir, int InfoStartEnd, int InfoOperation);
 int    __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri);
 int    __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, RemoteInfoStruct* ri);
 

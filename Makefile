@@ -22,6 +22,7 @@ TEST_CONFIG_OUT = $(BUILD_DIR)\test_config.exe
 TEST_CLI_OUT    = $(BUILD_DIR)\test_restic_cli.exe
 TEST_DLL_OUT    = $(BUILD_DIR)\test_plugin_dll.exe
 TEST_STATS_OUT  = $(BUILD_DIR)\test_stats.exe
+TEST_REPORT_OUT = $(BUILD_DIR)\test_report.exe
 DEF_FILE        = restic_wfx.def
 RC_FILE         = src\restic_wfx.rc
 ICO_FILE        = logo\restic_wfx.ico
@@ -70,11 +71,13 @@ CFLAGS = $(CFLAGS_COMMON) $(CFLAGS_CFG) $(CFLAGS_EXTRA)
 
 PLUGIN_OBJS = $(BUILD_DIR)\main.obj $(BUILD_DIR)\config.obj $(BUILD_DIR)\restic_cli.obj \
               $(BUILD_DIR)\restic_stats.obj $(BUILD_DIR)\wfx_path.obj $(BUILD_DIR)\fscontent.obj \
+              $(BUILD_DIR)\restic_report.obj $(BUILD_DIR)\wfx_status.obj \
               $(BUILD_DIR)\wfx_trace.obj $(BUILD_DIR)\cJSON.obj
 
 TEST_CONFIG_OBJS = $(BUILD_DIR)\test_config.obj $(PLUGIN_OBJS)
 TEST_CLI_OBJS    = $(BUILD_DIR)\test_restic_cli.obj $(PLUGIN_OBJS)
 TEST_STATS_OBJS  = $(BUILD_DIR)\test_stats.obj $(PLUGIN_OBJS)
+TEST_REPORT_OBJS = $(BUILD_DIR)\test_report.obj $(PLUGIN_OBJS)
 
 all: $(BUILD_DIR) $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT)
 
@@ -87,7 +90,7 @@ $(INI_OUT): $(BUILD_DIR) $(INI_TEMPLATE)
 $(PLUGINST_OUT): $(BUILD_DIR) $(PLUGINST_FILE)
 	copy /Y "$(PLUGINST_FILE)" "$(PLUGINST_OUT)" >nul
 
-$(BUILD_DIR)\main.obj: $(BUILD_DIR) src\main.c include\fsplugin.h include\config.h include\restic_cli.h include\restic_stats.h include\wfx_path.h include\wfx_trace.h
+$(BUILD_DIR)\main.obj: $(BUILD_DIR) src\main.c include\fsplugin.h include\config.h include\restic_cli.h include\restic_stats.h include\restic_report.h include\wfx_path.h include\wfx_status.h include\wfx_trace.h
 	$(CC) /c $(CFLAGS) src\main.c
 
 $(BUILD_DIR)\config.obj: $(BUILD_DIR) src\config.c include\config.h
@@ -102,8 +105,14 @@ $(BUILD_DIR)\restic_cli.obj: $(BUILD_DIR) src\restic_cli.c include\restic_cli.h 
 $(BUILD_DIR)\restic_stats.obj: $(BUILD_DIR) src\restic_stats.c include\restic_stats.h include\restic_cli.h cJSON\cJSON.h
 	$(CC) /c $(CFLAGS) src\restic_stats.c
 
-$(BUILD_DIR)\wfx_path.obj: $(BUILD_DIR) src\wfx_path.c include\wfx_path.h include\restic_cli.h
+$(BUILD_DIR)\wfx_path.obj: $(BUILD_DIR) src\wfx_path.c include\wfx_path.h include\restic_cli.h include\restic_report.h
 	$(CC) /c $(CFLAGS) src\wfx_path.c
+
+$(BUILD_DIR)\restic_report.obj: $(BUILD_DIR) src\restic_report.c include\restic_report.h include\restic_cli.h include\restic_stats.h cJSON\cJSON.h
+	$(CC) /c $(CFLAGS) src\restic_report.c
+
+$(BUILD_DIR)\wfx_status.obj: $(BUILD_DIR) src\wfx_status.c include\wfx_status.h include\fsplugin.h include\wfx_trace.h
+	$(CC) /c $(CFLAGS) src\wfx_status.c
 
 $(BUILD_DIR)\fscontent.obj: $(BUILD_DIR) src\fscontent.c include\fscontent.h include\fsplugin.h include\restic_stats.h include\wfx_path.h include\wfx_trace.h
 	$(CC) /c $(CFLAGS) src\fscontent.c
@@ -123,6 +132,9 @@ $(BUILD_DIR)\test_restic_cli.obj: $(BUILD_DIR) tests\test_restic_cli.c include\r
 $(BUILD_DIR)\test_stats.obj: $(BUILD_DIR) tests\test_stats.c include\restic_stats.h include\fscontent.h include\wfx_path.h include\wfx_trace.h
 	$(CC) /c $(CFLAGS) tests\test_stats.c
 
+$(BUILD_DIR)\test_report.obj: $(BUILD_DIR) tests\test_report.c include\restic_report.h include\restic_cli.h include\restic_stats.h include\wfx_path.h include\wfx_status.h
+	$(CC) /c $(CFLAGS) tests\test_report.c
+
 $(PLUGIN_RES): $(BUILD_DIR) $(RC_FILE) $(ICO_FILE) include\version.h
 	$(RC) $(RCFLAGS) /fo$(PLUGIN_RES) $(RC_FILE)
 
@@ -138,6 +150,9 @@ $(TEST_CLI_OUT): $(TEST_CLI_OBJS)
 $(TEST_STATS_OUT): $(TEST_STATS_OBJS)
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(TEST_STATS_OBJS) $(SYSLIBS) /link $(LFLAGS_CFG) /OUT:$(TEST_STATS_OUT)
 
+$(TEST_REPORT_OUT): $(TEST_REPORT_OBJS)
+	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(TEST_REPORT_OBJS) $(SYSLIBS) /link $(LFLAGS_CFG) /OUT:$(TEST_REPORT_OUT)
+
 $(BUILD_DIR)\test_plugin_dll.obj: $(BUILD_DIR) tests\test_plugin_dll.c include\version.h
 	$(CC) /c $(CFLAGS) tests\test_plugin_dll.c
 
@@ -146,7 +161,7 @@ $(TEST_DLL_OUT): $(BUILD_DIR)\test_plugin_dll.obj
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(BUILD_DIR)\test_plugin_dll.obj /link $(LFLAGS_CFG) /OUT:$(TEST_DLL_OUT)
 
 # The DLL smoke test needs the plugin binary; AddressSanitizer runs only exercise the unit tests
-TEST_DEPS = $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_DLL_OUT)
+TEST_DEPS = $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_REPORT_OUT) $(TEST_DLL_OUT)
 !IF "$(ASAN)" != "1"
 TEST_DEPS = $(PLUGIN_OUT) $(TEST_DEPS)
 !ENDIF
@@ -155,10 +170,11 @@ test: $(TEST_DEPS)
 	$(TEST_CONFIG_OUT)
 	$(TEST_CLI_OUT)
 	$(TEST_STATS_OUT)
+	$(TEST_REPORT_OUT)
 	$(TEST_DLL_OUT)
 
 analyze:
-	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_DLL_OUT)
+	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_REPORT_OUT) $(TEST_DLL_OUT)
 
 package:
 	$(MAKE) /nologo CONFIG=Release all

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX64-orange.svg" alt="Total Commander WFX64" />
-  <img src="https://img.shields.io/badge/Version-1.2.0-success.svg" alt="Version: 1.2.0" />
+  <img src="https://img.shields.io/badge/Version-1.3.0-success.svg" alt="Version: 1.3.0" />
 </p>
 
 ---
@@ -27,6 +27,7 @@ It turns Total Commander's **Network Neighborhood** (`\\\Restic Backups\`) into 
 ```text
 \\\Restic Backups\
 ├── MyLocalBackup\                              <-- Level 0: Repository aliases (from restic_plugin.ini)
+│   ├── !restic_stats.html                      <-- Repository report (F3)
 │   ├── 2026-10-18_09-30-00_[a1b2c3d4]\         <-- Level 1: Snapshots (YYYY-MM-DD_HH-MM-SS_[short_id])
 │   │   └── C\
 │   │       └── Users\
@@ -44,6 +45,7 @@ It turns Total Commander's **Network Neighborhood** (`\\\Restic Backups\`) into 
   - Copy individual files or entire directory trees out of any snapshot using **`F5`** (preserving original modification timestamps and 64-bit file sizes).
   - Inspect files directly with Total Commander's **Lister (`F3`)** or **Quick View (`Ctrl+Q`)**.
   - Constant-memory streaming (`64 KB` chunks via `restic dump --no-lock`) into a temporary file with **atomic replacement** on completion: an interrupted or failed overwrite never corrupts or deletes your existing local file.
+- **Interactive Statistics Report (`!restic_stats.html`):** every repository, snapshot and snapshot folder shows one extra virtual file. Press **`F3`** (Lister) or open it in a browser to get an HTML dashboard: repository-wide storage and deduplication plus the snapshot history, snapshot metadata with live compression statistics and a diff against the parent snapshot, or a folder breakdown by subfolder, file type, size range and largest files. The file is hidden during recursive copies, searches and folder size calculations, so an extracted backup never contains it.
 - **Strictly Read-Only by Design:** Every Restic command runs with `--no-lock`. Repository modification entry points (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally not exported, and `F6` (Move) is rejected.
 - **Zero Passwords on Disk:** Repository passwords are requested interactively via Total Commander's native password dialog (`RequestProcW`), kept only in volatile RAM per repository alias for the active session, passed to `restic.exe` via an isolated environment block (`RESTIC_PASSWORD`), and wiped with `SecureZeroMemory`.
 - **Responsive Cancellation (`ESC`):** Long operations on remote backends can be aborted with `ESC` and use a 30-minute **inactivity** timeout (so slow multi-gigabyte transfers are never cut off as long as bytes keep flowing).
@@ -177,6 +179,7 @@ GoogleDrive=rclone:gdrive:Backups/restic_repo
 | **View File (`F3` / `Ctrl+Q`)** | Press **`F3`** (Lister) or **`Ctrl+Q`** (Quick View) on any file to stream it to a temporary location and view its contents. |
 | **Restore / Extract (`F5`)** | Select one or more files or directories and press **`F5`** to copy them to the target panel, preserving original `LastWriteTime` timestamps. Standard Total Commander overwrite prompts are supported. |
 | **Cancel Operation (`ESC`)** | Press **`ESC`** in Total Commander's progress dialog to terminate the underlying `restic.exe` child process and clean up any temporary file. |
+| **Statistics Report (`F3`)** | Every repository, snapshot and folder contains the virtual file `!restic_stats.html`; `F3` renders a self-contained HTML report (see below). |
 | **Backup Statistics (Columns)** | Enter a repository: Total Commander switches to the plugin's custom columns view automatically. Add or reorder columns via **Configuration -> Options -> Custom columns** (see below). |
 
 ---
@@ -246,6 +249,27 @@ Total Commander shows the statistics columns only when the column definition poi
    Remove the file or unset the variable when you are done.
 
 ---
+
+---
+
+## Statistics Report (`!restic_stats.html`)
+
+Each repository, snapshot and snapshot folder contains one extra read-only virtual file named **`!restic_stats.html`**. Press **`F3`** (Lister) or **`Ctrl+Q`** (Quick View) on it: the plugin runs the required Restic queries and writes a self-contained HTML report. You can also copy it with **`F5`** and open it in any browser.
+
+| Where | What the report contains |
+| --- | --- |
+| `\<Alias>\!restic_stats.html` | Whole-repository storage: logical restore size, uncompressed and compressed (stored) size, compression ratio and savings, deduplication factor, blob count, plus the full snapshot history with the data each backup added over time. |
+| `\<Alias>\<Snapshot>\!restic_stats.html` | Snapshot metadata (IDs, parent, host, user, Restic version, tags, source paths, backup window and duration), live storage and compression figures for that snapshot, the new/changed/unmodified file and directory breakdown, and a diff against the parent snapshot with the changed paths. |
+| `\<Alias>\<Snapshot>\<Folder>\!restic_stats.html` | Recursive analysis of that folder: total size and file/directory counts, the share of every direct subfolder, the largest file types, a file size histogram and the fifteen largest files. |
+
+Notes:
+
+- The report renders in both Lister modes: plain tables and Unicode bars (`[████░░░░]`) are readable in the built-in HTML text mode, and the embedded CSS turns it into a dark/light dashboard in a browser or in the Explorer preview.
+- Generating a report needs a few extra `restic.exe` runs (`stats`, `diff`, `ls --recursive`), so it can take a moment on a slow or remote repository. **`ESC`** cancels it, the partially written file is discarded and an existing target file is left untouched.
+- Optional queries degrade gracefully: a snapshot whose parent has been deleted still produces a report, with a note stating that the diff is unavailable.
+- The repository location in the report hides the credentials of a URL (`rest:https://user:secret@host/repo` is shown as `rest:https://***@host/repo`), because the file can be copied or shared. Passwords are never written to the report.
+- If a snapshot contains a real file called `!restic_stats.html` (for example a report you saved earlier into a backed-up folder), the plugin does not add its virtual file to that folder: your file stays reachable.
+- The file is **not** listed during recursive copies (`F5` on a folder), searches (`Alt+F7`), folder size calculations (space bar) or directory synchronisation, because Total Commander reports those operations through `FsStatusInfoW`. Manual extraction of a whole snapshot therefore never adds a file the user never had.
 
 ## Building & Testing from Source
 

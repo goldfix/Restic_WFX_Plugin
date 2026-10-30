@@ -843,19 +843,17 @@ static void build_error_message(const ByteBuf* out, const ByteBuf* err, WCHAR* d
     }
 }
 
-ResticResult restic_exec_command(
+/* Validates the arguments, builds the command line and the credential environment, and starts
+ * restic.exe with its stdout/stderr redirected to two pipes. Caller closes pi->hThread. */
+static ResticResult spawn_restic_command(
     const WCHAR* restic_exe,
     const WCHAR* repo_target,
     const WCHAR* password,
     const WCHAR* args,
-    const ResticExecOptions* options,
-    ResticCommandOutput* out_result
+    PROCESS_INFORMATION* pi,
+    HANDLE* out_pipe,
+    HANDLE* err_pipe
 ) {
-    if (!restic_exe || !repo_target || !password || !args || !out_result) {
-        return RESTIC_ERR_INVALID_ARG;
-    }
-    memset(out_result, 0, sizeof(ResticCommandOutput));
-
     /* A bare file name would make CreateProcess search the current directory: refuse it */
     if (restic_exe[0] == L'\0' || wcspbrk(restic_exe, L"\\/:") == NULL) {
         return RESTIC_ERR_SPAWN_FAILED;
@@ -878,21 +876,56 @@ ResticResult restic_exec_command(
         return RESTIC_ERR_OUT_OF_MEMORY;
     }
 
-    HANDLE out_pipe = NULL, err_pipe = NULL;
-    PROCESS_INFORMATION pi;
-    BOOL spawned = spawn_hidden(cmd_line, env_block, &out_pipe, &err_pipe, &pi);
+    BOOL spawned = spawn_hidden(cmd_line, env_block, out_pipe, err_pipe, pi);
 
     /* Credentials must not outlive the CreateProcess call in this process' memory */
     SecureZeroMemory(env_block, env_chars * sizeof(WCHAR));
     free(env_block);
     free(cmd_line);
-    if (!spawned) {
-        return RESTIC_ERR_SPAWN_FAILED;
+    return spawned ? RESTIC_OK : RESTIC_ERR_SPAWN_FAILED;
+}
+
+/* Maps a non-zero Restic exit code to a ResticResult and fills the human-readable reason */
+static ResticResult classify_exit_code(
+    DWORD exit_code,
+    const ByteBuf* out,
+    const ByteBuf* err,
+    WCHAR* msg,
+    size_t msg_capacity
+) {
+    if (msg && msg_capacity > 0) {
+        build_error_message(out, err, msg, msg_capacity);
     }
+    switch (exit_code) {
+        case 10: return RESTIC_ERR_REPO_NOT_FOUND;
+        case 11: return RESTIC_ERR_REPO_LOCKED;
+        case 12: return RESTIC_ERR_WRONG_PASSWORD;
+        default: return RESTIC_ERR_CLI_FAILED;
+    }
+}
+
+ResticResult restic_exec_command(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const WCHAR* args,
+    const ResticExecOptions* options,
+    ResticCommandOutput* out_result
+) {
+    if (!restic_exe || !repo_target || !password || !args || !out_result) {
+        return RESTIC_ERR_INVALID_ARG;
+    }
+    memset(out_result, 0, sizeof(ResticCommandOutput));
+
+    HANDLE out_pipe = NULL, err_pipe = NULL;
+    PROCESS_INFORMATION pi;
+    ResticResult result =
+        spawn_restic_command(restic_exe, repo_target, password, args, &pi, &out_pipe, &err_pipe);
+    if (result != RESTIC_OK) return result;
     CloseHandle(pi.hThread);
 
     ByteBuf out = {0}, err = {0};
-    ResticResult result = RESTIC_ERR_OUT_OF_MEMORY;
+    result = RESTIC_ERR_OUT_OF_MEMORY;
     if (bytebuf_append(&out, "", 0) && bytebuf_append(&err, "", 0)) {
         result = collect_output(pi.hProcess, out_pipe, err_pipe, options, &out, &err);
     }
@@ -902,13 +935,8 @@ ResticResult restic_exec_command(
         GetExitCodeProcess(pi.hProcess, &exit_code);
         out_result->exit_code = exit_code;
         if (exit_code != 0) {
-            build_error_message(&out, &err, out_result->error_message, _countof(out_result->error_message));
-            switch (exit_code) {
-                case 10: result = RESTIC_ERR_REPO_NOT_FOUND; break;
-                case 11: result = RESTIC_ERR_REPO_LOCKED; break;
-                case 12: result = RESTIC_ERR_WRONG_PASSWORD; break;
-                default: result = RESTIC_ERR_CLI_FAILED; break;
-            }
+            result = classify_exit_code(exit_code, &out, &err, out_result->error_message,
+                                        _countof(out_result->error_message));
         }
     } else {
         TerminateProcess(pi.hProcess, 1); /* Timeout, cancellation or memory failure */
@@ -931,6 +959,191 @@ void restic_free_command_output(ResticCommandOutput* result) {
     free(result->output);
     free(result->error_output);
     memset(result, 0, sizeof(ResticCommandOutput));
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* Streaming line-by-line execution                                                            */
+/* ------------------------------------------------------------------------------------------ */
+
+/* Accumulates stdout bytes and forwards complete lines to a ResticLineProc */
+typedef struct {
+    ByteBuf pending;
+    size_t start; /* First byte of pending[] not forwarded yet */
+    ResticLineProc proc;
+    void* user_data;
+} LineStream;
+
+/*
+ * Forwards the line pending[start..line_end) without its terminator (a trailing CR is dropped as
+ * well) and continues with the next line at `next_start`. RESTIC_ERR_CANCELLED on callback stop.
+ */
+static ResticResult line_stream_emit(LineStream* stream, size_t line_end, size_t next_start) {
+    size_t length = line_end - stream->start;
+    while (length > 0 && stream->pending.data[stream->start + length - 1] == '\r') {
+        --length;
+    }
+    if (!stream->proc(stream->pending.data + stream->start, length, stream->user_data)) {
+        return RESTIC_ERR_CANCELLED;
+    }
+    stream->start = next_start;
+    return RESTIC_OK;
+}
+
+/* Appends freshly read bytes and forwards every line that is now complete */
+static ResticResult line_stream_feed(LineStream* stream, const char* data, size_t length) {
+    if (!bytebuf_append(&stream->pending, data, length)) {
+        return RESTIC_ERR_OUT_OF_MEMORY;
+    }
+
+    for (;;) {
+        const char* begin = stream->pending.data + stream->start;
+        const char* newline = (const char*)memchr(begin, '\n', stream->pending.len - stream->start);
+        if (newline == NULL) break;
+        const size_t line_end = (size_t)(newline - stream->pending.data);
+        ResticResult res      = line_stream_emit(stream, line_end, line_end + 1);
+        if (res != RESTIC_OK) return res;
+    }
+
+    /* Drop the consumed prefix so the pending buffer never grows with the stream length */
+    if (stream->start > 0) {
+        size_t remaining = stream->pending.len - stream->start;
+        if (remaining > 0) {
+            memmove(stream->pending.data, stream->pending.data + stream->start, remaining);
+        }
+        stream->pending.len = remaining;
+        stream->pending.data[remaining] = '\0';
+        stream->start = 0;
+    }
+    return RESTIC_OK;
+}
+
+/* Reads everything currently available from the child's stdout, forwarding complete lines */
+static ResticResult line_stream_drain(HANDLE pipe, LineStream* stream, BOOL* eof) {
+    char chunk[4096];
+    while (!*eof) {
+        DWORD avail = 0;
+        DWORD got = 0;
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) {
+            *eof = TRUE;
+            break;
+        }
+        if (avail == 0) break;
+        if (!ReadFile(pipe, chunk, avail < sizeof(chunk) ? avail : (DWORD)sizeof(chunk), &got, NULL) ||
+            got == 0) {
+            *eof = TRUE;
+            break;
+        }
+        ResticResult res = line_stream_feed(stream, chunk, got);
+        if (res != RESTIC_OK) return res;
+    }
+    return RESTIC_OK;
+}
+
+/* Reads both pipes until the child exits, forwarding stdout lines and collecting stderr */
+static ResticResult collect_stream_lines(
+    HANDLE process,
+    HANDLE out_pipe,
+    HANDLE err_pipe,
+    const ResticExecOptions* options,
+    LineStream* stream,
+    ByteBuf* err
+) {
+    ULONGLONG start = GetTickCount64();
+    ULONGLONG last_poll = start;
+    BOOL out_eof = FALSE, err_eof = FALSE;
+
+    for (;;) {
+        BOOL progressed = FALSE;
+
+        size_t before_pending = stream->pending.len;
+        ResticResult res = line_stream_drain(out_pipe, stream, &out_eof);
+        if (res != RESTIC_OK) return res;
+        if (stream->pending.len != before_pending) progressed = TRUE;
+
+        size_t before_err = err->len;
+        if (!drain_pipe(err_pipe, err, &err_eof)) return RESTIC_ERR_OUT_OF_MEMORY;
+        if (err->len != before_err) progressed = TRUE;
+
+        if (!progressed && WaitForSingleObject(process, 20) == WAIT_OBJECT_0) {
+            res = line_stream_drain(out_pipe, stream, &out_eof);
+            if (res != RESTIC_OK) return res;
+            if (!drain_pipe(err_pipe, err, &err_eof)) return RESTIC_ERR_OUT_OF_MEMORY;
+            return RESTIC_OK;
+        }
+
+        if (options) {
+            ULONGLONG now = GetTickCount64();
+            if (options->timeout_ms != 0 && now - start >= options->timeout_ms) {
+                return RESTIC_ERR_TIMEOUT;
+            }
+            if (options->cancel_proc && now - last_poll >= CANCEL_POLL_MS) {
+                last_poll = now;
+                if (options->cancel_proc(options->cancel_ctx)) return RESTIC_ERR_CANCELLED;
+            }
+        }
+    }
+}
+
+ResticResult restic_exec_lines(
+    const WCHAR* restic_exe,
+    const WCHAR* repo_target,
+    const WCHAR* password,
+    const WCHAR* args,
+    const ResticExecOptions* options,
+    ResticLineProc line_proc,
+    void* user_data,
+    WCHAR* out_error_msg,
+    size_t err_capacity
+) {
+    if (out_error_msg && err_capacity > 0) out_error_msg[0] = L'\0';
+    if (!restic_exe || !repo_target || !password || !args || !line_proc) {
+        return RESTIC_ERR_INVALID_ARG;
+    }
+
+    HANDLE out_pipe = NULL, err_pipe = NULL;
+    PROCESS_INFORMATION pi;
+    ResticResult result =
+        spawn_restic_command(restic_exe, repo_target, password, args, &pi, &out_pipe, &err_pipe);
+    if (result != RESTIC_OK) return result;
+    CloseHandle(pi.hThread);
+
+    LineStream stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.proc      = line_proc;
+    stream.user_data = user_data;
+
+    ByteBuf err = {0};
+    result      = RESTIC_ERR_OUT_OF_MEMORY;
+    if (bytebuf_append(&stream.pending, "", 0) && bytebuf_append(&err, "", 0)) {
+        result = collect_stream_lines(pi.hProcess, out_pipe, err_pipe, options, &stream, &err);
+        /* A last line without terminator still belongs to the output */
+        if (result == RESTIC_OK && stream.pending.len > stream.start) {
+            result = line_stream_emit(&stream, stream.pending.len, stream.pending.len);
+        }
+    }
+
+    if (result == RESTIC_OK) {
+        DWORD exit_code = 1;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        if (exit_code != 0) {
+            ByteBuf empty_out = {0};
+            result = classify_exit_code(exit_code, &empty_out, &err, out_error_msg, err_capacity);
+        }
+    } else {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+        /* An abnormal end must not be reported as "no output": keep the reason if there is one */
+        if (out_error_msg && err_capacity > 0 && result != RESTIC_ERR_CANCELLED) {
+            build_error_message(&stream.pending, &err, out_error_msg, err_capacity);
+        }
+    }
+
+    free(stream.pending.data);
+    free(err.data);
+    CloseHandle(out_pipe);
+    CloseHandle(err_pipe);
+    CloseHandle(pi.hProcess);
+    return result;
 }
 
 /* ------------------------------------------------------------------------------------------ */

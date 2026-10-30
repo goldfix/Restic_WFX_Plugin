@@ -2,6 +2,17 @@
 
 All notable changes to the Restic WFX plugin.
 
+## [1.3.0] — 2026-10-30
+
+### Added
+
+- **Statistics report as a virtual file.** Every repository, snapshot and snapshot folder lists one extra read-only entry, `!restic_stats.html`. `F3` (Lister) or a browser shows a self-contained HTML report:
+  - repository: storage and deduplication figures plus the snapshot history;
+  - snapshot: metadata, live compression statistics and a diff against the parent snapshot;
+  - folder: breakdown by subfolder, file type and size range, and the largest files.
+- The report is hidden during recursive copies, searches, folder size calculations and directory synchronisation, so an extracted backup never contains it. It can be cancelled with `ESC`, never replaces an existing file when cancelled, and shows repository URLs without their credentials.
+- A backed-up file that happens to be called `!restic_stats.html` stays reachable: the virtual entry is not added next to it.
+
 ## [1.2.0] — 2026-10-26
 
 ### Added
@@ -32,10 +43,12 @@ All notable changes to the Restic WFX plugin.
 
 - **Statistics columns.** File listing can show backup statistics (time, host, tags, file/dir counts, sizes, data added, duration, hashes, paths, summary availability) as native content columns. Values come from the snapshot list already loaded by the plugin, so displaying a column never starts a new process. Ships with a ready-to-use default view that works regardless of the name the plugin is registered under.
 
-## [Unreleased] — Planned
+## [Unreleased]
 
-- Statistics options B and C: HTML report view and typed command.
-- Optional extra-process fields: repository statistics (restore size, deduplication, compression) and differences against the parent snapshot.
+### Planned
+
+- Statistics option C: typed command.
+- Optional extra-process columns: repository statistics and differences against the parent snapshot.
 - Streaming directory listing for very deep or very wide folders.
 - Optional directory cache.
 - Child process tree termination on cancellation.

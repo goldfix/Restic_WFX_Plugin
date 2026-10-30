@@ -430,6 +430,105 @@ static void test_exec_streams_and_exit_codes(void) {
     restic_free_command_output(&out);
 }
 
+static BOOL always_cancel(void* user_data) {
+    (void)user_data;
+    return TRUE;
+}
+
+/* restic_exec_lines(): stdout is delivered line by line, in constant memory */
+typedef struct {
+    size_t lines;
+    size_t bytes;
+    size_t stop_after; /* 0 = never ask to stop */
+    BOOL saw_cr;
+    char first[64];
+    char last[64];
+} LineCapture;
+
+static BOOL capture_line(const char* line, size_t length, void* user_data) {
+    LineCapture* capture = (LineCapture*)user_data;
+    if (capture->lines == 0) {
+        strncpy_s(capture->first, sizeof(capture->first), line, length < 63 ? length : 63);
+    }
+    strncpy_s(capture->last, sizeof(capture->last), line, length < 63 ? length : 63);
+    if (memchr(line, '\r', length) != NULL) capture->saw_cr = TRUE;
+    capture->lines++;
+    capture->bytes += length;
+    return capture->stop_after == 0 || capture->lines < capture->stop_after;
+}
+
+static ResticResult run_cmd_lines(const WCHAR* args, const ResticExecOptions* opts, LineCapture* capture,
+                                  WCHAR* err, size_t err_capacity) {
+    WCHAR cmd[MAX_PATH];
+    if (!get_cmd_exe(cmd, MAX_PATH)) return RESTIC_ERR_SPAWN_FAILED;
+    memset(capture->first, 0, sizeof(capture->first));
+    memset(capture->last, 0, sizeof(capture->last));
+    capture->lines = capture->bytes = 0;
+    capture->saw_cr = FALSE;
+    return restic_exec_lines(cmd, L"repo", L"pw", args, opts, capture_line, capture, err, err_capacity);
+}
+
+static void test_exec_lines(void) {
+    LineCapture capture;
+    WCHAR err[512] = {0};
+    memset(&capture, 0, sizeof(capture));
+
+    /* 4000 lines (>100 KB) arrive one by one, terminators removed, nothing buffered up */
+    ResticResult res = run_cmd_lines(
+        L"/c \"for /L %i in (1,1,4000) do @echo line_%i_0123456789_0123456789\"", NULL, &capture, err,
+        _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK, "A long listing is streamed");
+    EXPECT_TRUE(capture.lines == 4000, "Every line is delivered exactly once");
+    EXPECT_TRUE(capture.saw_cr == FALSE, "CR LF terminators are removed");
+    EXPECT_TRUE(strcmp(capture.first, "line_1_0123456789_0123456789") == 0 &&
+                    strcmp(capture.last, "line_4000_0123456789_0123456789") == 0,
+                "First and last line are intact");
+    EXPECT_TRUE(capture.bytes > 100000, "The whole payload went through the callback");
+
+    /* Empty lines are delivered too; a last line without terminator is not lost */
+    res = run_cmd_lines(L"/c \"echo.& echo a& echo.& <nul set /p =tail& exit /b 0\"", NULL, &capture, err,
+                        _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && capture.lines == 4, "Empty lines and an unterminated tail count");
+    EXPECT_TRUE(strcmp(capture.last, "tail") == 0, "The unterminated last line is delivered");
+
+    /* The callback can stop the command: the child is killed and the result is a cancellation */
+    capture.stop_after = 10;
+    res = run_cmd_lines(L"/c \"for /L %i in (1,1,4000) do @echo line_%i\"", NULL, &capture, err,
+                        _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_CANCELLED && capture.lines == 10,
+                "A callback returning FALSE cancels the command at that line");
+    capture.stop_after = 0;
+
+    /* Exit codes keep their meaning; output printed before the failure was still delivered */
+    res = run_cmd_lines(L"/c \"echo one& echo oops 1>&2& exit /b 12\"", NULL, &capture, err,
+                        _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_WRONG_PASSWORD && capture.lines == 1 &&
+                    strcmp(capture.first, "one") == 0,
+                "Exit 12 -> wrong password, earlier lines delivered");
+    EXPECT_TRUE(wcsncmp(err, L"oops", 4) == 0, "The reason comes from stderr");
+    res = run_cmd_lines(L"/c \"exit /b 3\"", NULL, &capture, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_CLI_FAILED && capture.lines == 0, "Exit 3 -> generic failure");
+
+    /* Timeout and cancellation callback behave as for restic_exec_command */
+    ResticExecOptions options = {300, NULL, NULL};
+    res = run_cmd_lines(L"/c \"ping -n 8 127.0.0.1 >nul\"", &options, &capture, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_TIMEOUT, "A silent command hits the timeout");
+    options.timeout_ms = 0;
+    options.cancel_proc = always_cancel;
+    res = run_cmd_lines(L"/c \"ping -n 8 127.0.0.1 >nul\"", &options, &capture, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_ERR_CANCELLED, "The cancellation callback stops the stream");
+
+    /* Argument validation and spawn failures */
+    WCHAR cmd[MAX_PATH];
+    EXPECT_TRUE(get_cmd_exe(cmd, MAX_PATH), "ComSpec available");
+    EXPECT_TRUE(restic_exec_lines(cmd, L"repo", L"pw", L"/c exit", NULL, NULL, NULL, err, _countof(err)) ==
+                    RESTIC_ERR_INVALID_ARG,
+                "A missing callback is refused");
+    EXPECT_TRUE(restic_exec_lines(L"cmd.exe", L"repo", L"pw", L"/c exit", NULL, capture_line, &capture, err,
+                                  _countof(err)) == RESTIC_ERR_SPAWN_FAILED,
+                "A bare executable name is refused");
+}
+
 /* Credentials are injected, conflicting inherited variables removed, the rest inherited */
 static void test_exec_environment(void) {
     WCHAR cmd[MAX_PATH];
@@ -1291,6 +1390,7 @@ int main(void) {
     test_exec_environment();
     test_exec_limits_and_failures();
     test_exec_large_output_and_long_args();
+    test_exec_lines();
     test_dump_with_fake_restic();
     test_live_restic_cli();
     test_live_unc_share();

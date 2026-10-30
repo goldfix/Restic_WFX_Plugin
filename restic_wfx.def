@@ -8,6 +8,8 @@ EXPORTS
     FsFindNext
     FsFindNextW
     FsFindClose
+    FsStatusInfo
+    FsStatusInfoW
     FsGetFile
     FsGetFileW
     FsContentGetSupportedField
