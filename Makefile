@@ -42,7 +42,7 @@ CFLAGS_COMMON = /nologo /TC /std:c11 /permissive- /W4 /WX /we4013 /GS \
 
 # Linker security hardening (/DYNAMICBASE for ASLR, /NXCOMPAT for DEP)
 LFLAGS_COMMON = /NOLOGO /DEBUG /DYNAMICBASE /NXCOMPAT
-SYSLIBS       =
+SYSLIBS       = User32.lib
 TEST_LIBS     = Shell32.lib
 
 !IF "$(CONFIG)" == "Release"
@@ -105,7 +105,7 @@ $(BUILD_DIR)\restic_cli.obj: $(BUILD_DIR) src\restic_cli.c include\restic_cli.h 
 $(BUILD_DIR)\restic_stats.obj: $(BUILD_DIR) src\restic_stats.c include\restic_stats.h include\restic_cli.h cJSON\cJSON.h
 	$(CC) /c $(CFLAGS) src\restic_stats.c
 
-$(BUILD_DIR)\wfx_path.obj: $(BUILD_DIR) src\wfx_path.c include\wfx_path.h include\restic_cli.h include\restic_report.h
+$(BUILD_DIR)\wfx_path.obj: $(BUILD_DIR) src\wfx_path.c include\wfx_path.h include\restic_cli.h
 	$(CC) /c $(CFLAGS) src\wfx_path.c
 
 $(BUILD_DIR)\restic_report.obj: $(BUILD_DIR) src\restic_report.c include\restic_report.h include\restic_cli.h include\restic_stats.h cJSON\cJSON.h
@@ -114,7 +114,7 @@ $(BUILD_DIR)\restic_report.obj: $(BUILD_DIR) src\restic_report.c include\restic_
 $(BUILD_DIR)\wfx_status.obj: $(BUILD_DIR) src\wfx_status.c include\wfx_status.h include\fsplugin.h include\wfx_trace.h
 	$(CC) /c $(CFLAGS) src\wfx_status.c
 
-$(BUILD_DIR)\fscontent.obj: $(BUILD_DIR) src\fscontent.c include\fscontent.h include\fsplugin.h include\restic_stats.h include\wfx_path.h include\wfx_trace.h
+$(BUILD_DIR)\fscontent.obj: $(BUILD_DIR) src\fscontent.c include\fscontent.h include\fsplugin.h include\restic_stats.h include\restic_report.h include\wfx_path.h include\wfx_trace.h
 	$(CC) /c $(CFLAGS) src\fscontent.c
 
 $(BUILD_DIR)\wfx_trace.obj: $(BUILD_DIR) src\wfx_trace.c include\wfx_trace.h

@@ -2,6 +2,34 @@
 
 All notable changes to the Restic WFX plugin.
 
+## [1.3.1] — 2026-10-30
+
+Reworks the statistics report introduced in 1.3.0.
+
+### Changed
+
+- **The report is opened from the folder, not from a file.** The virtual `!restic_stats.html` entry is gone:
+  listings contain only real snapshots and files again, so nothing artificial can be copied or counted. Put the
+  cursor on a repository, a snapshot or a snapshot folder and press `F3` or `Alt+Enter`, or type `stats`; the
+  report opens in the Total Commander Lister. The space bar still calculates the folder size.
+- **Markdown instead of HTML.** Pipe tables aligned in monospace and ASCII bars (`#` and `.`) read cleanly as
+  plain text in the Lister and render in any Markdown viewer. The Unicode bar characters that overlapped in the
+  Lister are gone. The report is written to the temporary folder with a descriptive name.
+- **Faster.**
+  - Report generation reuses the snapshot list, the snapshot metadata and the restore size that the columns
+    already hold, so a repository or snapshot report no longer scans the whole tree; a repeated request within
+    one minute is answered from memory.
+  - Output from Restic is read without idle sleeps and with a larger pipe buffer: file extraction is about 60 %
+    faster and folder reports on trees with many subfolders no longer stall.
+  - The 30-minute timeout counts silence, not total time.
+- The progress bar now only moves forward instead of being reset to zero about ten times a second.
+
+### Fixed
+
+- A report requested for a file or for a path that does not exist does nothing instead of producing an empty
+  document, and `Alt+Enter` on a file or on the plugin root is no longer reported as an error.
+- A new report no longer fails when the previous one is still open in the Lister; it gets a new name.
+
 ## [1.3.0] — 2026-10-30
 
 ### Added
@@ -47,7 +75,6 @@ All notable changes to the Restic WFX plugin.
 
 ### Planned
 
-- Statistics option C: typed command.
 - Optional extra-process columns: repository statistics and differences against the parent snapshot.
 - Streaming directory listing for very deep or very wide folders.
 - Optional directory cache.

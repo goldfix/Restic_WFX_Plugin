@@ -17,7 +17,7 @@ typedef enum {
     RESTIC_ERR_JSON_PARSE,       /* Invalid or unexpected JSON/NDJSON payload */
     RESTIC_ERR_PATH_NOT_FOUND,   /* Requested snapshot path does not exist or is not a directory */
     RESTIC_ERR_LOCAL_WRITE,      /* Failed to create or write the local destination file */
-    RESTIC_ERR_TIMEOUT,          /* Child process exceeded ResticExecOptions.timeout_ms */
+    RESTIC_ERR_TIMEOUT,          /* Child process was silent for longer than ResticExecOptions.timeout_ms */
     RESTIC_ERR_CANCELLED         /* ResticExecOptions.cancel_proc requested abort */
 } ResticResult;
 
@@ -46,7 +46,7 @@ typedef BOOL (*ResticLineProc)(const char* line, size_t length, void* user_data)
  * Optional execution controls. Pass NULL to use defaults (no timeout, not cancellable).
  */
 typedef struct {
-    DWORD timeout_ms;            /* Maximum run time in milliseconds (0 = unlimited) */
+    DWORD timeout_ms;            /* Inactivity timeout: ms without a byte on stdout/stderr (0 = unlimited) */
     ResticCancelProc cancel_proc;/* Optional cancellation poll callback */
     void* cancel_ctx;            /* Opaque pointer forwarded to cancel_proc */
 } ResticExecOptions;

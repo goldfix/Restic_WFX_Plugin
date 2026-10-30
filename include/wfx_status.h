@@ -2,12 +2,18 @@
 #include <windows.h>
 
 /**
- * Tracks the operation Total Commander is currently performing (FsStatusInfo / FsStatusInfoW).
+ * Tracks the operation Total Commander is currently performing (FsStatusInfo / FsStatusInfoW) and
+ * detects the F3 pressed on a folder.
  *
- * The virtual statistics report is a convenience for the interactive user: it must never be
- * extracted by operations that walk the whole tree (recursive F5 copy, Alt+F7 search, space bar
- * folder size calculation, directory synchronisation), otherwise the copied backup would contain
- * an extra file the user never had.
+ * The statistics report is no longer a virtual file inside the listings: the user puts the cursor
+ * on a repository, a snapshot or a snapshot subfolder and presses F3 (or Alt+Enter). Total Commander
+ * has no "view a folder" entry point, so pressing F3 on a directory starts the folder-size
+ * calculation (FS_STATUS_OP_CALCSIZE) instead. The F3 key state at the moment that operation starts
+ * tells the two intents apart:
+ *
+ *   F3        -> remember that a report must be produced; the next FsFindFirstW of that CALCSIZE
+ *                scope generates it and returns "no files", which ends the operation immediately.
+ *   Space bar -> nothing happens here, Total Commander calculates the folder size as usual.
  *
  * Total Commander may drive the plugin from several background threads, so the state is kept per
  * thread (TLS) as a small stack for nested operations.
@@ -26,11 +32,21 @@ void wfx_status_end(void);
 int wfx_status_current_operation(void);
 
 /**
- * Returns TRUE when the virtual statistics report may be listed, i.e. when the current operation is
- * interactive. Mass traversal operations and searches hide it; no reported operation at all (older
- * Total Commander versions, unit tests calling the entry points directly) counts as interactive.
+ * Returns TRUE once per F3-triggered FS_STATUS_OP_CALCSIZE scope, when FsFindFirstW is called for
+ * the selected folder. Further calls in the same scope return FALSE, and
+ * wfx_status_is_f3_calcsize_aborted() keeps returning TRUE until FS_STATUS_END: the whole CALCSIZE
+ * scope answers "no files", so Total Commander never walks the tree of the folder being reported.
  */
-BOOL wfx_status_should_expose_report(void);
+BOOL wfx_status_consume_f3_calcsize(void);
 
-/* Forgets the whole stack of this thread (test helper) */
+/* TRUE once the F3 request of the current CALCSIZE scope has been served */
+BOOL wfx_status_is_f3_calcsize_aborted(void);
+
+/**
+ * Test helper: when set to TRUE the next FS_STATUS_OP_CALCSIZE start is treated as if F3 was held
+ * down, so unit and DLL tests are deterministic without physical keyboard input.
+ */
+void wfx_status_force_f3_next_calcsize(BOOL force);
+
+/* Forgets the whole stack and every F3 flag of this thread (test helper) */
 void wfx_status_reset(void);

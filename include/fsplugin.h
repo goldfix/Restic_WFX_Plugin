@@ -146,6 +146,8 @@ void   __stdcall FsStatusInfo(char* RemoteDir, int InfoStartEnd, int InfoOperati
 void   __stdcall FsStatusInfoW(WCHAR* RemoteDir, int InfoStartEnd, int InfoOperation);
 int    __stdcall FsGetFile(char* RemoteName, char* LocalName, int CopyFlags, RemoteInfoStruct* ri);
 int    __stdcall FsGetFileW(WCHAR* RemoteName, WCHAR* LocalName, int CopyFlags, RemoteInfoStruct* ri);
+int    __stdcall FsExecuteFile(HWND MainWin, char* RemoteName, char* Verb);
+int    __stdcall FsExecuteFileW(HWND MainWin, WCHAR* RemoteName, WCHAR* Verb);
 
 /* Optional custom-columns surface (read-only: no FsContentSetValue).
  * The W variants are the ones Total Commander calls on NT-based systems (they only fall back to the

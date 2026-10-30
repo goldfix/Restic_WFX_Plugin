@@ -27,15 +27,3 @@ typedef struct {
  * name ("YYYY-MM-DD_HH-MM-SS_[short_id]"). `out->subpath` aliases the caller's buffer.
  */
 BOOL wfx_parse_path(const WCHAR* path, WfxParsedPath* out);
-
-/**
- * Detects a trailing segment equal to the virtual statistics report name ("!restic_stats.html")
- * and copies the path without it into `out_parent` (e.g. L"\\Repo" or L"\\Repo\\Snap\\dir").
- * `*out_is_report` is always set; the return value is FALSE only when `out_parent` is too small.
- */
-BOOL wfx_path_strip_report_segment(
-    const WCHAR* path,
-    WCHAR* out_parent,
-    size_t out_capacity,
-    BOOL* out_is_report
-);

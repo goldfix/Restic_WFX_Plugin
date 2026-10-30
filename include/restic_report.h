@@ -6,20 +6,22 @@
 #include "restic_stats.h"
 
 /*
- * Virtual statistics report.
+ * Statistics report.
  *
- * Every repository root, snapshot root and snapshot subfolder lists one extra read-only virtual
- * file, "!restic_stats.html". Total Commander extracts it with F3 / Ctrl+Q / F5 through FsGetFileW,
- * which runs the required restic.exe queries and writes a self-contained HTML report.
+ * The report is not a file of the listings any more: the user puts the cursor on a repository,
+ * a snapshot or a snapshot subfolder and presses F3 (intercepted through FS_STATUS_OP_CALCSIZE)
+ * or Alt+Enter (FsExecuteFileW). The plugin runs the required restic.exe queries, writes a
+ * self-contained Markdown document to %TEMP% and opens the Total Commander Lister on it.
  *
- * The report renders acceptably in both Lister modes: plain tables and <pre> blocks for the native
- * HTML text mode (5), plus CSS for the browser / Explorer preview mode (8).
+ * Markdown was chosen over HTML because the native Lister shows it as perfectly aligned plain
+ * text (the report is pure ASCII outside the titles: pipe tables and '#'/'.' bars), while a
+ * Markdown Lister plugin or an external editor renders it graphically. HTML mode 5 of the Lister
+ * rewrote the spacing around tags and the Unicode block characters of the first version
+ * overlapped vertically and changed width through font fallback.
  */
 
-#define RESTIC_REPORT_FILENAME_W L"!restic_stats.html"
-
-/* Size reported in the file panel before the report is generated (purely informational) */
-#define RESTIC_REPORT_PLACEHOLDER_SIZE 16384ULL
+/* Name prefix of the generated document in %TEMP%: <prefix><alias>[_<short_id>][_<leaf>].md */
+#define RESTIC_REPORT_TEMP_PREFIX L"restic_stats_"
 
 /* Collection limits: the reports never grow beyond these bounds, whatever the repository size */
 #define RESTIC_REPORT_MAX_DIFF_CHANGES 100
@@ -122,32 +124,48 @@ typedef struct {
 } ResticReportFolder;
 
 /* ------------------------------------------------------------------------------------------ */
-/* Virtual file plumbing                                                                       */
+/* Opening the report                                                                          */
 /* ------------------------------------------------------------------------------------------ */
 
 /**
- * Fills the directory entry of the virtual report file for a repository root (`snapshot_id` NULL)
- * or a snapshot folder. The timestamp comes from the statistics cache when available.
- * Returns FALSE only for invalid parameters.
+ * Builds the deterministic local path of the report in %TEMP%:
+ *   repository: %TEMP%\restic_stats_<alias>.md
+ *   snapshot:   %TEMP%\restic_stats_<alias>_<short_id>.md
+ *   subfolder:  %TEMP%\restic_stats_<alias>_<short_id>_<leaf>.md
+ * Characters Windows does not accept in a file name are replaced and the result stays well below
+ * MAX_PATH. The speaking name is what the Total Commander Lister shows in its title bar.
+ * Returns FALSE for invalid arguments or a buffer that is too small.
  */
-BOOL restic_report_fill_find_data(
+BOOL restic_report_build_temp_path(
     const WCHAR* repository_alias,
     const char* snapshot_id,
-    WIN32_FIND_DATAW* find_data
+    const WCHAR* subpath,
+    WCHAR* out_path,
+    size_t out_capacity
 );
 
 /**
- * Inserts the virtual report as the first entry of a directory listing (`*items` is a malloc
- * array, grown with realloc). Nothing is added when the listing already contains a file with the
- * same name: a backed-up file called "!restic_stats.html" must stay reachable. Returns TRUE when
- * the entry was added.
+ * Makes sure the report can be written over `path`. The Lister of an earlier report may still keep
+ * the file open without FILE_SHARE_DELETE, which would make the atomic replacement fail; in that
+ * case " (2)" ... " (9)" is inserted before the ".md" extension until a free name is found and
+ * `path` is updated in place. Returns FALSE when no usable name exists or on invalid arguments.
  */
-BOOL restic_report_prepend_entry(
-    WIN32_FIND_DATAW** items,
-    size_t* count,
-    const WCHAR* repository_alias,
-    const char* snapshot_id
-);
+BOOL restic_report_pick_destination(WCHAR* path, size_t capacity);
+
+/**
+ * Opens `local_report_path` in the Total Commander Lister ("<tc_exe>" /S=L "<file>").
+ *
+ * %COMMANDER_EXE% (set by Total Commander) names the host executable; when it is missing the host
+ * module path is used instead. The process is spawned and not waited for. A test hook
+ * (restic_report_set_lister_test_hook) or the environment variable RESTIC_WFX_NO_LISTER_GUI=1
+ * replaces the launch, so automated tests never open windows.
+ */
+BOOL restic_report_open_in_lister(const WCHAR* local_report_path);
+
+/* Installs (or removes with NULL) the hook used instead of launching the Lister. The hook receives
+   the report path and returns TRUE when it has handled the request. */
+typedef BOOL (*ResticReportListerHook)(const WCHAR* local_report_path);
+void restic_report_set_lister_test_hook(ResticReportListerHook hook);
 
 /* ------------------------------------------------------------------------------------------ */
 /* Parsers and aggregation (pure functions, unit tested)                                       */
@@ -171,7 +189,7 @@ void restic_report_finalize_folder(ResticReportFolder* folder);
 /* Formatting helpers (UTF-8 input/output, unit tested)                                        */
 /* ------------------------------------------------------------------------------------------ */
 
-/* Writes "[NNNN░░░░]" using U+2588 / U+2591, `width` blocks wide. */
+/* Writes "[####....]", `width` characters wide, in pure ASCII (see format_bar). */
 void restic_report_format_bar(char* out, size_t out_capacity, double ratio, int width);
 
 /* Formats a byte count as "1.23 GB" (B, KB, MB, GB, TB). */
@@ -183,8 +201,13 @@ void restic_report_format_uint(unsigned long long value, char* out, size_t out_c
 /* Formats a FILETIME as "YYYY-MM-DD HH:MM:SS" (UTC). Returns FALSE for unknown/invalid times. */
 BOOL restic_report_format_time(const FILETIME* file_time, char* out, size_t out_capacity);
 
-/* Writes `text` to `fp`, escaping &, <, > and " (never write a path or host name unescaped). */
-void restic_report_escape_write(FILE* fp, const char* text);
+/*
+ * Writes `text` as the content of a Markdown table cell: a pipe becomes '/' (a real pipe would
+ * start a new column, and '/' keeps the cell one character wide), CR / LF / TAB become spaces.
+ * Everything else (&, <, >, ", ') is written verbatim: the report is no longer HTML, and escaping
+ * it would make paths unreadable in the Lister.
+ */
+void restic_report_write_text(FILE* fp, const char* text);
 
 /**
  * Copies a repository location for display, masking the credentials of a URL
@@ -194,7 +217,7 @@ void restic_report_escape_write(FILE* fp, const char* text);
 void restic_report_redact_location(const char* location, char* out, size_t capacity);
 
 /* ------------------------------------------------------------------------------------------ */
-/* HTML generation                                                                             */
+/* Markdown generation                                                                         */
 /* ------------------------------------------------------------------------------------------ */
 
 /* Report payloads; strings are UTF-8. `repo_target` may be empty, `alias` must not be NULL. */
@@ -228,9 +251,17 @@ typedef struct {
 } ResticReportSubtree;
 
 /* Writers take an already opened text file (unit tested without running restic) */
-void restic_report_write_repo_html(FILE* fp, const ResticReportRepo* report);
-void restic_report_write_snapshot_html(FILE* fp, const ResticReportSnapshot* report);
-void restic_report_write_subtree_html(FILE* fp, const ResticReportSubtree* report);
+void restic_report_write_repo_md(FILE* fp, const ResticReportRepo* report);
+void restic_report_write_snapshot_md(FILE* fp, const ResticReportSnapshot* report);
+void restic_report_write_subtree_md(FILE* fp, const ResticReportSubtree* report);
+
+/**
+ * Drops the one-slot cache of the last generated report. It is filled by restic_report_generate()
+ * and answers a repeated request (F3 twice, or Alt+Enter after F3) in memory, without running
+ * restic.exe again. An entry expires after one minute and is dropped by FsInitW,
+ * FsContentPluginUnloading and DLL_PROCESS_DETACH, so it is never older than that.
+ */
+void restic_report_clear_cache(void);
 
 /**
  * Generates the report for a virtual path and writes it to `local_dest_path`.
@@ -241,6 +272,10 @@ void restic_report_write_subtree_html(FILE* fp, const ResticReportSubtree* repor
  * - `options` (optional) supplies the inactivity timeout and the ESC polling callback.
  * - The file is written to a temporary file in the destination directory and moved over the target
  *   only on success, so a cancellation never leaves a truncated report behind.
+ * - The snapshot list, the snapshot metadata and the restore size come from the statistics cache
+ *   when it is warm (0 extra restic.exe processes); only the figures that the cache cannot provide
+ *   (`stats --mode raw-data`, `diff`, the recursive `ls` of a folder report) run a live query.
+ * - A second identical request within one minute is answered from memory.
  * - Secondary query failures degrade the report instead of failing it; RESTIC_ERR_* is returned
  *   only when the report itself cannot be produced.
  */

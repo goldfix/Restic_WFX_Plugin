@@ -17,6 +17,7 @@
 #include "fsplugin.h"
 #include "fscontent.h"
 #include "restic_stats.h"
+#include "restic_report.h"
 #include "wfx_path.h"
 #include "wfx_trace.h"
 
@@ -623,4 +624,5 @@ void __stdcall FsContentStopGetValueW(WCHAR* FileName) {
 
 void __stdcall FsContentPluginUnloading(void) {
     snapshot_stats_clear();
+    restic_report_clear_cache();
 }

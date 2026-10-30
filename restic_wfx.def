@@ -12,6 +12,8 @@ EXPORTS
     FsStatusInfoW
     FsGetFile
     FsGetFileW
+    FsExecuteFile
+    FsExecuteFileW
     FsContentGetSupportedField
     FsContentGetValue
     FsContentGetValueW
@@ -22,3 +24,4 @@ EXPORTS
     FsContentStopGetValue
     FsContentStopGetValueW
     FsContentPluginUnloading
+    restic_test_force_f3

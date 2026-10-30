@@ -28,6 +28,14 @@
 #define MAX_CMDLINE_CHARS 32767
 /* Poll interval for the cancellation callback while Restic is running */
 #define CANCEL_POLL_MS 100
+/*
+ * Kernel-side buffer of the stdout pipe. The default (4 KB) makes restic.exe block on WriteFile
+ * as soon as the reader is one scheduling quantum late; while streaming `restic ls --recursive`
+ * that happens for every subfolder tree blob. 64 KB absorbs the bursts.
+ */
+#define STDOUT_PIPE_BYTES 65536
+/* Idle wait before the pipes are polled again (short: Restic pauses only for a few hundred us) */
+#define IDLE_WAIT_MS 1
 
 /* ------------------------------------------------------------------------------------------ */
 /* Small helpers                                                                              */
@@ -716,7 +724,10 @@ static BOOL spawn_hidden(
     BOOL attrs_ready = FALSE;
     BOOL ok = FALSE;
 
-    if (!CreatePipe(&out_r, &out_w, &sa, 0) || !CreatePipe(&err_r, &err_w, &sa, 0)) goto done;
+    if (!CreatePipe(&out_r, &out_w, &sa, STDOUT_PIPE_BYTES) ||
+        !CreatePipe(&err_r, &err_w, &sa, 0)) {
+        goto done;
+    }
     SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
 
@@ -780,18 +791,19 @@ static ResticResult collect_output(
     ByteBuf* out,
     ByteBuf* err
 ) {
-    ULONGLONG start = GetTickCount64();
-    ULONGLONG last_poll = start;
+    ULONGLONG last_activity = GetTickCount64();
+    ULONGLONG last_poll     = last_activity;
     BOOL out_eof = FALSE, err_eof = FALSE;
 
     for (;;) {
-        size_t before = out->len + err->len;
+        const size_t before = out->len + err->len;
         if (!drain_pipe(out_pipe, out, &out_eof) || !drain_pipe(err_pipe, err, &err_eof)) {
             return RESTIC_ERR_OUT_OF_MEMORY;
         }
-
-        /* Only sleep when idle; wake immediately when the child exits */
-        if (out->len + err->len == before && WaitForSingleObject(process, 20) == WAIT_OBJECT_0) {
+        if (out->len + err->len != before) {
+            last_activity = GetTickCount64(); /* The inactivity timeout only counts silence */
+        } else if (WaitForSingleObject(process, IDLE_WAIT_MS) == WAIT_OBJECT_0) {
+            /* Only sleep when idle; wake immediately when the child exits */
             if (!drain_pipe(out_pipe, out, &out_eof) || !drain_pipe(err_pipe, err, &err_eof)) {
                 return RESTIC_ERR_OUT_OF_MEMORY;
             }
@@ -800,7 +812,7 @@ static ResticResult collect_output(
 
         if (options) {
             ULONGLONG now = GetTickCount64();
-            if (options->timeout_ms != 0 && now - start >= options->timeout_ms) {
+            if (options->timeout_ms != 0 && now - last_activity >= options->timeout_ms) {
                 return RESTIC_ERR_TIMEOUT;
             }
             if (options->cancel_proc && now - last_poll >= CANCEL_POLL_MS) {
@@ -1017,8 +1029,13 @@ static ResticResult line_stream_feed(LineStream* stream, const char* data, size_
     return RESTIC_OK;
 }
 
-/* Reads everything currently available from the child's stdout, forwarding complete lines */
-static ResticResult line_stream_drain(HANDLE pipe, LineStream* stream, BOOL* eof) {
+/*
+ * Reads everything currently available from the child's stdout, forwarding complete lines.
+ * `*out_read_any` is set when ReadFile returned at least one byte: the pending buffer shrinks back
+ * to its residual line after every batch, so its length cannot be used to detect progress.
+ */
+static ResticResult line_stream_drain(HANDLE pipe, LineStream* stream, BOOL* eof,
+                                      BOOL* out_read_any) {
     char chunk[4096];
     while (!*eof) {
         DWORD avail = 0;
@@ -1033,6 +1050,7 @@ static ResticResult line_stream_drain(HANDLE pipe, LineStream* stream, BOOL* eof
             *eof = TRUE;
             break;
         }
+        *out_read_any     = TRUE;
         ResticResult res = line_stream_feed(stream, chunk, got);
         if (res != RESTIC_OK) return res;
     }
@@ -1048,24 +1066,26 @@ static ResticResult collect_stream_lines(
     LineStream* stream,
     ByteBuf* err
 ) {
-    ULONGLONG start = GetTickCount64();
-    ULONGLONG last_poll = start;
+    ULONGLONG last_activity = GetTickCount64();
+    ULONGLONG last_poll     = last_activity;
     BOOL out_eof = FALSE, err_eof = FALSE;
 
     for (;;) {
+        BOOL read_any   = FALSE;
         BOOL progressed = FALSE;
 
-        size_t before_pending = stream->pending.len;
-        ResticResult res = line_stream_drain(out_pipe, stream, &out_eof);
+        ResticResult res = line_stream_drain(out_pipe, stream, &out_eof, &read_any);
         if (res != RESTIC_OK) return res;
-        if (stream->pending.len != before_pending) progressed = TRUE;
+        if (read_any) progressed = TRUE;
 
         size_t before_err = err->len;
         if (!drain_pipe(err_pipe, err, &err_eof)) return RESTIC_ERR_OUT_OF_MEMORY;
         if (err->len != before_err) progressed = TRUE;
 
-        if (!progressed && WaitForSingleObject(process, 20) == WAIT_OBJECT_0) {
-            res = line_stream_drain(out_pipe, stream, &out_eof);
+        if (progressed) {
+            last_activity = GetTickCount64(); /* The inactivity timeout only counts silence */
+        } else if (WaitForSingleObject(process, IDLE_WAIT_MS) == WAIT_OBJECT_0) {
+            res = line_stream_drain(out_pipe, stream, &out_eof, &read_any);
             if (res != RESTIC_OK) return res;
             if (!drain_pipe(err_pipe, err, &err_eof)) return RESTIC_ERR_OUT_OF_MEMORY;
             return RESTIC_OK;
@@ -1073,7 +1093,7 @@ static ResticResult collect_stream_lines(
 
         if (options) {
             ULONGLONG now = GetTickCount64();
-            if (options->timeout_ms != 0 && now - start >= options->timeout_ms) {
+            if (options->timeout_ms != 0 && now - last_activity >= options->timeout_ms) {
                 return RESTIC_ERR_TIMEOUT;
             }
             if (options->cancel_proc && now - last_poll >= CANCEL_POLL_MS) {
@@ -1629,7 +1649,7 @@ ResticResult restic_dump_file(
 
             if (st.written != before_out || err.len != before_err) {
                 st.last_activity = GetTickCount64();
-            } else if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {
+            } else if (WaitForSingleObject(pi.hProcess, IDLE_WAIT_MS) == WAIT_OBJECT_0) {
                 result = dump_drain_stdout(out_pipe, &st, &out_eof);
                 if (result == RESTIC_OK && !drain_pipe(err_pipe, &err, &err_eof)) {
                     result = RESTIC_ERR_OUT_OF_MEMORY;
