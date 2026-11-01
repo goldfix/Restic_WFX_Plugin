@@ -2,19 +2,20 @@
 
 All notable changes to the Restic WFX plugin.
 
-## [1.3.1] — 2026-10-30
+## [1.3.2] — 2026-11-01
 
-Reworks the statistics report introduced in 1.3.0.
+Reworks the statistics report introduced in 1.3.0 and makes it reachable with `F3`.
 
 ### Changed
 
 - **The report is opened from the folder, not from a file.** The virtual `!restic_stats.html` entry is gone:
   listings contain only real snapshots and files again, so nothing artificial can be copied or counted. Put the
   cursor on a repository, a snapshot or a snapshot folder and press `F3` or `Alt+Enter`, or type `stats`; the
-  report opens in the Total Commander Lister. The space bar still calculates the folder size.
+  report opens in the Total Commander Lister.
 - **Markdown instead of HTML.** Pipe tables aligned in monospace and ASCII bars (`#` and `.`) read cleanly as
   plain text in the Lister and render in any Markdown viewer. The Unicode bar characters that overlapped in the
-  Lister are gone. The report is written to the temporary folder with a descriptive name.
+  Lister are gone. The report is written to the temporary folder with a descriptive name and opened in the
+  Lister's own UTF-8 text mode, so a third-party Lister plugin registered for `.md` cannot intercept it.
 - **Faster.**
   - Report generation reuses the snapshot list, the snapshot metadata and the restore size that the columns
     already hold, so a repository or snapshot report no longer scans the whole tree; a repeated request within
@@ -26,8 +27,15 @@ Reworks the statistics report introduced in 1.3.0.
 
 ### Fixed
 
-- A report requested for a file or for a path that does not exist does nothing instead of producing an empty
-  document, and `Alt+Enter` on a file or on the plugin root is no longer reported as an error.
+- **`F3` on a folder now works.** Total Commander answers "No files selected!" for a directory of a
+  file system plugin by itself, without calling the plugin. The plugin now watches the keyboard inside Total
+  Commander's own process and, when the active panel shows one of its folders, opens the report instead.
+- `F3` is only handled when the **active** panel shows the plugin, in either panel layout (side by side or
+  above each other). With the cursor in a normal folder, an archive or another plugin, `F3` keeps Total
+  Commander's behaviour even when the other panel still shows a backup.
+- `F3` on a **file** inside a snapshot keeps working: the file is downloaded and shown in the configured
+  viewer. `Alt+Enter` on a file or on the plugin root does nothing and is no longer reported as an error.
+- A report requested for a path that does not exist does nothing instead of producing an empty document.
 - A new report no longer fails when the previous one is still open in the Lister; it gets a new name.
 
 ## [1.3.0] — 2026-10-30

@@ -97,7 +97,7 @@ Total Commander passes backslash-delimited paths rooted at `\`. The plugin maps 
 
 **Statistics report.** The listings contain only real entries: no artificial file is added at any
 level. The report of a repository, a snapshot or a snapshot subfolder is produced on demand by
-`F3` on the folder (intercepted inside the folder-size calculation, see 5.3) or by
+`F3` on the folder (intercepted by the keyboard hook, see 5.3) or by
 `Alt+Enter` / `quote stats` (`FsExecuteFileW`); it is a Markdown document written to `%TEMP%` and
 opened in the Total Commander Lister.
 
@@ -129,13 +129,13 @@ All exported functions use the `__stdcall` calling convention. Both Unicode (`W`
 
 *Note:* Modification, deletion, and move functions (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally omitted to enforce strict read-only repository access.
 
-The plugin exports **26 functions**: the 11 browsing/extraction entry points above, the 10 optional
-content-column functions of §5.2 (7 ANSI + 3 Unicode variants), the `FsStatusInfo` /
-`FsStatusInfoW` operation notifiers of §5.3 (ANSI and Unicode, used to detect `F3` on a folder),
-the `FsExecuteFile` / `FsExecuteFileW` execute entry points of §5.3 (Alt+Enter and `quote stats`)
-and `restic_test_force_f3`, a test-only hook that marks the next folder-size calculation as an `F3`
-request so the automated tests can replay the real Total Commander sequence without a keyboard.
-`FsContentSetValue` is *not* exported (no field is editable).
+The plugin exports **23 functions**: the 11 browsing/extraction entry points above, the 10 optional
+content-column functions of §5.2 (7 ANSI + 3 Unicode variants) and the `FsExecuteFile` /
+`FsExecuteFileW` execute entry points of §5.3 (`F3` on a folder, Alt+Enter and `quote stats`).
+`FsStatusInfo(W)` is deliberately **not** exported: it only existed to follow the folder-size
+calculation, which Total Commander never starts for `F3`. `FsContentSetValue` is *not* exported (no
+field is editable), and neither is any test hook: the pure parts of the `F3` logic are linked directly
+into the unit tests.
 
 ### 5.2 Custom Columns (`FsContent*`, read-only)
 
@@ -206,32 +206,83 @@ Rules and limitations:
 The report is **not** a file of the listings: they contain exactly the snapshots and the files of the
 backup. It is produced on demand for the folder the cursor is on and opened in the Total Commander Lister.
 
-- **`F3` on a folder (CALCSIZE interception, `src/wfx_status.c` + `src/main.c`).** Total Commander has no
-  "view a folder" entry point: `F3` on a directory starts a folder-size calculation, which is the sequence
-  `FsStatusInfoW(dir, FS_STATUS_START, FS_STATUS_OP_CALCSIZE)` -> `FsFindFirstW(dir, ...)` ->
-  `FsStatusInfoW(dir, FS_STATUS_END, FS_STATUS_OP_CALCSIZE)`. When that operation starts, `wfx_status_begin()`
-  samples `GetAsyncKeyState(VK_F3)`: if `F3` is held down, a per-thread flag is set and the next
-  `FsFindFirstW` of the same scope calls `show_stats_report_for_path()` and answers
-  `INVALID_HANDLE_VALUE` + `ERROR_NO_MORE_FILES`. `wfx_status_is_f3_calcsize_aborted()` keeps every further
-  `FsFindFirstW` of that scope answering "no files", so Total Commander never walks the tree of the folder
-  being reported and the operation ends immediately. A space bar (folder size) leaves the flag unset and the
-  normal calculation runs. A per-thread stack of depth 8 tracks nested operations and `FS_STATUS_END`
-  forgets the request. `GetAsyncKeyState` is the only reason the plugin imports `USER32.dll`.
-  - The tests drive this path through `restic_test_force_f3(TRUE)`, which sets the same flag instead of
-    requiring a physical keystroke.
+- **`F3` on a folder (keyboard hook, `src/wfx_status.c`).** Total Commander has no "view a folder"
+  entry point: `F3` on a directory of a plugin is answered by Total Commander itself with "No files
+  selected!" and **no** WFX function is called (verified live on 11.58 x64 with the trace: no
+  `FsFindFirst`, no status notification). The plugin therefore installs one **thread-local** hook on
+  Total Commander's user interface thread - `SetWindowsHookExW(WH_KEYBOARD, proc, NULL,
+  GetCurrentThreadId())`, no system-wide injection, no DLL loaded into other processes - from
+  `FsFindFirstW` (a thread without keyboard focus, e.g. a background copy, is skipped and a later
+  listing retries).
+  - **Path Guard.** On a plain `VK_F3` key-down `active_panel_depth()` requires that the window owning
+    the focus is the file list of a panel (`restic_f3_is_panel_list_class`: `LCLListBox`, verified;
+    `TMyListBox`, the name of older versions, not verified) inside a `TTOTAL_CMD` main window that is
+    also the foreground window. It then enumerates **all** descendants (the panels are not direct
+    children) and feeds their texts to the pure core `restic_f3_scan_add()` / `restic_f3_scan_result()`:
+    - a text ending in `>` is the **command line prompt**; it always shows the path of the *active*
+      panel (verified: `\\\Restic Backups\Probe>` while the plugin is active, `c:\>` after `Tab`)
+      and decides alone;
+    - with the command line hidden there is no prompt and the path bars whose horizontal extent
+      contains the focus are used, but a bar of another location in that extent (backslash in the
+      text, not the plugin) makes the answer "not the plugin": panels **above each other** share the
+      whole width, so the geometry cannot tell them apart. Without the prompt rule this violated the
+      isolation in that layout (found live: F3 on a local folder was swallowed while the plugin sat in
+      the other panel; fixed and covered by tests);
+    - `restic_f3_parse_panel_text()` returns the depth (0 = repository list, 1 = snapshot list, 2+ =
+      inside a snapshot) or "not this plugin"; status bars and labels are ignored.
+    Anything else (local folder, archive, another plugin, command line, dialog) leaves `F3` to Total
+    Commander, even when the *other* panel still shows a backup. The thumbnail view and other list
+    controls are not recognised (their class is unknown): `F3` then keeps Total Commander's behaviour.
+  - **Report request.** When the guard matches, the key-down is swallowed (Total Commander never
+    shows its dialog) and, when the key is released, a message is posted to the plugin's own
+    message-only window. That window re-checks the guard (the user may have moved on), records the
+    request (`restic_f3_note_request`) and injects **Alt+Enter** with `SendInput` in two steps (Alt
+    down, then Return and Alt up 20 ms later), which is Total Commander's own "properties" command. It
+    reaches the plugin as `FsExecuteFileW(MainWin, remote_name, L"properties")` with the exact path
+    of the row under the cursor, and `show_stats_report_for_path()` produces the report. A stale
+    "swallowed" flag cannot fire on a later key-up: an unhandled plain F3 clears it. A timer was tried
+    first and never fired (Total Commander only dispatches messages addressed to a window).
+    Posting `WM_USER + 51` with `cm_VersionInfo` (510, the About box), `cm_Properties` (1003) or the
+    context menu (2500) does **nothing** for plugin panels (retested with the left panel verified
+    active through the prompt and the cursor on the snapshot row), which is why a synthesised
+    Alt+Enter is used.
+  - **Files keep the native viewer.** `F3` on a file inside a snapshot must still download and view
+    it. The same "properties" request arrives with a file path; `show_stats_report_for_path()` returns
+    `STATS_NOT_A_FOLDER` (Restic answers `RESTIC_ERR_PATH_NOT_FOUND` for a file) and, **only if the
+    request was recorded by the hook** (`restic_f3_take_request`, valid 10 s, consumed once),
+    `FsExecuteFileW` posts `WM_USER + 51` with `cm_List` (903) to `MainWin`, which is exactly what `F3`
+    does natively (`restic_f3_request_native_view()`). A user's own Alt+Enter on a file therefore stays
+    a no-op instead of starting a download. Cost of this design: `F3` on a file first runs one cheap
+    `restic ls` to learn that it is a file (about 0.7 s on a local repository).
+  - **`WH_CBT` was abandoned.** The specification suggested cancelling the "No files selected!" dialog
+    in a `WH_CBT` hook; Total Commander's message box never raised `HCBT_CREATEWND` for it (the hook was
+    demonstrably alive: other windows did), so `F3` is always answered by the plugin instead.
+  - **Unloading.** `restic_f3_hook_shutdown()` (hook, helper window **and its class**, which would
+    otherwise keep a window procedure pointing into the unloaded DLL) runs from
+    `FsContentPluginUnloading` (Total Commander's UI thread, where the window can be destroyed) and from
+    `DllMain(DLL_PROCESS_DETACH)` only when the DLL is really unloaded (`lpvReserved == NULL`). After
+    `cm_UnloadPlugins` the next listing installs the hook again (verified live).
+  - Tests cover the pure parts (panel text parsing, the Path Guard scan including the stacked-panel and
+    prompt-authority cases, the request marker, the list-class predicate, the `cm_List` request received
+    by a stand-in window, hook lifecycle) and the negative wiring (Alt+Enter on a file posts nothing);
+    the Win32 plumbing (hook, injection) is verified live with the trace, because no unit test can
+    press a key in a real Total Commander.
 - **`FsExecuteFileW` (Alt+Enter, `quote stats`).** Per the SDK, `FS_EXEC_OK` also means "the command is not
   applicable and nothing more has to be done", `FS_EXEC_ERROR` means the execution failed. The verb
-  `"properties"` (Alt+Enter on a folder) and `"quote stats"` (the user typed `stats`; `RemoteName` is the
-  current directory; matching is case-insensitive, spacing is free, anything after `stats` is refused) call
-  the same `show_stats_report_for_path()`. Its outcome (`StatsOutcome`) is mapped as: `STATS_SHOWN` and
-  `STATS_NOT_APPLICABLE` -> `FS_EXEC_OK` (the plugin root - Total Commander sends `RemoteName="\"` +
-  `"properties"` for a right click on the root -, a file, a cancelled password dialog, `ESC`),
-  `STATS_FAILED` -> `FS_EXEC_ERROR` (unknown alias, missing `restic.exe`, wrong password, Restic failure; the
-  message was already shown by `handle_restic_failure()`). `"open"` (Enter on a file) returns
-  `FS_EXEC_YOURSELF`, so Total Commander downloads and opens the file as usual; every other verb returns
-  `FS_EXEC_ERROR`. The ANSI `FsExecuteFile` only forwards `"open"`, because an ANSI path cannot carry a
-  Unicode report destination. How Total Commander spells the `[..]` row for Alt+Enter is not documented and
-  is not handled specially; verify it live.
+  `"properties"` (Alt+Enter on a folder, and the request produced by `F3`) and `"quote stats"` (the user
+  typed `stats`; `RemoteName` is the current directory; matching is case-insensitive, spacing is free,
+  anything after `stats` is refused) call the same `show_stats_report_for_path()`. Its outcome
+  (`StatsOutcome`) is mapped as: `STATS_SHOWN`, `STATS_NOT_APPLICABLE` (the plugin root - Total Commander
+  sends `RemoteName="\"` + `"properties"` for a right click on the root -, a cancelled password dialog,
+  `ESC`) and `STATS_NOT_A_FOLDER` (a file; for an F3-originated request `cm_List` is posted first) ->
+  `FS_EXEC_OK`, `STATS_FAILED` ->
+  `FS_EXEC_ERROR` (unknown alias, missing `restic.exe`, wrong password, Restic failure; the message was
+  already shown by `handle_restic_failure()`). `"open"` (Enter on a file) returns `FS_EXEC_YOURSELF`, so
+  Total Commander downloads and opens the file as usual; every other verb returns `FS_EXEC_ERROR`. The
+  ANSI `FsExecuteFile` only forwards `"open"`, because an ANSI path cannot carry a Unicode report
+  destination. How Total Commander spells the `[..]` row for Alt+Enter is not documented and is not
+  handled specially: `F3` on `[..]` is swallowed and Total Commander does not call the plugin, so
+  nothing happens.
 - **`show_stats_report_for_path()` (`src/main.c`)** parses the path (`wfx_parse_path`), loads the
   configuration, finds the repository, builds the destination with `restic_report_build_temp_path()`, calls
   `restic_report_pick_destination()` (see below), `ProgressProcW(virtual_path, report_path, 0)`, runs the shared password/session loop (`session_get` /
@@ -239,7 +290,8 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
   `restic_report_generate()` and finally `restic_report_open_in_lister()`. Failures go through
   `handle_restic_failure()`; `ESC` stays silent. Only `WFX_PATH_REPO` and `WFX_PATH_SNAPSHOT_DIR` have a
   report (the plugin root lists aliases and has none). A path that Restic knows only as a **file** gives
-  `RESTIC_ERR_PATH_NOT_FOUND`, reported as `STATS_NOT_APPLICABLE` without a message.
+  `RESTIC_ERR_PATH_NOT_FOUND`, reported as `STATS_NOT_A_FOLDER` without a message, which makes
+  `FsExecuteFileW` hand the file back to Total Commander (`cm_List`).
 - **Destination (`restic_report_build_temp_path`).** `%TEMP%\restic_stats_<alias>.md`,
   `%TEMP%\restic_stats_<alias>_<short_id>.md`, `%TEMP%\restic_stats_<alias>_<short_id>_<leaf>.md`.
   Characters Windows rejects (`<>:"/\|?*` and control characters) become `_`, the alias is cut at 40
@@ -248,7 +300,9 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
   sharing: if an earlier Lister keeps it open without `FILE_SHARE_DELETE` (which would make the atomic
   `MoveFileExW` replacement fail) the name becomes `... (2).md` ... `(9).md`.
 - **Opening (`restic_report_open_in_lister`).** `%COMMANDER_EXE%` (fallback: `GetModuleFileNameW(NULL)`) plus
-  `"<exe>" /S=L "<file>"` through `CreateProcessW`; the process is not waited for. A test hook
+  `"<exe>" /S=L:T7 "<file>"` through `CreateProcessW`; the process is not waited for. `:T7` selects the
+  internal **UTF-8 text** mode, so a third-party Lister plugin registered for `.md` (for example a PDF
+  reader) cannot intercept the report. A test hook
   (`restic_report_set_lister_test_hook`) and the environment variable `RESTIC_WFX_NO_LISTER_GUI=1` replace
   the launch, so the automated tests never open a window.
 - **Generation (`src/restic_report.c`).** `restic_report_generate()` dispatches on the level; every phase goes
@@ -313,7 +367,7 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
   - Format: `logo\restic_wfx.ico` linked into `restic.wfx64` via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
   - Included frames inside `logo\restic_wfx.ico` (5 resolutions): **16×16, 24×24, 32×32, 48×48** (32-bit BGRA uncompressed BMP/DIB frames) plus **256×256** (32-bit RGBA PNG-compressed), built from `logo\logo_16x16.ico`, `logo\logo_24x24.ico`, `logo\logo_32x32.ico`, `logo\logo_48x48.ico`, and `logo\logo_256x256.png`.
 - **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
-- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.1.0` / `"1.3.1"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
+- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.2.0` / `"1.3.2"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
 
 ---
 
@@ -340,9 +394,9 @@ Restic_WFX_Plugin/
 │   ├── restic_cli.h            # Restic CLI child process & JSON/NDJSON parser interface
 │   ├── restic_stats.h          # ResticSnapshotInfo, snapshots --json parser, per-alias cache API
 │   ├── wfx_path.h              # Plugin-namespace path decomposition (WfxParsedPath)
-│   ├── wfx_status.h            # FsStatusInfo operation stack + report visibility filter
+│   ├── wfx_status.h            # F3 hook, Path Guard core, request marker, cm_List hand-back
 │   ├── restic_report.h         # Statistics report: data model, parsers, Markdown writers, Lister
-│   └── version.h               # Single source of truth for plugin version macros (1.3.1)
+│   └── version.h               # Single source of truth for plugin version macros (1.3.2)
 ├── src/
 │   ├── main.c                  # DllMain, WFX entry points, virtual path routing
 │   ├── config.c                # restic_plugin.ini resolution & parsing
@@ -350,7 +404,7 @@ Restic_WFX_Plugin/
 │   ├── restic_stats.c          # Snapshot statistics parser + per-alias LRU cache (SRWLOCK)
 │   ├── wfx_path.c              # Path decomposition shared by routing and content columns
 │   ├── fscontent.c             # FsContent* custom columns (field table, values, default view)
-│   ├── wfx_status.c            # FsStatusInfo(W) entry points, per-thread stack, F3-on-folder detection
+│   ├── wfx_status.c            # Thread-local WH_KEYBOARD hook, Path Guard, injected Alt+Enter
 │   ├── restic_report.c         # Statistics report: restic queries, NDJSON aggregation, Markdown
 │   ├── wfx_trace.c             # Diagnostic trace: session header, %TEMP% log, switch file, 400-line cap
 │   └── restic_wfx.rc           # Windows resource script (ICON #1 + VS_VERSION_INFO metadata)
@@ -358,7 +412,7 @@ Restic_WFX_Plugin/
     ├── test_config.c           # Configuration, PATH-lookup security, 300-repo scaling, root enumeration
     ├── test_restic_cli.c       # Parsers, quoting, process execution (cmd.exe stand-in) + live restic.exe tests
     ├── test_stats.c            # Path decomposition, statistics parser, cache, FsContent* columns
-    ├── test_report.c           # Statistics report: bars, parsers, F3 interception, Markdown writers, live run
+    ├── test_report.c           # Statistics report: bars, parsers, F3 Path Guard/decision, Markdown writers, live run
     └── test_plugin_dll.c       # Black-box smoke test: LoadLibrary(restic.wfx64) + exported WFX surface
 ```
 
@@ -461,14 +515,13 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 - **Export surface:** `cJSON` is compiled with `/DCJSON_HIDE_SYMBOLS`. Without it the library marks
   every API `__declspec(dllexport)` and the plugin would export ~90 `cJSON_*` functions next to the
   WFX entry points. `tests/test_plugin_dll.c` asserts the exact surface: the 15 read-only
-  `Fs*` functions (11 browsing/extraction + `FsStatusInfo`/`FsStatusInfoW` + `FsExecuteFile`/
-  `FsExecuteFileW`), the 10 content-column entry points and the `restic_test_force_f3` test hook are
-  exported; `FsPutFile/DeleteFile/MkDir/RemoveDir/RenMovFile/SetAttr/SetTime` (and any `cJSON_*`)
+  `Fs*` functions (11 browsing/extraction + `FsExecuteFile`/`FsExecuteFileW`) and the 10
+  content-column entry points are exported (23 in total); `FsPutFile/DeleteFile/MkDir/RemoveDir/RenMovFile/SetAttr/SetTime` (and any `cJSON_*`)
   must stay absent, because Total Commander enables an operation as soon as the symbol exists.
-- **Imports:** `KERNEL32.dll` (static CRT) plus `USER32.dll` - the latter only for
-  `GetAsyncKeyState(VK_F3)`, which tells `F3` on a folder from the space bar inside
-  `FS_STATUS_OP_CALCSIZE` (`SYSLIBS = User32.lib`; the tests also use `Shell32.lib` for
-  `CommandLineToArgvW`).
+- **Imports:** `KERNEL32.dll` (static CRT) plus `USER32.dll` - the latter for the thread-local
+  `WH_KEYBOARD` hook of §5.3, `SetWindowsHookExW`, the message-only helper window and `SendInput`
+  (the injected Alt+Enter) (`SYSLIBS = User32.lib`; the tests also use
+  `Shell32.lib` for `CommandLineToArgvW`).
 
 ### 8.6 Build & Test Commands (`build.sh` & `Makefile`)
 
@@ -495,8 +548,8 @@ If Total Commander still has `build/restic.wfx64` loaded, `build.sh` renames the
 | `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty), and verification that the staged `build\restic_plugin.ini` sample template is valid and has 0 active repositories, plus the **ANSI-unmappable `DefaultIniName`** cases (a `?` in the converted path or an empty name falls back to `%COMMANDER_INI_PATH%`, trailing separators are stripped, a usable name still wins, and no source leaves the fallback empty) (85 assertions). |
 | `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines, `\` and `/` inside a node name), snapshot-name strictness (`report_[deadbeef].txt` and `file[deadbeef]` are refused, the exact `YYYY-MM-DD_HH-MM-SS_[<hex>]` shape is accepted), truncation of a long non-ASCII Restic error message on a character boundary (no `U+FFFD`), **UNC share backups** (display name <-> real name mapping in `restic_normalize_filter_path`, a UNC volume at the root, `restic_add_unc_volumes` with duplicates/device paths/garbage, and a live backup taken through `\\localhost\C$\...` that is listed, navigated and dumped), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe` including `restic_dump_file` streaming extraction, mtime preservation, 0-byte and 100 KB files, overwrite protection, binary fidelity (`00/0A/0D/1A` bytes), existing target preserved on every failure or abort, no leftover `~rp*.tmp`, local-side failures, argument validation, plus `test_dump_with_fake_restic` (a fake `restic` batch file that deterministically covers exit codes 10/11/12/other, stderr classification, partial output then failure, empty stderr, environment injection and the inactivity timeout: a silent child is killed, a slow but steady one survives) plus **`restic_exec_lines`** (a 4000-line / >100 KB stream delivered line by line, CR LF terminators removed, empty lines and an unterminated last line, callback abort, exit-code mapping with earlier lines still delivered, timeout, cancellation, argument checks) (332 assertions). |
 | `test_stats.c` | Path decomposition (`wfx_parse_path`: root, alias, snapshot, deep path, malformed/non-hex/empty IDs), statistics parser (`ResticSnapshotInfo` from a fixture with/without `summary`, tags/paths joining and counts, derived duration, `short_id` fallback, skipped entries, `null`/empty/malformed payloads, NULL arguments), per-alias cache (store/lookup/invalidate/clear, case-insensitive alias, replaced entries, 12-alias eviction, empty record list), and the `FsContent*` surface (field enumeration and naming rules, unit strings, values per field with unit scaling, fields inherited by files inside a snapshot, empty alias/root/unknown paths, `ft_nosuchfield`/`ft_fileerror`/`ft_fieldempty` edge cases, buffer truncation, delayed flag, default view/headers/widths/options consistency, NULL buffers, truncated `maxlen`, sort order, no field flags, unloading clears the cache) and the **Code Review 4 hardening tests** (statistics parser vs. listing parser stay index-aligned on non-hex/empty/non-ASCII IDs and bad dates, counters saturate at 2^63-1 for `1e30`/`2^64-1`/negative/string values and never turn negative through `FsContentGetValue`, 200-tag lists are cut without a dangling separator and still counted, UTF-8 host/tag/path text is converted to the ANSI code page and cut on a character boundary, emoji aliases resolve through their ANSI spelling, ambiguous spellings are refused, a literal `?` alias never overwrites a Unicode alias, 4 reader threads + 1 writer thread hammering the cache for 16 000 lookups), plus the **path-spelling and diagnostic tests** (8 accepted spellings of the same snapshot folder - relative, plugin root prepended, bare name, deep file, trailing backslash - with the canonical form still refusing another alias; `snapshot_stats_lookup_any` unique/unknown/NULL/duplicate-alias/conflicting-ID cases and the `snapshot_stats_describe` format; the `RESTIC_WFX_TRACE` switch writing nothing when unset, a full call record when set and UTF-8 paths (accent + CJK) in the log; UTF-8 truncation of 600-byte tags and of the diagnostic summary lands on a character boundary and still counts every alias; the loose lookup prefers the alias segment when two repositories share a short ID; the trace UTF-8 converters truncate on a character / surrogate-pair boundary instead of failing) (450 assertions). |
-| `test_report.c` | Statistics report: ASCII bar formatting (0 %, tiny ratio, 100 %, out-of-range ratios, degenerate widths/buffers), byte/count/timestamp formatting, Markdown cell text (`|` becomes `/`, control characters become spaces, markup kept verbatim), the `FsStatusInfo`/`FsStatusInfoW` F3 detection (space bar vs. F3, one report per CALCSIZE scope, the aborted flag, the force helper, nested/unbalanced operations, ANSI entry point), `restic stats` JSON parsing (restore-size, raw-data, format-v1 fallback, garbage), `restic diff` NDJSON parsing (change list capped at 100 while every event is counted), `restic ls --recursive` aggregation (self node ignored, a file named by the filter is not a folder, sibling with a shared prefix ignored, direct vs. nested counts, histogram buckets summing to the totals, sorted subfolder/extension buckets, top-15 ranking with Windows separators, timestamps converted to UTC), the three Markdown writers with hostile file names (`<script>`, quotes, `&`) and the absence of HTML, report paths in `%TEMP%` (repository/snapshot/folder names, forbidden characters, length bounds, small buffer), the Lister opening (test hook, failing hook, `RESTIC_WFX_NO_LISTER_GUI`), and a live end-to-end generation for all three levels with the real `tmp\restic.exe` (progress callbacks, the RAM cache answering a repeated request with a single progress step, `restic_report_clear_cache`, `ESC` cancellation that leaves an existing file untouched, unknown snapshot/folder refused, argument validation), plus the review hardening tests (hidden-file and trailing-dot extensions, long paths cut on a UTF-8 boundary, the `(other ...)` remainder rows, credential masking in every writer, a history table with sizes, a live second backup whose report carries the diff, a read-only earlier copy replaced, `ESC` inside a secondary `restic stats`), the in-use report probe (`restic_report_pick_destination`: suffix numbering, read-only and missing files) and the real Lister launch through a stand-in executable (`/S=L`, quoting of a path with spaces and brackets, missing host) (280 assertions). |
-| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 26-function export surface (`FsGetFile`/`FsGetFileW` and the 10 `FsContent*` entry points included; write/delete/move functions forbidden), custom-column surface through `GetProcAddress` (field enumeration terminates, names unique, default view references `[=<fs>.` with one header per column, empty values for unknown paths, sort order, unloading), embedded `RT_GROUP_ICON` #1 + 5 `RT_ICON` frames (`16x16`..`256x256`), embedded `RT_VERSION` (`VS_VERSION_INFO` / `VS_FIXEDFILEINFO` matching `include/version.h`), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads, plus the statistics columns end to end on the live fixture (host name, `FILETIME`, short ID, file count vs. `has_summary`, inheritance for files inside a snapshot, empty columns for a repository that was never listed, independent entry per alias, cold start filled by one extra `restic snapshots` run when a snapshot folder is entered directly, one `MSGTYPE_TRANSFERCOMPLETE` with the documented `Download complete: <src> -> <dst>` text after a successful extraction, a snapshot of a UNC share navigated and extracted through the entry points, and the **statistics report** end to end: no artificial entry in any listing, F3 on a repository, a snapshot and a subfolder (the real `FsStatusInfoW` + `FsFindFirstW` sequence, with the CALCSIZE scope answering "no files" so the tree is never walked), the space bar still calculating the folder size, `FsExecuteFileW` with `properties`/`quote stats` producing the same Markdown (case/spacing tolerated, `quote statsx`/`quote ls` refused), `open` forwarded to Total Commander, a file or the plugin root answered `FS_EXEC_OK` without a message, an unknown repository `FS_EXEC_ERROR`, NULL arguments refused, all without a new password prompt and with the Lister suppressed by `RESTIC_WFX_NO_LISTER_GUI` (265 assertions in Debug/Release; skipped in ASan runs). |
+| `test_report.c` | Statistics report: ASCII bar formatting (0 %, tiny ratio, 100 %, out-of-range ratios, degenerate widths/buffers), byte/count/timestamp formatting, Markdown cell text (`|` becomes `/`, control characters become spaces, markup kept verbatim), the `F3` Path Guard (panel text parsing at every level, both path bar and command line prompt spellings, plugin vs. local/UNC/other-plugin paths, a root name that only starts with the same characters, trailing separators, case and leading spaces, the file-list class predicate), the Path Guard scan (prompt authoritative in both directions, panels side by side and above each other, command line hidden, ambiguous layout refused, status bars ignored, deepest plugin bar wins), the request marker (window, single use, clock going backwards, zero tick), the `cm_List` request received by a stand-in window and the hook lifecycle (never installed from a thread without focus, idempotent shutdown), `restic stats` JSON parsing (restore-size, raw-data, format-v1 fallback, garbage), `restic diff` NDJSON parsing (change list capped at 100 while every event is counted), `restic ls --recursive` aggregation (self node ignored, a file named by the filter is not a folder, sibling with a shared prefix ignored, direct vs. nested counts, histogram buckets summing to the totals, sorted subfolder/extension buckets, top-15 ranking with Windows separators, timestamps converted to UTC), the three Markdown writers with hostile file names (`<script>`, quotes, `&`) and the absence of HTML, report paths in `%TEMP%` (repository/snapshot/folder names, forbidden characters, length bounds, small buffer), the Lister opening (test hook, failing hook, `RESTIC_WFX_NO_LISTER_GUI`), and a live end-to-end generation for all three levels with the real `tmp\restic.exe` (progress callbacks, the RAM cache answering a repeated request with a single progress step, `restic_report_clear_cache`, `ESC` cancellation that leaves an existing file untouched, unknown snapshot/folder refused, argument validation), plus the review hardening tests (hidden-file and trailing-dot extensions, long paths cut on a UTF-8 boundary, the `(other ...)` remainder rows, credential masking in every writer, a history table with sizes, a live second backup whose report carries the diff, a read-only earlier copy replaced, `ESC` inside a secondary `restic stats`), the in-use report probe (`restic_report_pick_destination`: suffix numbering, read-only and missing files) and the real Lister launch through a stand-in executable (`/S=L`, quoting of a path with spaces and brackets, missing host) (324 assertions). |
+| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 23-function export surface (`FsGetFile`/`FsGetFileW` and the 10 `FsContent*` entry points included; write/delete/move functions forbidden), custom-column surface through `GetProcAddress` (field enumeration terminates, names unique, default view references `[=<fs>.` with one header per column, empty values for unknown paths, sort order, unloading), embedded `RT_GROUP_ICON` #1 + 5 `RT_ICON` frames (`16x16`..`256x256`), embedded `RT_VERSION` (`VS_VERSION_INFO` / `VS_FIXEDFILEINFO` matching `include/version.h`), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads, plus the statistics columns end to end on the live fixture (host name, `FILETIME`, short ID, file count vs. `has_summary`, inheritance for files inside a snapshot, empty columns for a repository that was never listed, independent entry per alias, cold start filled by one extra `restic snapshots` run when a snapshot folder is entered directly, one `MSGTYPE_TRANSFERCOMPLETE` with the documented `Download complete: <src> -> <dst>` text after a successful extraction, a snapshot of a UNC share navigated and extracted through the entry points, and the **statistics report** end to end: no artificial entry in any listing, `FsExecuteFileW` with `properties` (what `F3` and Alt+Enter end in) on a repository, a snapshot and a subfolder and with `quote stats` producing the Markdown, an Alt+Enter on a file or a folder posting no `cm_List` request to a stand-in main window, the command line verb tolerating case and spacing but refusing `quote statsx`/`quote ls`, `open` forwarded to Total Commander, a file or the plugin root answered `FS_EXEC_OK` without a message, an unknown repository `FS_EXEC_ERROR`, NULL arguments refused, all without a new password prompt and with the Lister suppressed by `RESTIC_WFX_NO_LISTER_GUI` (260 assertions in Debug/Release; skipped in ASan runs). |
 
 The live test needs only `tmp\restic.exe` (git-ignored; reported as `[SKIP]` when absent). On every run it rebuilds `tmp\test_fixture\{data,repo}` from scratch (300-file directory, Unicode and shell-metacharacter names, empty directory, 100 KB file, fixed mtime), initializes a repository whose password contains quotes, `%PATH%` and CJK text, takes two snapshots and verifies per-snapshot listings, timestamps and the error mapping (wrong password, missing repository, unknown snapshot, missing path, file used as directory, quote-injection attempt). The fixture stays on disk for inspection.
 

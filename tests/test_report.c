@@ -1,10 +1,10 @@
 /*
  * Unit and integration tests for the Markdown statistics report:
  *  - restic_report_format_*       (bars, byte/count/timestamp formatting, table text)
- *  - wfx_status_* / FsStatusInfo* (operation filter that hides the virtual file)
+ *  - restic_f3_*                  (F3 on plugin folders: Path Guard, request marker, hand-back)
  *  - restic_report_parse_*        (`restic stats` JSON, `restic diff` NDJSON)
  *  - restic_report_aggregate_ls_line / finalize (`restic ls --recursive` aggregation)
- *  - the three Markdown writers and the virtual directory entry
+ *  - the three Markdown writers
  *  - end-to-end generation with the real restic.exe (skipped when tmp\restic.exe is missing)
  */
 #ifndef UNICODE
@@ -246,101 +246,251 @@ static void test_markdown_text_escaping(void) {
 }
 
 /* ------------------------------------------------------------------------------------------ */
-/* Operation filter (FsStatusInfo)                                                             */
+/* F3 hook: Path Guard, request marker, hand-back to the viewer                                */
 /* ------------------------------------------------------------------------------------------ */
 
-static void test_status_info_f3_detection(void) {
-    wfx_status_reset();
-    EXPECT_U64_EQ(wfx_status_current_operation(), 0, "No operation on the stack");
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE,
-                "A report is never requested without a CALCSIZE operation");
-    EXPECT_TRUE(wfx_status_is_f3_calcsize_aborted() == FALSE, "Nothing was aborted");
+static void expect_panel_path(const WCHAR* text, BOOL in_plugin, int expected_depth) {
+    int depth = -1;
+    const BOOL parsed = restic_f3_parse_panel_text(text, &depth);
+    EXPECT_TRUE(parsed == in_plugin, "Panel text classification");
+    EXPECT_U64_EQ((unsigned long long)depth, (unsigned long long)(in_plugin ? expected_depth : -1),
+                  "Panel depth");
+}
 
-    /* A listing or a copy never triggers the report */
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_LIST);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE, "A panel listing is not F3");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_LIST);
-    EXPECT_TRUE(wfx_status_current_operation() == 0, "The operation stack is emptied");
+static void test_f3_panel_path_parsing(void) {
+    /* The path bar above a panel and the command line prompt both describe the active panel */
+    expect_panel_path(L"\\\\\\Restic Backups\\>", TRUE, 0);
+    expect_panel_path(L"\\\\\\Restic Backups\\*.*", TRUE, 0);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale>", TRUE, 1);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\*.*", TRUE, 1);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\2026-03-31 19-40-52 [a1b2c3d4]>", TRUE, 2);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\2026-03-31 19-40-52 [a1b2c3d4]\\Users\\*.*", TRUE,
+                      3);
+    /* Trailing separator, leading spaces and case are tolerated */
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\", TRUE, 1);
+    expect_panel_path(L"   \\\\\\restic backups\\Locale>", TRUE, 1);
+    /* Everything else is somebody else's panel: F3 must keep its native behaviour */
+    expect_panel_path(L"c:\\AMD>", FALSE, -1);
+    expect_panel_path(L"C:\\Windows\\System32\\*.*", FALSE, -1);
+    expect_panel_path(L"\\\\server\\share\\folder>", FALSE, -1);
+    expect_panel_path(L"\\\\\\OtherPlugin\\folder>", FALSE, -1);
+    /* A root name that merely starts with the same characters is not the plugin */
+    expect_panel_path(L"\\\\\\Restic BackupsXYZ\\>", FALSE, -1);
+    expect_panel_path(L"", FALSE, -1);
+    expect_panel_path(NULL, FALSE, -1);
+    /* No depth pointer: still a valid path */
+    EXPECT_TRUE(restic_f3_parse_panel_text(L"\\\\\\Restic Backups\\*.*", NULL) != FALSE,
+                "The depth is optional");
+}
 
-    /* Space bar: a CALCSIZE without F3 must keep calculating the folder size */
-    wfx_status_force_f3_next_calcsize(FALSE);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE, "Space bar is not intercepted");
-    EXPECT_TRUE(wfx_status_is_f3_calcsize_aborted() == FALSE, "The folder size may be calculated");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
+/* Feeds a scripted window tree to the Path Guard core and returns the depth it decides on */
+typedef struct {
+    const WCHAR* text;
+    BOOL on_focus_side;
+} ScanEntry;
 
-    /* F3: the report is requested exactly once per CALCSIZE scope */
-    wfx_status_force_f3_next_calcsize(TRUE);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_is_f3_calcsize_aborted() == FALSE, "Not aborted before the first query");
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() != FALSE, "F3 is detected on the first query");
-    EXPECT_TRUE(wfx_status_is_f3_calcsize_aborted() != FALSE,
-                "The rest of the CALCSIZE scope answers \"no files\"");
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE, "Only one report per F3");
-    EXPECT_TRUE(wfx_status_is_f3_calcsize_aborted() != FALSE, "Still aborted for the whole scope");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_is_f3_calcsize_aborted() == FALSE,
-                "FS_STATUS_END forgets the request");
-
-    /* The force flag applies to the next CALCSIZE only */
-    wfx_status_force_f3_next_calcsize(TRUE);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE, "The force flag is consumed once");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-
-    /* Nested operations keep their own CALCSIZE state */
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_LIST);
-    wfx_status_force_f3_next_calcsize(TRUE);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() != FALSE, "Nested F3 request");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE, "Ending the inner scope clears it");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_LIST);
-    EXPECT_U64_EQ(wfx_status_current_operation(), 0, "Nested stack unwinds");
-
-    /* The ANSI entry point shares the same per-thread state */
-    wfx_status_force_f3_next_calcsize(TRUE);
-    FsStatusInfo((char*)"\\Repo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() != FALSE, "The ANSI entry point detects F3 too");
-    FsStatusInfo((char*)"\\Repo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-
-    /* Unbalanced starts must not overflow the stack, unbalanced ends must not underflow it */
-    for (int i = 0; i < 32; ++i) {
-        FsStatusInfoW(NULL, FS_STATUS_START, FS_STATUS_OP_LIST);
+static int scan_depth(const ScanEntry* entries, size_t count) {
+    ResticF3Scan scan;
+    restic_f3_scan_init(&scan);
+    for (size_t i = 0; i < count; ++i) {
+        restic_f3_scan_add(&scan, entries[i].text, entries[i].on_focus_side);
     }
-    EXPECT_U64_EQ(wfx_status_current_operation(), FS_STATUS_OP_LIST, "A saturated stack still answers");
-    for (int i = 0; i < 64; ++i) {
-        FsStatusInfoW(NULL, FS_STATUS_END, FS_STATUS_OP_LIST);
-    }
-    EXPECT_U64_EQ(wfx_status_current_operation(), 0, "Extra ends are ignored");
+    return restic_f3_scan_result(&scan);
+}
 
-    /* A START that does not fit the stack is dropped as a whole and must not arm F3 */
-    wfx_status_reset();
-    for (int i = 0; i < WFX_STATUS_STACK_MAX; ++i) {
-        FsStatusInfoW(NULL, FS_STATUS_START, FS_STATUS_OP_LIST);
-    }
-    wfx_status_force_f3_next_calcsize(TRUE);
-    FsStatusInfoW(NULL, FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE &&
-                    wfx_status_current_operation() == FS_STATUS_OP_LIST,
-                "A dropped CALCSIZE start never requests a report");
+static void test_f3_path_guard_scan(void) {
+    /* Nothing seen: the plugin never acts */
+    EXPECT_U64_EQ((unsigned long long)scan_depth(NULL, 0), (unsigned long long)-1, "Empty window tree");
 
-    /* ...and it must not leave a request behind for a later space bar on the same thread (the test
-       helper is cleared by hand: the dropped notification never reached it) */
-    wfx_status_force_f3_next_calcsize(FALSE);
-    for (int i = 0; i < WFX_STATUS_STACK_MAX; ++i) {
-        FsStatusInfoW(NULL, FS_STATUS_END, FS_STATUS_OP_LIST);
-    }
-    FsStatusInfoW(NULL, FS_STATUS_START, FS_STATUS_OP_CALCSIZE); /* Space bar: no F3 held */
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE,
-                "A request dropped with a full stack does not surface in a later CALCSIZE");
-    FsStatusInfoW(NULL, FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
+    /* Side by side: plugin on the left (active), local on the right */
+    const ScanEntry plugin_active[] = {
+        {L"vertical.bar", FALSE},
+        {L"\\\\\\Restic Backups\\Probe>", TRUE}, /* the command line prompt describes the active panel */
+        {L"0 k / 0 k in 0 / 0 file(s)", TRUE},
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"c:\\*.*", FALSE},
+        {L"[_none_]  ", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(plugin_active, _countof(plugin_active)), 1,
+                  "The prompt and the bar of the focused side agree on the plugin");
 
-    wfx_status_force_f3_next_calcsize(TRUE);
-    wfx_status_reset();
-    EXPECT_TRUE(wfx_status_consume_f3_calcsize() == FALSE, "The helper drops the pending request");
+    /* Same screen, local panel active: the prompt shows the local folder and decides alone */
+    const ScanEntry local_active[] = {
+        {L"c:\\>", FALSE},
+        {L"\\\\\\Restic Backups\\Probe\\*.*", FALSE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(local_active, _countof(local_active)), (unsigned long long)-1,
+                  "A local active panel is never the plugin");
+
+    /* Panels above each other: both bars share the whole width, so the geometry says nothing; the
+       prompt of the local active panel must still win over the plugin bar on the "focus side" */
+    const ScanEntry stacked_local_active[] = {
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"c:\\*.*", TRUE},
+        {L"c:\\>", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(stacked_local_active, _countof(stacked_local_active)),
+                  (unsigned long long)-1, "Stacked panels: the prompt of the local panel decides");
+
+    /* The prompt is authoritative both ways, whatever the bars of the focused side say */
+    const ScanEntry prompt_local_bar_plugin[] = {
+        {L"c:\\>", FALSE},
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(prompt_local_bar_plugin, _countof(prompt_local_bar_plugin)),
+                  (unsigned long long)-1, "A local prompt beats a plugin bar on the focus side");
+    const ScanEntry prompt_plugin_bar_local[] = {
+        {L"\\\\\\Restic Backups\\Probe>", FALSE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(prompt_plugin_bar_local, _countof(prompt_plugin_bar_local)), 1,
+                  "A plugin prompt beats a local bar on the focus side");
+
+    /* The prompt may come before or after the bars in the enumeration order */
+    const ScanEntry prompt_last[] = {
+        {L"\\\\\\Restic Backups\\Probe\\snap\\*.*", TRUE},
+        {L"\\\\\\Restic Backups\\Probe\\snap>", FALSE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(prompt_last, _countof(prompt_last)), 2,
+                  "The prompt decides wherever it is enumerated, even outside the focus extent");
+
+    /* Command line hidden: only the bars are left */
+    const ScanEntry no_prompt_plugin[] = {
+        {L"\\\\\\Restic Backups\\*.*", TRUE},
+        {L"c:\\*.*", FALSE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_plugin, _countof(no_prompt_plugin)), 0,
+                  "Without a prompt the plugin bar of the focused side is used");
+    const ScanEntry no_prompt_local[] = {
+        {L"\\\\\\Restic Backups\\*.*", FALSE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_local, _countof(no_prompt_local)),
+                  (unsigned long long)-1, "Without a prompt a local bar on the focused side wins");
+    const ScanEntry no_prompt_ambiguous[] = {
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_ambiguous, _countof(no_prompt_ambiguous)),
+                  (unsigned long long)-1, "Without a prompt an ambiguous layout is refused");
+    const ScanEntry no_prompt_unc[] = {
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"\\\\server\\share\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_unc, _countof(no_prompt_unc)),
+                  (unsigned long long)-1, "A network path in the same extent is refused too");
+
+    /* Texts that are not paths never decide anything */
+    const ScanEntry noise[] = {
+        {L"0 k / 0 k in 0 / 0 file(s), 0 / 1 dir(s)", TRUE},
+        {L"[sys_disk]  170.539.260 k of 233.400.316 k free", TRUE},
+        {L"default.bar", TRUE},
+        {L"", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(noise, _countof(noise)), (unsigned long long)-1,
+                  "Status bars and labels are ignored");
+    ResticF3Scan scan;
+    restic_f3_scan_init(&scan);
+    restic_f3_scan_add(&scan, NULL, TRUE);
+    restic_f3_scan_add(NULL, L"x", TRUE);
+    EXPECT_U64_EQ((unsigned long long)restic_f3_scan_result(&scan), (unsigned long long)-1,
+                  "NULL arguments are tolerated");
+
+    /* The deepest plugin bar wins when several describe the plugin (command line hidden) */
+    const ScanEntry deepest[] = {
+        {L"\\\\\\Restic Backups\\*.*", TRUE},
+        {L"\\\\\\Restic Backups\\Probe\\snap\\data\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(deepest, _countof(deepest)), 3,
+                  "Several plugin bars: the deepest one");
+}
+
+static void test_f3_request_marker(void) {
+    (void)restic_f3_take_request(1);
+    EXPECT_TRUE(restic_f3_take_request(100) == FALSE, "Nothing recorded, nothing taken");
+
+    restic_f3_note_request(1000);
+    EXPECT_TRUE(restic_f3_take_request(1000 + RESTIC_F3_REQUEST_WINDOW_MS) != FALSE,
+                "A request is taken inside the window");
+    EXPECT_TRUE(restic_f3_take_request(1000) == FALSE, "...and only once");
+
+    restic_f3_note_request(1000);
+    EXPECT_TRUE(restic_f3_take_request(1001 + RESTIC_F3_REQUEST_WINDOW_MS) == FALSE,
+                "An old request does not make a later Alt+Enter look like an F3");
+    EXPECT_TRUE(restic_f3_take_request(1002 + RESTIC_F3_REQUEST_WINDOW_MS) == FALSE,
+                "...and an expired request is discarded");
+
+    restic_f3_note_request(5000);
+    EXPECT_TRUE(restic_f3_take_request(4000) == FALSE, "A clock that went backwards is not an F3");
+
+    restic_f3_note_request(0);
+    EXPECT_TRUE(restic_f3_take_request(10) != FALSE, "A zero tick is stored as a valid mark");
+}
+
+/* A message-only window that counts the internal commands Total Commander would receive */
+static int g_native_view_count;
+static WPARAM g_native_view_command;
+
+static LRESULT CALLBACK native_view_sink_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == RESTIC_TC_WM_USER_CMD) {
+        ++g_native_view_count;
+        g_native_view_command = wparam;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static void test_f3_native_view_request(void) {
+    static const WCHAR class_name[] = L"ResticTestNativeViewSink";
+    HINSTANCE instance              = GetModuleHandleW(NULL);
+    WNDCLASSEXW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = native_view_sink_proc;
+    wc.hInstance     = instance;
+    wc.lpszClassName = class_name;
+    RegisterClassExW(&wc);
+    HWND sink = CreateWindowExW(0, class_name, L"sink", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, instance, NULL);
+    EXPECT_TRUE(sink != NULL, "A stand-in for the Total Commander main window");
+
+    g_native_view_count   = 0;
+    g_native_view_command = 0;
+    restic_f3_request_native_view(sink);
+    MSG msg;
+    while (PeekMessageW(&msg, sink, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    EXPECT_TRUE(g_native_view_count == 1 && g_native_view_command == RESTIC_TC_CMD_LIST,
+                "F3 on a file asks Total Commander for cm_List (WM_USER + 51, 903)");
+    EXPECT_U64_EQ(RESTIC_TC_CMD_LIST, 903, "cm_List is command 903 of TOTALCMD.INC");
+    EXPECT_U64_EQ(RESTIC_TC_WM_USER_CMD, WM_USER + 51, "The command channel is WM_USER + 51");
+
+    /* Invalid windows are ignored */
+    restic_f3_request_native_view(NULL);
+    DestroyWindow(sink);
+    restic_f3_request_native_view(sink);
+    EXPECT_TRUE(g_native_view_count == 1, "NULL and destroyed windows receive nothing");
+    UnregisterClassW(class_name, instance);
+}
+
+static void test_f3_panel_list_class(void) {
+    /* Only the file list of a panel may own the focus when F3 is answered by the plugin */
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"LCLListBox") != FALSE, "The file list of a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"lcllistbox") != FALSE, "Case does not matter");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"TMyListBox") != FALSE, "The alternative list class");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"Edit") == FALSE, "The command line is not a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"TTOTAL_CMD") == FALSE, "The main window is not a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"SysTreeView32") == FALSE, "The tree is not a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"") == FALSE, "An empty class name is refused");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(NULL) == FALSE, "A NULL class name is refused");
+}
+
+static void test_f3_hook_lifecycle(void) {
+    /* A thread without keyboard focus (this test) never installs the hook */
+    restic_f3_hook_ensure_installed();
+    restic_f3_hook_shutdown();
+    EXPECT_TRUE(restic_f3_hook_is_installed() == FALSE, "Shutdown removes the hook");
+    restic_f3_hook_shutdown();
+    EXPECT_TRUE(restic_f3_hook_is_installed() == FALSE, "Shutdown is idempotent");
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -1416,7 +1566,12 @@ int main(void) {
     test_ascii_bar_formatting();
     test_number_and_time_formatting();
     test_markdown_text_escaping();
-    test_status_info_f3_detection();
+    test_f3_panel_path_parsing();
+    test_f3_path_guard_scan();
+    test_f3_request_marker();
+    test_f3_native_view_request();
+    test_f3_panel_list_class();
+    test_f3_hook_lifecycle();
     test_storage_json_parsing();
     test_diff_parsing();
     test_folder_aggregation();

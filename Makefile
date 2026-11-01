@@ -158,7 +158,7 @@ $(BUILD_DIR)\test_plugin_dll.obj: $(BUILD_DIR) tests\test_plugin_dll.c include\v
 
 # Black-box smoke test: loads build\restic.wfx64 like Total Commander does (links no plugin code)
 $(TEST_DLL_OUT): $(BUILD_DIR)\test_plugin_dll.obj
-	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(BUILD_DIR)\test_plugin_dll.obj /link $(LFLAGS_CFG) /OUT:$(TEST_DLL_OUT)
+	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(BUILD_DIR)\test_plugin_dll.obj /link $(LFLAGS_CFG) $(SYSLIBS) /OUT:$(TEST_DLL_OUT)
 
 # The DLL smoke test needs the plugin binary; AddressSanitizer runs only exercise the unit tests
 TEST_DEPS = $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_REPORT_OUT) $(TEST_DLL_OUT)

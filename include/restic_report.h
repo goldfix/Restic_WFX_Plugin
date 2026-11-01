@@ -9,8 +9,8 @@
  * Statistics report.
  *
  * The report is not a file of the listings any more: the user puts the cursor on a repository,
- * a snapshot or a snapshot subfolder and presses F3 (intercepted through FS_STATUS_OP_CALCSIZE)
- * or Alt+Enter (FsExecuteFileW). The plugin runs the required restic.exe queries, writes a
+ * a snapshot or a snapshot subfolder and presses F3 (turned into Alt+Enter by the keyboard hook of
+ * wfx_status) or Alt+Enter (FsExecuteFileW). The plugin runs the required restic.exe queries, writes a
  * self-contained Markdown document to %TEMP% and opens the Total Commander Lister on it.
  *
  * Markdown was chosen over HTML because the native Lister shows it as perfectly aligned plain

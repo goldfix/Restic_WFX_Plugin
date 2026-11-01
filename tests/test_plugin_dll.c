@@ -53,11 +53,9 @@ static int g_tests_failed = 0;
 #define FS_FILE_USERABORT      5
 #define FS_FILE_NOTSUPPORTED   6
 
-#define FS_STATUS_START        0
-#define FS_STATUS_END          1
-#define FS_STATUS_OP_LIST      1
-#define FS_STATUS_OP_GET_MULTI 3
-#define FS_STATUS_OP_CALCSIZE  12
+/* Total Commander internal command channel used by the plugin to hand a file back to the Lister */
+#define TC_WM_USER_CMD        1075 /* WM_USER + 51 */
+#define TC_CM_LIST            903
 
 /* Return codes of FsExecuteFile */
 #define FS_EXEC_OK             0
@@ -112,7 +110,6 @@ typedef int    (__stdcall *PFN_GetFile)(char*, char*, int, RemoteInfo*);
 typedef int    (__stdcall *PFN_GetFileW)(WCHAR*, WCHAR*, int, RemoteInfo*);
 typedef int    (__stdcall *PFN_ExecuteFile)(HWND, char*, char*);
 typedef int    (__stdcall *PFN_ExecuteFileW)(HWND, WCHAR*, WCHAR*);
-typedef void   (__stdcall *PFN_ForceF3)(BOOL);
 typedef int    (__stdcall *PFN_ContentGetSupportedField)(int, char*, char*, int);
 typedef int    (__stdcall *PFN_ContentGetValue)(char*, int, int, void*, int, int);
 typedef int    (__stdcall *PFN_ContentGetSupportedFieldFlags)(int);
@@ -123,8 +120,6 @@ typedef BOOL   (__stdcall *PFN_ContentGetDefaultViewW)(WCHAR*, WCHAR*, WCHAR*, W
 typedef void   (__stdcall *PFN_ContentStopGetValueW)(WCHAR*);
 typedef void   (__stdcall *PFN_ContentStopGetValue)(char*);
 typedef void   (__stdcall *PFN_ContentPluginUnloading)(void);
-typedef void   (__stdcall *PFN_StatusInfoW)(WCHAR*, int, int);
-typedef void   (__stdcall *PFN_StatusInfo)(char*, int, int);
 
 typedef struct {
     HMODULE module;
@@ -139,9 +134,6 @@ typedef struct {
     PFN_GetFileW get_file_w;
     PFN_ExecuteFile execute_file;
     PFN_ExecuteFileW execute_file_w;
-    PFN_ForceF3 force_f3;
-    PFN_StatusInfoW status_info_w;
-    PFN_StatusInfo status_info;
 } Plugin;
 
 static BOOL make_unique_dir(const WCHAR* tag, WCHAR* out, size_t cap) {
@@ -178,9 +170,6 @@ static BOOL load_plugin_copy(const WCHAR* dir, Plugin* p) {
     p->get_file_w        = (PFN_GetFileW)(void*)GetProcAddress(p->module, "FsGetFileW");
     p->execute_file      = (PFN_ExecuteFile)(void*)GetProcAddress(p->module, "FsExecuteFile");
     p->execute_file_w    = (PFN_ExecuteFileW)(void*)GetProcAddress(p->module, "FsExecuteFileW");
-    p->force_f3          = (PFN_ForceF3)(void*)GetProcAddress(p->module, "restic_test_force_f3");
-    p->status_info_w     = (PFN_StatusInfoW)(void*)GetProcAddress(p->module, "FsStatusInfoW");
-    p->status_info       = (PFN_StatusInfo)(void*)GetProcAddress(p->module, "FsStatusInfo");
     return TRUE;
 }
 
@@ -200,12 +189,12 @@ static void test_export_surface(void) {
     const char* required[] = {"FsInit", "FsInitW", "FsFindFirst", "FsFindFirstW", "FsFindNext",
                               "FsFindNextW", "FsFindClose", "FsGetDefRootName", "FsSetDefaultParams",
                               "FsGetFile", "FsGetFileW", "FsExecuteFile", "FsExecuteFileW",
-                              "restic_test_force_f3", "FsContentGetSupportedField",
+                              "FsContentGetSupportedField",
                               "FsContentGetValue", "FsContentGetSupportedFieldFlags",
                               "FsContentGetDefaultSortOrder", "FsContentGetDefaultView",
                               "FsContentStopGetValue", "FsContentPluginUnloading",
                               "FsContentGetValueW", "FsContentGetDefaultViewW",
-                              "FsContentStopGetValueW", "FsStatusInfo", "FsStatusInfoW"};
+                              "FsContentStopGetValueW"};
     for (size_t i = 0; i < _countof(required); ++i) {
         FARPROC fn = GetProcAddress(m, required[i]);
         g_tests_run++;
@@ -498,13 +487,8 @@ static BOOL tc_copy_folder_recursive(
     (*out_dirs)++;
 
     WIN32_FIND_DATAW fd;
-    /* Total Commander reports FS_STATUS_OP_GET_MULTI around a recursive copy */
-    if (p->status_info_w) {
-        p->status_info_w((WCHAR*)remote_dir, FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
-    }
     HANDLE h = p->find_first_w((WCHAR*)remote_dir, &fd);
     if (h == INVALID_HANDLE_VALUE) {
-        if (p->status_info_w) p->status_info_w((WCHAR*)remote_dir, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
         return GetLastError() == ERROR_NO_MORE_FILES; /* Empty directory is valid */
     }
 
@@ -534,7 +518,6 @@ static BOOL tc_copy_folder_recursive(
     } while (p->find_next_w(h, &fd));
 
     p->find_close(h);
-    if (p->status_info_w) p->status_info_w((WCHAR*)remote_dir, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
     return ok;
 }
 
@@ -598,11 +581,53 @@ static BOOL snapshot_short_id_of(const WCHAR* snapshot_path, WCHAR* out, size_t 
     return TRUE;
 }
 
+/* Receives the cm_List request the plugin posts when F3 lands on a file */
+typedef struct {
+    int count;
+    WPARAM last_command;
+} ListRequestSink;
+
+static ListRequestSink g_list_requests;
+
+static LRESULT CALLBACK list_request_sink_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == TC_WM_USER_CMD) {
+        ++g_list_requests.count;
+        g_list_requests.last_command = wparam;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static HWND create_list_request_sink(void) {
+    static const WCHAR class_name[] = L"ResticTestListRequestSink";
+    HINSTANCE instance = GetModuleHandleW(NULL);
+    WNDCLASSEXW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = list_request_sink_proc;
+    wc.hInstance     = instance;
+    wc.lpszClassName = class_name;
+    if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return NULL;
+    return CreateWindowExW(0, class_name, L"list request sink", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
+                           instance, NULL);
+}
+
+/* Dispatches everything the sink received and returns how many commands were counted */
+static int drain_list_requests(HWND sink) {
+    MSG msg;
+    while (PeekMessageW(&msg, sink, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return g_list_requests.count;
+}
+
 /*
  * Statistics report: the listings are pure (no artificial file) and the report of a repository, a
- * snapshot or a subfolder is produced by F3 (intercepted inside the folder-size calculation) and by
- * Alt+Enter / "quote stats" (FsExecuteFileW). RESTIC_WFX_NO_LISTER_GUI keeps the Lister windows
- * away, so the assertions check the generated Markdown files.
+ * snapshot or a subfolder is produced through FsExecuteFileW, which is what F3 (the injected
+ * "properties" request of the wfx_status hooks), Alt+Enter and the typed "stats" command all end in.
+ * RESTIC_WFX_NO_LISTER_GUI keeps the Lister windows away, so the assertions check the generated
+ * Markdown files.
  */
 static void test_e2e_stats_report(const Plugin* p, const WCHAR* dir, const WCHAR* snapshot_root,
                                   const WCHAR* data_path) {
@@ -638,52 +663,15 @@ static void test_e2e_stats_report(const Plugin* p, const WCHAR* dir, const WCHAR
     const int prompts_before = g_e2e_pwd_prompts;
     g_e2e_msg_dialogs        = 0;
 
-    /* F3 on a repository: Total Commander starts a folder-size calculation for it */
-    WIN32_FIND_DATAW fd;
-    if (p->force_f3 != NULL) p->force_f3(TRUE);
-    p->status_info_w((WCHAR*)L"\\MainRepo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    SetLastError(0);
-    HANDLE h = p->find_first_w((WCHAR*)L"\\MainRepo", &fd);
-    EXPECT_TRUE(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_NO_MORE_FILES,
-                "F3 answers the CALCSIZE query with \"no files\"");
-    SetLastError(0);
-    EXPECT_TRUE(p->find_first_w((WCHAR*)L"\\MainRepo", &fd) == INVALID_HANDLE_VALUE &&
-                    GetLastError() == ERROR_NO_MORE_FILES,
-                "The whole CALCSIZE scope stays aborted, so the tree is never walked");
-    p->status_info_w((WCHAR*)L"\\MainRepo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
+    /* F3 on a repository ends up here: Total Commander sends the "properties" verb */
+    EXPECT_TRUE(p->execute_file_w(NULL, (WCHAR*)L"\\MainRepo", L"properties") == FS_EXEC_OK,
+                "A report request on the repository is accepted");
     EXPECT_TRUE(file_contains_text(repo_report, "# Restic repository report"),
-                "F3 on a repository writes the repository report");
+                "The repository report is written");
     EXPECT_TRUE(file_contains_text(repo_report, "## Snapshot history"),
                 "...with the snapshot history");
     EXPECT_TRUE(file_contains_text(repo_report, "<!DOCTYPE html>") == FALSE,
                 "...as Markdown, not HTML");
-
-    /* A CALCSIZE without F3 (space bar) is not intercepted */
-    p->status_info_w((WCHAR*)L"\\MainRepo", FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    h = p->find_first_w((WCHAR*)L"\\MainRepo", &fd);
-    EXPECT_TRUE(h != INVALID_HANDLE_VALUE, "The space bar still calculates the folder size");
-    if (h != INVALID_HANDLE_VALUE) p->find_close(h);
-    p->status_info_w((WCHAR*)L"\\MainRepo", FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-
-    /* F3 on a snapshot */
-    if (p->force_f3 != NULL) p->force_f3(TRUE);
-    p->status_info_w((WCHAR*)snapshot_root, FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    (void)p->find_first_w((WCHAR*)snapshot_root, &fd);
-    p->status_info_w((WCHAR*)snapshot_root, FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(file_contains_text(snap_report, "# Restic snapshot report"),
-                "F3 on a snapshot writes the snapshot report");
-    EXPECT_TRUE(file_contains_text(snap_report, "## Files and directories"),
-                "...with the summary of the backup");
-
-    /* F3 on a subfolder */
-    if (p->force_f3 != NULL) p->force_f3(TRUE);
-    p->status_info_w((WCHAR*)data_path, FS_STATUS_START, FS_STATUS_OP_CALCSIZE);
-    (void)p->find_first_w((WCHAR*)data_path, &fd);
-    p->status_info_w((WCHAR*)data_path, FS_STATUS_END, FS_STATUS_OP_CALCSIZE);
-    EXPECT_TRUE(file_contains_text(folder_report, "# Restic folder report"),
-                "F3 on a subfolder writes the folder report");
-    EXPECT_TRUE(file_contains_text(folder_report, "## Size by subfolder"),
-                "...with the subfolder breakdown");
 
     /* Alt+Enter (Verb "properties") reaches the same report */
     DeleteFileW(folder_report);
@@ -695,6 +683,26 @@ static void test_e2e_stats_report(const Plugin* p, const WCHAR* dir, const WCHAR
     EXPECT_TRUE(p->execute_file_w(NULL, (WCHAR*)snapshot_root, L"properties") == FS_EXEC_OK &&
                     file_contains_text(snap_report, "# Restic snapshot report"),
                 "Alt+Enter on a snapshot produces the snapshot report");
+
+    /* A user's own Alt+Enter on a file must not start a download: only the "properties" request
+       produced from F3 by the keyboard hook is handed back to the viewer (cm_List), and the hook
+       cannot run in this test process. The hand-back itself is covered in test_report.c. */
+    WCHAR remote_readme[MAX_PATH * 2];
+    swprintf_s(remote_readme, _countof(remote_readme), L"%ls\\readme.txt", data_path);
+    HWND sink = create_list_request_sink();
+    EXPECT_TRUE(sink != NULL, "The test can observe the internal command channel");
+    g_list_requests.count        = 0;
+    g_list_requests.last_command = 0;
+    EXPECT_TRUE(p->execute_file_w(sink, remote_readme, L"properties") == FS_EXEC_OK,
+                "Alt+Enter on a file is accepted without an error dialog");
+    EXPECT_TRUE(drain_list_requests(sink) == 0 && g_list_requests.last_command == 0,
+                "...and does not ask Total Commander to view (download) it");
+    /* A folder must not produce that request either: it has its own report */
+    g_list_requests.count = 0;
+    EXPECT_TRUE(p->execute_file_w(sink, (WCHAR*)data_path, L"properties") == FS_EXEC_OK,
+                "A folder report is still produced");
+    EXPECT_TRUE(drain_list_requests(sink) == 0, "...and never asks for the native viewer");
+    if (sink != NULL) DestroyWindow(sink);
 
     /* The typed command reaches it as well: RemoteName is the current directory */
     DeleteFileW(repo_report);
@@ -714,11 +722,10 @@ static void test_e2e_stats_report(const Plugin* p, const WCHAR* dir, const WCHAR
                 "Other command line verbs are not statistics requests");
 
     /* Everything else keeps Total Commander's normal behaviour */
-    WCHAR remote_readme[MAX_PATH * 2];
-    swprintf_s(remote_readme, _countof(remote_readme), L"%ls\\readme.txt", data_path);
     EXPECT_TRUE(p->execute_file_w(NULL, remote_readme, L"open") == FS_EXEC_YOURSELF,
                 "Enter on a file lets Total Commander download and open it");
     /* Per the SDK FS_EXEC_OK also means "not applicable": no error message for these */
+    g_list_requests.count = 0;
     EXPECT_TRUE(p->execute_file_w(NULL, remote_readme, L"properties") == FS_EXEC_OK &&
                     g_e2e_msg_dialogs == 0,
                 "Alt+Enter on a file has nothing to show and is not an error");
@@ -1354,12 +1361,6 @@ static void test_live_end_to_end_navigation(void) {
     EXPECT_TRUE(p.find_first_w(empty_path, &fd) == INVALID_HANDLE_VALUE &&
                 GetLastError() == ERROR_NO_MORE_FILES,
                 "An empty snapshot directory is reported as empty");
-    p.status_info_w(empty_path, FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
-    SetLastError(0);
-    EXPECT_TRUE(p.find_first_w(empty_path, &fd) == INVALID_HANDLE_VALUE &&
-                GetLastError() == ERROR_NO_MORE_FILES,
-                "A mass operation sees the empty directory as empty too");
-    p.status_info_w(empty_path, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
 
     /* 2b. File extraction via FsGetFileW + recursive directory copy (as Total Commander does on F5) */
     test_e2e_file_and_folder_extraction(&p, dir, data_path);

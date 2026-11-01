@@ -412,15 +412,16 @@ static BOOL wfx_report_cancel_callback(void* user_data) {
 /* How a request for a statistics report ended (FsExecuteFileW maps it to the SDK return codes) */
 typedef enum {
     STATS_SHOWN,          /* The report was generated and handed to the Lister */
-    STATS_NOT_APPLICABLE, /* Nothing to show (plugin root, a file, user cancelled): not an error */
+    STATS_NOT_APPLICABLE, /* Nothing to show (plugin root, user cancelled): not an error */
+    STATS_NOT_A_FOLDER,   /* The request named a file: Total Commander has to view it the usual way */
     STATS_FAILED          /* Configuration, password or Restic problem */
 } StatsOutcome;
 
 /*
  * Generates the Markdown statistics report of a repository, snapshot or snapshot subfolder and
- * opens it in the Total Commander Lister. Both entry points that can request it end up here: F3 on
- * a folder (intercepted inside the folder-size calculation, see FsFindFirstW) and Alt+Enter or
- * "quote stats" (FsExecuteFileW).
+ * opens it in the Total Commander Lister. Every entry point that can request it ends up here:
+ * F3 on a folder (wfx_status turns it into the "properties" verb below), Alt+Enter and the command
+ * line word "stats" (both call FsExecuteFileW).
  */
 static StatsOutcome show_stats_report_for_path(const WCHAR* virtual_path) {
     if (virtual_path == NULL || virtual_path[0] == L'\0') return STATS_FAILED;
@@ -535,7 +536,7 @@ static StatsOutcome show_stats_report_for_path(const WCHAR* virtual_path) {
     } else if (res == RESTIC_ERR_PATH_NOT_FOUND) {
         /* Restic knows no such folder: the cursor was on a file (or on something that vanished) */
         wfx_trace_printf("report: not a folder of the snapshot");
-        outcome = STATS_NOT_APPLICABLE;
+        outcome = STATS_NOT_A_FOLDER;
     } else {
         handle_restic_failure(res, repo->alias, err_msg);
     }
@@ -628,12 +629,14 @@ static HANDLE execute_repo_query(
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
         config_set_plugin_dir_from_module((HMODULE)hinstDLL);
         wfx_trace_init(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
+        /* lpvReserved is NULL when the DLL is unloaded (cm_UnloadPlugins), non-NULL at process exit,
+           when removing the hook would be pointless and other DLLs may already be gone */
+        if (lpvReserved == NULL) restic_f3_hook_shutdown();
         clear_password_session();
         snapshot_stats_clear();
         restic_report_clear_cache();
@@ -729,22 +732,9 @@ HANDLE __stdcall FsFindFirstW(WCHAR* Path, WIN32_FIND_DATAW* FindData) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    /*
-     * Total Commander has no "view a folder" entry point: F3 on a directory is implemented by
-     * intercepting the folder-size calculation that TC starts for it. wfx_status remembers the F3
-     * key state seen when that operation began; here the report is produced once and the whole
-     * CALCSIZE scope answers "no files", so TC never walks the tree of the folder being reported.
-     */
-    if (wfx_status_is_f3_calcsize_aborted()) {
-        SetLastError(ERROR_NO_MORE_FILES);
-        return INVALID_HANDLE_VALUE;
-    }
-    if (wfx_status_consume_f3_calcsize()) {
-        wfx_trace_path("F3 on folder", Path);
-        (void)show_stats_report_for_path(Path); /* The outcome is not reported through F3 */
-        SetLastError(ERROR_NO_MORE_FILES);
-        return INVALID_HANDLE_VALUE;
-    }
+    /* Listing a folder proves that Total Commander is driving us from its user interface thread,
+       which is where the F3 hooks must be installed (a no-op on background threads) */
+    restic_f3_hook_ensure_installed();
 
     memset(FindData, 0, sizeof(WIN32_FIND_DATAW));
 
@@ -833,15 +823,6 @@ static BOOL wfx_dump_progress_callback(ULONGLONG bytes_written, void* user_data)
     return g_ProgressProc(g_PluginNr, src, dst, pct) != 0;
 }
 
-/*
- * Test-only entry point: forces the next folder-size calculation to be treated as an F3 request, so
- * the automated tests can replay the real Total Commander sequence without a physical keyboard.
- * Total Commander never calls it; it only sets a per-thread flag.
- */
-void __stdcall restic_test_force_f3(BOOL force) {
-    wfx_status_force_f3_next_calcsize(force);
-}
-
 int __stdcall FsExecuteFile(HWND MainWin, char* RemoteName, char* Verb) {
     /* The ANSI variant cannot carry a Unicode report path: only "open" is honoured */
     (void)MainWin;
@@ -865,7 +846,6 @@ static BOOL is_stats_command(const WCHAR* verb) {
 }
 
 int __stdcall FsExecuteFileW(HWND MainWin, WCHAR* RemoteName, WCHAR* Verb) {
-    (void)MainWin;
     if (!RemoteName || !Verb) return FS_EXEC_ERROR;
 
     /* Enter on a file: Total Commander downloads and opens it the usual way */
@@ -873,11 +853,18 @@ int __stdcall FsExecuteFileW(HWND MainWin, WCHAR* RemoteName, WCHAR* Verb) {
         return FS_EXEC_YOURSELF;
     }
 
-    /* Alt+Enter on a folder, or the command line verb "quote stats" (RemoteName is then the current
-       directory). Per the SDK FS_EXEC_OK also means "not applicable, nothing more to do": the plugin
-       root, a file or a cancelled dialog must not end in an error message. */
+    /* Alt+Enter on a folder, F3 (turned into the same request by the keyboard hook of wfx_status), or
+       the command line verb "quote stats" (RemoteName is then the current directory). Per the SDK
+       FS_EXEC_OK also means "not applicable, nothing more to do": the plugin root, a file or a
+       cancelled dialog must not end in an error message. */
     if (_wcsicmp(Verb, L"properties") == 0 || is_stats_command(Verb)) {
-        return show_stats_report_for_path(RemoteName) == STATS_FAILED ? FS_EXEC_ERROR : FS_EXEC_OK;
+        const BOOL from_f3         = restic_f3_take_request(GetTickCount64());
+        const StatsOutcome outcome = show_stats_report_for_path(RemoteName);
+        if (outcome == STATS_FAILED) return FS_EXEC_ERROR;
+        /* F3 on a file must still show the file: cm_List is exactly what F3 does natively. A user's
+           own Alt+Enter on a file is not an F3 and must not start a download. */
+        if (outcome == STATS_NOT_A_FOLDER && from_f3) restic_f3_request_native_view(MainWin);
+        return FS_EXEC_OK;
     }
 
     return FS_EXEC_ERROR;

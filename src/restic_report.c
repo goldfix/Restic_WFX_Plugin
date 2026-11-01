@@ -1262,12 +1262,13 @@ BOOL restic_report_open_in_lister(const WCHAR* local_report_path) {
     const size_t cmd_chars = wcslen(tc_exe) + wcslen(local_report_path) + 16;
     WCHAR* cmd_line        = (WCHAR*)malloc(cmd_chars * sizeof(WCHAR));
     if (cmd_line == NULL) return FALSE;
-    if (swprintf_s(cmd_line, cmd_chars, L"\"%ls\" /S=L \"%ls\"", tc_exe, local_report_path) < 0) {
+    /* /S=L starts the Lister, ":T7" forces its internal UTF-8 text mode: a third-party Lister
+       plugin registered for .md (for example a PDF reader) must not intercept the report */
+    if (swprintf_s(cmd_line, cmd_chars, L"\"%ls\" /S=L:T7 \"%ls\"", tc_exe, local_report_path) < 0) {
         free(cmd_line);
         return FALSE;
     }
 
-    /* /S=L is the Total Commander internal command that opens a file in its Lister */
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));

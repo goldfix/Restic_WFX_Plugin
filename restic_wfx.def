@@ -8,8 +8,6 @@ EXPORTS
     FsFindNext
     FsFindNextW
     FsFindClose
-    FsStatusInfo
-    FsStatusInfoW
     FsGetFile
     FsGetFileW
     FsExecuteFile
@@ -24,4 +22,3 @@ EXPORTS
     FsContentStopGetValue
     FsContentStopGetValueW
     FsContentPluginUnloading
-    restic_test_force_f3
