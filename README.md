@@ -13,21 +13,22 @@
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX64-orange.svg" alt="Total Commander WFX64" />
-  <img src="https://img.shields.io/badge/Version-1.3.0-success.svg" alt="Version: 1.3.0" />
+  <img src="https://img.shields.io/badge/Version-1.3.2-success.svg" alt="Version: 1.3.2" />
 </p>
 
 ---
 
 ## Overview & Purpose
 
-**Restic WFX** (`restic.wfx64`) is a native 64-bit **File System Plugin (WFX)** for [Total Commander](https://www.ghisler.com/) written in pure **C11** (Win32 API, zero external DLL dependencies beyond `KERNEL32.dll`).
+**Restic WFX** (`restic.wfx64`) is a native 64-bit **File System Plugin (WFX)** for [Total Commander](https://www.ghisler.com/) written in pure **C11** (Win32 API, zero external DLL dependencies: only `KERNEL32.dll` and
+`USER32.dll`, the latter solely for the keyboard hook and the injected Alt+Enter that make `F3` work on
+plugin folders).
 
 It turns Total Commander's **Network Neighborhood** (`\\\Restic Backups\`) into a fast, strictly **read-only** browser and extractor for your [Restic](https://restic.net) backup repositories:
 
 ```text
 \\\Restic Backups\
 ├── MyLocalBackup\                              <-- Level 0: Repository aliases (from restic_plugin.ini)
-│   ├── !restic_stats.html                      <-- Repository report (F3)
 │   ├── 2026-10-18_09-30-00_[a1b2c3d4]\         <-- Level 1: Snapshots (YYYY-MM-DD_HH-MM-SS_[short_id])
 │   │   └── C\
 │   │       └── Users\
@@ -45,7 +46,7 @@ It turns Total Commander's **Network Neighborhood** (`\\\Restic Backups\`) into 
   - Copy individual files or entire directory trees out of any snapshot using **`F5`** (preserving original modification timestamps and 64-bit file sizes).
   - Inspect files directly with Total Commander's **Lister (`F3`)** or **Quick View (`Ctrl+Q`)**.
   - Constant-memory streaming (`64 KB` chunks via `restic dump --no-lock`) into a temporary file with **atomic replacement** on completion: an interrupted or failed overwrite never corrupts or deletes your existing local file.
-- **Interactive Statistics Report (`!restic_stats.html`):** every repository, snapshot and snapshot folder shows one extra virtual file. Press **`F3`** (Lister) or open it in a browser to get an HTML dashboard: repository-wide storage and deduplication plus the snapshot history, snapshot metadata with live compression statistics and a diff against the parent snapshot, or a folder breakdown by subfolder, file type, size range and largest files. The file is hidden during recursive copies, searches and folder size calculations, so an extracted backup never contains it.
+- **Statistics report on demand (`F3` / `Alt+Enter` / `stats`):** put the cursor on a repository, a snapshot or any snapshot folder and press **`F3`** or **`Alt+Enter`** (or type **`stats`**): the plugin writes a **Markdown** report to `%TEMP%` and opens it in Total Commander's own Lister. The listings stay 100 % clean (no artificial file to copy or to count) and nothing is generated unless you ask for it. Repository level gives storage, deduplication and the snapshot history; snapshot level gives the backup metadata, compression figures and the diff against the parent; folder level gives a breakdown by subfolder, file type, size range and largest files.
 - **Strictly Read-Only by Design:** Every Restic command runs with `--no-lock`. Repository modification entry points (`FsPutFile`, `FsDeleteFile`, `FsRemoveDir`, `FsMkDir`, `FsRenMovFile`) are intentionally not exported, and `F6` (Move) is rejected.
 - **Zero Passwords on Disk:** Repository passwords are requested interactively via Total Commander's native password dialog (`RequestProcW`), kept only in volatile RAM per repository alias for the active session, passed to `restic.exe` via an isolated environment block (`RESTIC_PASSWORD`), and wiped with `SecureZeroMemory`.
 - **Responsive Cancellation (`ESC`):** Long operations on remote backends can be aborted with `ESC` and use a 30-minute **inactivity** timeout (so slow multi-gigabyte transfers are never cut off as long as bytes keep flowing).
@@ -179,7 +180,7 @@ GoogleDrive=rclone:gdrive:Backups/restic_repo
 | **View File (`F3` / `Ctrl+Q`)** | Press **`F3`** (Lister) or **`Ctrl+Q`** (Quick View) on any file to stream it to a temporary location and view its contents. |
 | **Restore / Extract (`F5`)** | Select one or more files or directories and press **`F5`** to copy them to the target panel, preserving original `LastWriteTime` timestamps. Standard Total Commander overwrite prompts are supported. |
 | **Cancel Operation (`ESC`)** | Press **`ESC`** in Total Commander's progress dialog to terminate the underlying `restic.exe` child process and clean up any temporary file. |
-| **Statistics Report (`F3`)** | Every repository, snapshot and folder contains the virtual file `!restic_stats.html`; `F3` renders a self-contained HTML report (see below). |
+| **Statistics Report (`F3` / `Alt+Enter` / `stats`)** | Cursor on a repository, a snapshot or a folder: `F3` or `Alt+Enter` (or the command `stats`) writes a Markdown report to `%TEMP%` and opens it in the Lister (see below). |
 | **Backup Statistics (Columns)** | Enter a repository: Total Commander switches to the plugin's custom columns view automatically. Add or reorder columns via **Configuration -> Options -> Custom columns** (see below). |
 
 ---
@@ -200,7 +201,7 @@ While a panel displays `Restic Backups`, Total Commander can show Restic's own b
 | Added | `42` | `summary.data_added` (MB of new data written to the repository, before compression) |
 | Duration | `95` | backup end minus backup start (seconds) |
 
-To build your own view: **Configuration -> Options -> Custom columns -> New**, add a column and pick a field from the plugin. In the field reference, `<plugin name>` is the key shown in **Configuration -> Options -> Plugins -> File system plugins** (the installer proposes `restic`, but it can differ - the test machine uses "Restic Backups"):
+To build your own view: **Configuration -> Options -> Custom columns -> New**, add a column and pick a field from the plugin. In the field reference, `<plugin name>` is the key shown in **Configuration -> Options -> Plugins -> File system plugins** (the installer proposes `restic`, but it can differ, for example `Restic Backups`):
 
 ```text
 [=<plugin name>.size.Mbytes]
@@ -250,26 +251,65 @@ Total Commander shows the statistics columns only when the column definition poi
 
 ---
 
----
+## Statistics Report (`F3` / `Alt+Enter` / `stats`)
 
-## Statistics Report (`!restic_stats.html`)
+No artificial file is added to the listings. To read the statistics of a repository, a snapshot or a
+snapshot folder, put the cursor **on the folder itself** and:
 
-Each repository, snapshot and snapshot folder contains one extra read-only virtual file named **`!restic_stats.html`**. Press **`F3`** (Lister) or **`Ctrl+Q`** (Quick View) on it: the plugin runs the required Restic queries and writes a self-contained HTML report. You can also copy it with **`F5`** and open it in any browser.
+- press **`F3`**. Total Commander has no "view a folder" command and normally answers "No files
+  selected!" without ever calling the plugin, so the plugin watches the keyboard inside Total
+  Commander's own process (a thread-local hook; nothing is injected into other programs) and, as soon
+  as the **active panel** shows a path of this plugin, turns `F3` into its own report request. `F3` on a
+  **file** keeps working as usual: the file is downloaded and opened in the configured viewer (after one
+  short Restic query that tells it is not a folder);
+- or press **`Alt+Enter`** (properties);
+- or type **`stats`** on the command line (Total Commander sends `quote stats`) while the panel shows the
+  repository, snapshot or folder you want a report for.
 
-| Where | What the report contains |
+The document is written to `%TEMP%\restic_stats_<alias>[_<short_id>][_<leaf>].md` and opened in the
+Total Commander Lister, whose title bar shows that speaking name. `ESC` cancels the generation and
+leaves any earlier copy untouched.
+
+| Where the cursor is | What the report contains |
 | --- | --- |
-| `\<Alias>\!restic_stats.html` | Whole-repository storage: logical restore size, uncompressed and compressed (stored) size, compression ratio and savings, deduplication factor, blob count, plus the full snapshot history with the data each backup added over time. |
-| `\<Alias>\<Snapshot>\!restic_stats.html` | Snapshot metadata (IDs, parent, host, user, Restic version, tags, source paths, backup window and duration), live storage and compression figures for that snapshot, the new/changed/unmodified file and directory breakdown, and a diff against the parent snapshot with the changed paths. |
-| `\<Alias>\<Snapshot>\<Folder>\!restic_stats.html` | Recursive analysis of that folder: total size and file/directory counts, the share of every direct subfolder, the largest file types, a file size histogram and the fifteen largest files. |
+| `\<Alias>` (repository) | Whole-repository storage: logical restore size, uncompressed and compressed (stored) size, compression ratio and savings, deduplication factor, blob count, plus the full snapshot history with the data each backup added over time. |
+| `\<Alias>\<Snapshot>` | Snapshot metadata (IDs, parent, host, user, Restic version, tags, source paths, backup window and duration), live storage and compression figures for that snapshot, the new/changed/unmodified file and directory breakdown, and a diff against the parent snapshot with the changed paths. |
+| `\<Alias>\<Snapshot>\<Folder>` | Recursive analysis of that folder: total size and file/directory counts, the share of every direct subfolder, the largest file types, a file size histogram and the fifteen largest files. |
 
-Notes:
+### How `F3` behaves
 
-- The report renders in both Lister modes: plain tables and Unicode bars (`[████░░░░]`) are readable in the built-in HTML text mode, and the embedded CSS turns it into a dark/light dashboard in a browser or in the Explorer preview.
-- Generating a report needs a few extra `restic.exe` runs (`stats`, `diff`, `ls --recursive`), so it can take a moment on a slow or remote repository. **`ESC`** cancels it, the partially written file is discarded and an existing target file is left untouched.
-- Optional queries degrade gracefully: a snapshot whose parent has been deleted still produces a report, with a note stating that the diff is unavailable.
-- The repository location in the report hides the credentials of a URL (`rest:https://user:secret@host/repo` is shown as `rest:https://***@host/repo`), because the file can be copied or shared. Passwords are never written to the report.
-- If a snapshot contains a real file called `!restic_stats.html` (for example a report you saved earlier into a backed-up folder), the plugin does not add its virtual file to that folder: your file stays reachable.
-- The file is **not** listed during recursive copies (`F5` on a folder), searches (`Alt+F7`), folder size calculations (space bar) or directory synchronisation, because Total Commander reports those operations through `FsStatusInfoW`. Manual extraction of a whole snapshot therefore never adds a file the user never had.
+- The report is produced only when the **active** panel (the one that owns the keyboard focus, as shown
+  by the command line prompt) is inside the plugin. With the cursor in a normal folder, an archive or
+  another plugin, `F3` keeps Total Commander's behaviour even when the other panel still shows a backup,
+  whether the panels are side by side or above each other. It also works with the command line hidden.
+- `F3` is recognised in the file list only (not in the thumbnail view). `F3` or `Alt+Enter` on the `[..]`
+  row, and `Alt+Enter` on a file or on the plugin root, do nothing (and are not an error).
+- `Shift+F3`, `Ctrl+F3` and `Alt+F3` are never touched.
+
+### About the report
+
+- The format is **Markdown**: pipe tables aligned with monospace padding and bars drawn with `#` and
+  `.` (`[##########..........]`), so the document is perfectly readable as plain text in the built-in
+  Lister and renders as a formatted document in a Markdown Lister plugin or an external editor.
+- The report is opened with Total Commander's own Lister (`"<TOTALCMD64.EXE>" /S=L:T7 "<file>"`); `:T7`
+  forces the internal UTF-8 text mode, so a third-party Lister plugin registered for `.md` cannot
+  intercept it. Close it with `ESC`. If `%COMMANDER_EXE%` is not available the plugin falls back to the
+  host module path, and `RESTIC_WFX_NO_LISTER_GUI=1` suppresses the window entirely (used by the
+  automated tests). If the Lister of an earlier report still has the file open, the new report gets a
+  free name (`... (2).md`) instead of failing.
+- The report reads what Restic can tell it cheaply: the snapshot list, the snapshot metadata and the
+  restore size come from the statistics cache that the columns already fill, so a warm cache needs
+  **no** extra `restic.exe` run for them; only the physical (deduplicated/compressed) figures need
+  `restic stats --mode raw-data`, the diff needs `restic diff`, and a folder report needs one
+  streaming `restic ls --recursive`. A repeated request within one minute is answered from memory.
+- **`ESC`** cancels the generation; the partially written file is discarded and an existing report is
+  left untouched. Optional queries degrade gracefully: a snapshot whose parent has been deleted still
+  produces a report, with a note stating that the diff is unavailable.
+- The repository location in the report hides the credentials of a URL (`rest:https://user:secret@host/repo`
+  is shown as `rest:https://***@host/repo`), because the file can be copied or shared. Passwords are
+  never written to the report.
+
+---
 
 ## Building & Testing from Source
 
@@ -287,8 +327,8 @@ Using the Git Bash / MSYS2 wrapper (`build.sh`) or directly via `nmake`:
 ```bash
 ./build.sh release       # Build optimized Release DLL (build/restic.wfx64, static CRT /MT) + copy build/restic_plugin.ini
 ./build.sh debug         # Build Debug DLL (build/restic.wfx64, /MTd + CRT debug heap)
-./build.sh test          # Build & run all 4 test suites in Debug mode (with CRT memory-leak verification)
-./build.sh release-test  # Build & run all 4 test suites against the Release build
+./build.sh test          # Build & run all 5 test suites in Debug mode (with CRT memory-leak verification)
+./build.sh release-test  # Build & run all 5 test suites against the Release build
 ./build.sh analyze       # Run MSVC Static Code Analyzer (/analyze) with warnings-as-errors (/W4 /WX)
 ./build.sh asan          # Run unit tests under MSVC AddressSanitizer (/fsanitize=address)
 ./build.sh package       # Clean, build Release, run tests and create build/wfx_restic_<version>_x64.zip

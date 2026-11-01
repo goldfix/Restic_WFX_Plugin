@@ -97,12 +97,6 @@ BOOL snapshot_stats_lookup(const WCHAR* alias, const char* short_id, ResticSnaps
 BOOL snapshot_stats_lookup_any(const char* short_id, ResticSnapshotInfo* out_info);
 
 /**
- * Copies the most recent cached snapshot of `alias` into `*out_info` (by creation time).
- * Returns FALSE when the alias is not cached or holds no snapshots.
- */
-BOOL snapshot_stats_lookup_latest(const WCHAR* alias, ResticSnapshotInfo* out_info);
-
-/**
  * Renders the cached aliases as "Alias(count) ..." for the content diagnostic trace.
  * Returns the number of occupied slots; `out` is always 0-terminated.
  */

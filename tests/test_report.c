@@ -1,10 +1,10 @@
 /*
- * Unit and integration tests for the HTML statistics report:
- *  - restic_report_format_*       (bars, byte/count/timestamp formatting, HTML escaping)
- *  - wfx_status_* / FsStatusInfo* (operation filter that hides the virtual file)
+ * Unit and integration tests for the Markdown statistics report:
+ *  - restic_report_format_*       (bars, byte/count/timestamp formatting, table text)
+ *  - restic_f3_*                  (F3 on plugin folders: Path Guard, request marker, hand-back)
  *  - restic_report_parse_*        (`restic stats` JSON, `restic diff` NDJSON)
  *  - restic_report_aggregate_ls_line / finalize (`restic ls --recursive` aggregation)
- *  - the three HTML writers and the virtual directory entry
+ *  - the three Markdown writers
  *  - end-to-end generation with the real restic.exe (skipped when tmp\restic.exe is missing)
  */
 #ifndef UNICODE
@@ -146,34 +146,37 @@ static BOOL write_text_file(const WCHAR* path, const char* content, size_t lengt
 /* Formatting                                                                                  */
 /* ------------------------------------------------------------------------------------------ */
 
-static void test_unicode_bar_formatting(void) {
+static void test_ascii_bar_formatting(void) {
     char bar[256];
 
     restic_report_format_bar(bar, sizeof(bar), 0.0, 10);
     EXPECT_TRUE(bar[0] == '[' && bar[strlen(bar) - 1] == ']', "A bar is enclosed in brackets");
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x88"), 0, "0 % shows no filled block");
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x91"), 10, "0 % shows ten empty blocks");
+    EXPECT_U64_EQ(count_occurrences(bar, "#"), 0, "0 % shows no filled block");
+    EXPECT_U64_EQ(count_occurrences(bar, "."), 10, "0 % shows ten empty blocks");
+    EXPECT_STR_EQ(bar, "[..........]", "Only ASCII characters are used");
 
     restic_report_format_bar(bar, sizeof(bar), 0.001, 10);
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x88"), 1, "A tiny ratio still shows one block");
+    EXPECT_U64_EQ(count_occurrences(bar, "#"), 1, "A tiny ratio still shows one block");
 
     restic_report_format_bar(bar, sizeof(bar), 0.5, 10);
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x88"), 5, "Half full bar has half the blocks");
+    EXPECT_U64_EQ(count_occurrences(bar, "#"), 5, "Half full bar has half the blocks");
+    EXPECT_STR_EQ(bar, "[#####.....]", "Half bar rendering");
 
     restic_report_format_bar(bar, sizeof(bar), 1.0, 10);
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x88"), 10, "100 % fills the bar");
+    EXPECT_U64_EQ(count_occurrences(bar, "#"), 10, "100 % fills the bar");
 
     restic_report_format_bar(bar, sizeof(bar), -1.0, 10);
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x88"), 0, "A negative ratio is clamped to zero");
+    EXPECT_U64_EQ(count_occurrences(bar, "#"), 0, "A negative ratio is clamped to zero");
 
     restic_report_format_bar(bar, sizeof(bar), 2.5, 10);
-    EXPECT_U64_EQ(count_occurrences(bar, "\xE2\x96\x88"), 10, "A ratio above 1 is clamped");
+    EXPECT_U64_EQ(count_occurrences(bar, "#"), 10, "A ratio above 1 is clamped");
 
     /* Degenerate parameters must never overrun or produce an unterminated string */
     restic_report_format_bar(bar, sizeof(bar), 0.5, 0);
     EXPECT_TRUE(strlen(bar) > 0, "A zero width still produces a valid bar");
+    /* The bar never exceeds 40 blocks plus the brackets, whatever the buffer */
     restic_report_format_bar(bar, sizeof(bar), 0.5, 1000);
-    EXPECT_TRUE(strlen(bar) < sizeof(bar), "The width is capped to the buffer capacity");
+    EXPECT_TRUE(strlen(bar) == 42, "The width is capped to 40 blocks");
     restic_report_format_bar(bar, 3, 0.5, 10);
     EXPECT_TRUE(strlen(bar) < 3, "A tiny buffer stays within bounds");
     restic_report_format_bar(NULL, 0, 0.5, 10);
@@ -221,12 +224,13 @@ static void test_number_and_time_formatting(void) {
     EXPECT_TRUE(restic_report_format_time(NULL, text, sizeof(text)) == FALSE, "NULL time");
 }
 
-static void test_html_escaping(void) {
+static void test_markdown_text_escaping(void) {
     FILE* fp = NULL;
     EXPECT_TRUE(tmpfile_s(&fp) == 0 && fp != NULL, "Open a scratch file");
 
-    restic_report_escape_write(fp, "<a href=\"x\">&'");
-    restic_report_escape_write(fp, NULL);
+    restic_report_write_text(fp, "a|b\r\n\tc");
+    restic_report_write_text(fp, "<a href=\"x\">&'");
+    restic_report_write_text(fp, NULL);
     fflush(fp);
     rewind(fp);
 
@@ -235,69 +239,258 @@ static void test_html_escaping(void) {
     buffer[got]      = '\0';
     fclose(fp);
 
-    EXPECT_STR_EQ(buffer, "&lt;a href=&quot;x&quot;&gt;&amp;'",
-                  "Markup characters are escaped, quotes and apostrophes handled");
+    /* A pipe would start a new table column, a control character would end the row; markup
+       characters are no longer special, so paths stay readable in the Lister */
+    EXPECT_STR_EQ(buffer, "a/b   c<a href=\"x\">&'",
+                  "Pipes become '/', control characters become spaces, markup is kept");
 }
 
 /* ------------------------------------------------------------------------------------------ */
-/* Operation filter (FsStatusInfo)                                                             */
+/* F3 hook: Path Guard, request marker, hand-back to the viewer                                */
 /* ------------------------------------------------------------------------------------------ */
 
-static void test_status_info_filtering(void) {
-    wfx_status_reset();
-    EXPECT_TRUE(wfx_status_should_expose_report() != FALSE,
-                "Without any reported operation the report is listed");
-    EXPECT_U64_EQ(wfx_status_current_operation(), 0, "No operation on the stack");
+static void expect_panel_path(const WCHAR* text, BOOL in_plugin, int expected_depth) {
+    int depth = -1;
+    const BOOL parsed = restic_f3_parse_panel_text(text, &depth);
+    EXPECT_TRUE(parsed == in_plugin, "Panel text classification");
+    EXPECT_U64_EQ((unsigned long long)depth, (unsigned long long)(in_plugin ? expected_depth : -1),
+                  "Panel depth");
+}
 
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_LIST);
-    EXPECT_TRUE(wfx_status_should_expose_report() != FALSE, "A panel listing shows the report");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_LIST);
-    EXPECT_TRUE(wfx_status_current_operation() == 0, "The operation stack is emptied");
+static void test_f3_panel_path_parsing(void) {
+    /* The path bar above a panel and the command line prompt both describe the active panel */
+    expect_panel_path(L"\\\\\\Restic Backups\\>", TRUE, 0);
+    expect_panel_path(L"\\\\\\Restic Backups\\*.*", TRUE, 0);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale>", TRUE, 1);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\*.*", TRUE, 1);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\2026-03-31 19-40-52 [a1b2c3d4]>", TRUE, 2);
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\2026-03-31 19-40-52 [a1b2c3d4]\\Users\\*.*", TRUE,
+                      3);
+    /* Trailing separator, leading spaces and case are tolerated */
+    expect_panel_path(L"\\\\\\Restic Backups\\Locale\\", TRUE, 1);
+    expect_panel_path(L"   \\\\\\restic backups\\Locale>", TRUE, 1);
+    /* Everything else is somebody else's panel: F3 must keep its native behaviour */
+    expect_panel_path(L"c:\\AMD>", FALSE, -1);
+    expect_panel_path(L"C:\\Windows\\System32\\*.*", FALSE, -1);
+    expect_panel_path(L"\\\\server\\share\\folder>", FALSE, -1);
+    expect_panel_path(L"\\\\\\OtherPlugin\\folder>", FALSE, -1);
+    /* A root name that merely starts with the same characters is not the plugin */
+    expect_panel_path(L"\\\\\\Restic BackupsXYZ\\>", FALSE, -1);
+    expect_panel_path(L"", FALSE, -1);
+    expect_panel_path(NULL, FALSE, -1);
+    /* No depth pointer: still a valid path */
+    EXPECT_TRUE(restic_f3_parse_panel_text(L"\\\\\\Restic Backups\\*.*", NULL) != FALSE,
+                "The depth is optional");
+}
 
-    const int hidden[] = {FS_STATUS_OP_GET_MULTI,   FS_STATUS_OP_GET_MULTI_THREAD,
-                          FS_STATUS_OP_CALCSIZE,    FS_STATUS_OP_SEARCH,
-                          FS_STATUS_OP_SEARCH_TEXT, FS_STATUS_OP_SYNC_SEARCH,
-                          FS_STATUS_OP_SYNC_GET};
-    for (size_t i = 0; i < _countof(hidden); ++i) {
-        FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, hidden[i]);
-        EXPECT_TRUE(wfx_status_should_expose_report() == FALSE,
-                    "Mass traversal operations hide the report");
-        FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, hidden[i]);
-        EXPECT_TRUE(wfx_status_should_expose_report() != FALSE, "The filter is restored");
+/* Feeds a scripted window tree to the Path Guard core and returns the depth it decides on */
+typedef struct {
+    const WCHAR* text;
+    BOOL on_focus_side;
+} ScanEntry;
+
+static int scan_depth(const ScanEntry* entries, size_t count) {
+    ResticF3Scan scan;
+    restic_f3_scan_init(&scan);
+    for (size_t i = 0; i < count; ++i) {
+        restic_f3_scan_add(&scan, entries[i].text, entries[i].on_focus_side);
     }
+    return restic_f3_scan_result(&scan);
+}
 
-    FsStatusInfo((char*)"\\Repo", FS_STATUS_START, FS_STATUS_OP_GET_SINGLE);
-    EXPECT_TRUE(wfx_status_should_expose_report() != FALSE, "F3 / Ctrl+Q keeps the report");
-    FsStatusInfo((char*)"\\Repo", FS_STATUS_END, FS_STATUS_OP_GET_SINGLE);
-    EXPECT_TRUE(wfx_status_current_operation() == 0, "The ANSI entry point uses the same stack");
+static void test_f3_path_guard_scan(void) {
+    /* Nothing seen: the plugin never acts */
+    EXPECT_U64_EQ((unsigned long long)scan_depth(NULL, 0), (unsigned long long)-1, "Empty window tree");
 
-    /* Nested operations: the innermost one decides */
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_LIST);
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
-    EXPECT_TRUE(wfx_status_should_expose_report() == FALSE, "The innermost operation wins");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
-    EXPECT_TRUE(wfx_status_should_expose_report() != FALSE, "The outer listing is visible again");
-    FsStatusInfoW((WCHAR*)L"\\Repo", FS_STATUS_END, FS_STATUS_OP_LIST);
-    EXPECT_TRUE(wfx_status_current_operation() == 0, "Nested stack unwinds");
+    /* Side by side: plugin on the left (active), local on the right */
+    const ScanEntry plugin_active[] = {
+        {L"vertical.bar", FALSE},
+        {L"\\\\\\Restic Backups\\Probe>", TRUE}, /* the command line prompt describes the active panel */
+        {L"0 k / 0 k in 0 / 0 file(s)", TRUE},
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"c:\\*.*", FALSE},
+        {L"[_none_]  ", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(plugin_active, _countof(plugin_active)), 1,
+                  "The prompt and the bar of the focused side agree on the plugin");
 
-    /* Unbalanced starts must not overflow the stack, unbalanced ends must not underflow it */
-    for (int i = 0; i < 32; ++i) {
-        FsStatusInfoW(NULL, FS_STATUS_START, FS_STATUS_OP_GET_MULTI);
+    /* Same screen, local panel active: the prompt shows the local folder and decides alone */
+    const ScanEntry local_active[] = {
+        {L"c:\\>", FALSE},
+        {L"\\\\\\Restic Backups\\Probe\\*.*", FALSE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(local_active, _countof(local_active)), (unsigned long long)-1,
+                  "A local active panel is never the plugin");
+
+    /* Panels above each other: both bars share the whole width, so the geometry says nothing; the
+       prompt of the local active panel must still win over the plugin bar on the "focus side" */
+    const ScanEntry stacked_local_active[] = {
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"c:\\*.*", TRUE},
+        {L"c:\\>", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(stacked_local_active, _countof(stacked_local_active)),
+                  (unsigned long long)-1, "Stacked panels: the prompt of the local panel decides");
+
+    /* The prompt is authoritative both ways, whatever the bars of the focused side say */
+    const ScanEntry prompt_local_bar_plugin[] = {
+        {L"c:\\>", FALSE},
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(prompt_local_bar_plugin, _countof(prompt_local_bar_plugin)),
+                  (unsigned long long)-1, "A local prompt beats a plugin bar on the focus side");
+    const ScanEntry prompt_plugin_bar_local[] = {
+        {L"\\\\\\Restic Backups\\Probe>", FALSE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(prompt_plugin_bar_local, _countof(prompt_plugin_bar_local)), 1,
+                  "A plugin prompt beats a local bar on the focus side");
+
+    /* The prompt may come before or after the bars in the enumeration order */
+    const ScanEntry prompt_last[] = {
+        {L"\\\\\\Restic Backups\\Probe\\snap\\*.*", TRUE},
+        {L"\\\\\\Restic Backups\\Probe\\snap>", FALSE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(prompt_last, _countof(prompt_last)), 2,
+                  "The prompt decides wherever it is enumerated, even outside the focus extent");
+
+    /* Command line hidden: only the bars are left */
+    const ScanEntry no_prompt_plugin[] = {
+        {L"\\\\\\Restic Backups\\*.*", TRUE},
+        {L"c:\\*.*", FALSE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_plugin, _countof(no_prompt_plugin)), 0,
+                  "Without a prompt the plugin bar of the focused side is used");
+    const ScanEntry no_prompt_local[] = {
+        {L"\\\\\\Restic Backups\\*.*", FALSE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_local, _countof(no_prompt_local)),
+                  (unsigned long long)-1, "Without a prompt a local bar on the focused side wins");
+    const ScanEntry no_prompt_ambiguous[] = {
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"c:\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_ambiguous, _countof(no_prompt_ambiguous)),
+                  (unsigned long long)-1, "Without a prompt an ambiguous layout is refused");
+    const ScanEntry no_prompt_unc[] = {
+        {L"\\\\\\Restic Backups\\Probe\\*.*", TRUE},
+        {L"\\\\server\\share\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(no_prompt_unc, _countof(no_prompt_unc)),
+                  (unsigned long long)-1, "A network path in the same extent is refused too");
+
+    /* Texts that are not paths never decide anything */
+    const ScanEntry noise[] = {
+        {L"0 k / 0 k in 0 / 0 file(s), 0 / 1 dir(s)", TRUE},
+        {L"[sys_disk]  170.539.260 k of 233.400.316 k free", TRUE},
+        {L"default.bar", TRUE},
+        {L"", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(noise, _countof(noise)), (unsigned long long)-1,
+                  "Status bars and labels are ignored");
+    ResticF3Scan scan;
+    restic_f3_scan_init(&scan);
+    restic_f3_scan_add(&scan, NULL, TRUE);
+    restic_f3_scan_add(NULL, L"x", TRUE);
+    EXPECT_U64_EQ((unsigned long long)restic_f3_scan_result(&scan), (unsigned long long)-1,
+                  "NULL arguments are tolerated");
+
+    /* The deepest plugin bar wins when several describe the plugin (command line hidden) */
+    const ScanEntry deepest[] = {
+        {L"\\\\\\Restic Backups\\*.*", TRUE},
+        {L"\\\\\\Restic Backups\\Probe\\snap\\data\\*.*", TRUE},
+    };
+    EXPECT_U64_EQ((unsigned long long)scan_depth(deepest, _countof(deepest)), 3,
+                  "Several plugin bars: the deepest one");
+}
+
+static void test_f3_request_marker(void) {
+    (void)restic_f3_take_request(1);
+    EXPECT_TRUE(restic_f3_take_request(100) == FALSE, "Nothing recorded, nothing taken");
+
+    restic_f3_note_request(1000);
+    EXPECT_TRUE(restic_f3_take_request(1000 + RESTIC_F3_REQUEST_WINDOW_MS) != FALSE,
+                "A request is taken inside the window");
+    EXPECT_TRUE(restic_f3_take_request(1000) == FALSE, "...and only once");
+
+    restic_f3_note_request(1000);
+    EXPECT_TRUE(restic_f3_take_request(1001 + RESTIC_F3_REQUEST_WINDOW_MS) == FALSE,
+                "An old request does not make a later Alt+Enter look like an F3");
+    EXPECT_TRUE(restic_f3_take_request(1002 + RESTIC_F3_REQUEST_WINDOW_MS) == FALSE,
+                "...and an expired request is discarded");
+
+    restic_f3_note_request(5000);
+    EXPECT_TRUE(restic_f3_take_request(4000) == FALSE, "A clock that went backwards is not an F3");
+
+    restic_f3_note_request(0);
+    EXPECT_TRUE(restic_f3_take_request(10) != FALSE, "A zero tick is stored as a valid mark");
+}
+
+/* A message-only window that counts the internal commands Total Commander would receive */
+static int g_native_view_count;
+static WPARAM g_native_view_command;
+
+static LRESULT CALLBACK native_view_sink_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == RESTIC_TC_WM_USER_CMD) {
+        ++g_native_view_count;
+        g_native_view_command = wparam;
+        return 0;
     }
-    EXPECT_TRUE(wfx_status_should_expose_report() == FALSE, "A saturated stack still answers");
-    for (int i = 0; i < 64; ++i) {
-        FsStatusInfoW(NULL, FS_STATUS_END, FS_STATUS_OP_GET_MULTI);
-    }
-    EXPECT_U64_EQ(wfx_status_current_operation(), 0, "Extra ends are ignored");
-    EXPECT_TRUE(wfx_status_should_expose_report() != FALSE, "The stack recovers");
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
 
-    /* Unknown operations and values are treated as interactive */
-    FsStatusInfoW(NULL, FS_STATUS_START, 999);
-    EXPECT_TRUE(wfx_status_should_expose_report() != FALSE, "Unknown operations are harmless");
-    FsStatusInfoW(NULL, 42, 999);
-    EXPECT_TRUE(wfx_status_current_operation() == 999, "Unknown transitions are ignored");
-    wfx_status_reset();
-    EXPECT_U64_EQ(wfx_status_current_operation(), 0, "The helper resets the stack");
+static void test_f3_native_view_request(void) {
+    static const WCHAR class_name[] = L"ResticTestNativeViewSink";
+    HINSTANCE instance              = GetModuleHandleW(NULL);
+    WNDCLASSEXW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = native_view_sink_proc;
+    wc.hInstance     = instance;
+    wc.lpszClassName = class_name;
+    RegisterClassExW(&wc);
+    HWND sink = CreateWindowExW(0, class_name, L"sink", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, instance, NULL);
+    EXPECT_TRUE(sink != NULL, "A stand-in for the Total Commander main window");
+
+    g_native_view_count   = 0;
+    g_native_view_command = 0;
+    restic_f3_request_native_view(sink);
+    MSG msg;
+    while (PeekMessageW(&msg, sink, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    EXPECT_TRUE(g_native_view_count == 1 && g_native_view_command == RESTIC_TC_CMD_LIST,
+                "F3 on a file asks Total Commander for cm_List (WM_USER + 51, 903)");
+    EXPECT_U64_EQ(RESTIC_TC_CMD_LIST, 903, "cm_List is command 903 of TOTALCMD.INC");
+    EXPECT_U64_EQ(RESTIC_TC_WM_USER_CMD, WM_USER + 51, "The command channel is WM_USER + 51");
+
+    /* Invalid windows are ignored */
+    restic_f3_request_native_view(NULL);
+    DestroyWindow(sink);
+    restic_f3_request_native_view(sink);
+    EXPECT_TRUE(g_native_view_count == 1, "NULL and destroyed windows receive nothing");
+    UnregisterClassW(class_name, instance);
+}
+
+static void test_f3_panel_list_class(void) {
+    /* Only the file list of a panel may own the focus when F3 is answered by the plugin */
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"LCLListBox") != FALSE, "The file list of a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"lcllistbox") != FALSE, "Case does not matter");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"TMyListBox") != FALSE, "The alternative list class");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"Edit") == FALSE, "The command line is not a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"TTOTAL_CMD") == FALSE, "The main window is not a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"SysTreeView32") == FALSE, "The tree is not a panel");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(L"") == FALSE, "An empty class name is refused");
+    EXPECT_TRUE(restic_f3_is_panel_list_class(NULL) == FALSE, "A NULL class name is refused");
+}
+
+static void test_f3_hook_lifecycle(void) {
+    /* A thread without keyboard focus (this test) never installs the hook */
+    restic_f3_hook_ensure_installed();
+    restic_f3_hook_shutdown();
+    EXPECT_TRUE(restic_f3_hook_is_installed() == FALSE, "Shutdown removes the hook");
+    restic_f3_hook_shutdown();
+    EXPECT_TRUE(restic_f3_hook_is_installed() == FALSE, "Shutdown is idempotent");
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -562,6 +755,30 @@ static void test_folder_extensions_and_truncation(void) {
                 "The truncated path is still valid UTF-8");
 }
 
+/* A filter that names a file must not be mistaken for a folder (F3 / Alt+Enter on a file) */
+static void test_folder_root_must_be_a_directory(void) {
+    static ResticReportFolder folder;
+    memset(&folder, 0, sizeof(folder));
+
+    /* Restic prints the node itself when the filter names a file */
+    feed_folder_line(&folder, "/D/readme.txt",
+                     "{\"name\":\"readme.txt\",\"type\":\"file\",\"size\":5,"
+                     "\"path\":\"/D/readme.txt\"}");
+    EXPECT_TRUE(folder.root_seen == FALSE, "A file named by the filter is not a folder");
+    EXPECT_U64_EQ(folder.total_files, 0, "It is not counted as a child of itself either");
+    EXPECT_U64_EQ(folder.total_size, 0, "No size is attributed to a folder that does not exist");
+
+    /* The same filter as a directory is the expected case */
+    feed_folder_line(&folder, "/D/data", "{\"name\":\"data\",\"type\":\"dir\",\"path\":\"/D/data\"}");
+    EXPECT_TRUE(folder.root_seen != FALSE, "A directory named by the filter is recognised");
+
+    /* A node without a type is treated as a directory, as Restic always sends one */
+    static ResticReportFolder untyped;
+    memset(&untyped, 0, sizeof(untyped));
+    feed_folder_line(&untyped, "/X", "{\"name\":\"X\",\"path\":\"/X\"}");
+    EXPECT_TRUE(untyped.root_seen != FALSE, "A node without a type still marks the root");
+}
+
 /* The "(other ...)" rows make every table add up to the folder total, whatever the cut-off */
 static void test_folder_remainder_rows(void) {
     static ResticReportFolder folder;
@@ -580,18 +797,18 @@ static void test_folder_remainder_rows(void) {
     subtree.alias        = "RepoA";
     subtree.display_path = "\\R";
     subtree.folder       = &folder;
-    char* html           = render_to_string(write_subtree_adapter, &subtree);
-    EXPECT_TRUE(html != NULL, "The folder report is written");
+    char* md           = render_to_string(write_subtree_adapter, &subtree);
+    EXPECT_TRUE(md != NULL, "The folder report is written");
 
     /* 15 subfolders are shown, the other 5 hold 5000+4000+3000+2000+1000 bytes */
-    EXPECT_TRUE(strstr(html, "(other subfolders)") != NULL && strstr(html, "14.65 KB") != NULL,
+    EXPECT_TRUE(strstr(md, "(other subfolders)") != NULL && strstr(md, "14.65 KB") != NULL,
                 "Subfolders beyond the top 15 are summed up");
     /* 12 extensions are shown, the other 8 hold 8000+7000+...+1000 bytes */
-    EXPECT_TRUE(strstr(html, "(other)") != NULL && strstr(html, "35.16 KB") != NULL,
+    EXPECT_TRUE(strstr(md, "(other)") != NULL && strstr(md, "35.16 KB") != NULL,
                 "Extensions beyond the top 12 are summed up");
-    EXPECT_U64_EQ(count_occurrences(html, "(files in this folder)"), 0,
+    EXPECT_U64_EQ(count_occurrences(md, "(files in this folder)"), 0,
                   "No row for files that do not exist directly in the folder");
-    free(html);
+    free(md);
 }
 
 static void test_location_redaction(void) {
@@ -623,10 +840,10 @@ static void test_location_redaction(void) {
     repo.repo_target    = "rest:https://user:secret@host/repo";
     repo.snapshots      = &snapshot;
     repo.snapshot_count = 1;
-    char* html          = render_to_string(write_repo_adapter, &repo);
-    EXPECT_TRUE(html != NULL && strstr(html, "secret") == NULL && strstr(html, "rest:https://***@host/repo") != NULL,
+    char* md          = render_to_string(write_repo_adapter, &repo);
+    EXPECT_TRUE(md != NULL && strstr(md, "secret") == NULL && strstr(md, "rest:https://***@host/repo") != NULL,
                 "The repository report masks the password");
-    free(html);
+    free(md);
 
     static ResticReportFolder folder;
     memset(&folder, 0, sizeof(folder));
@@ -635,55 +852,13 @@ static void test_location_redaction(void) {
     subtree.alias       = "Remote";
     subtree.repo_target = "rest:https://user:secret@host/repo";
     subtree.folder      = &folder;
-    html                = render_to_string(write_subtree_adapter, &subtree);
-    EXPECT_TRUE(html != NULL && strstr(html, "secret") == NULL, "The folder report masks the password");
-    free(html);
-}
-
-static void test_prepend_entry(void) {
-    WIN32_FIND_DATAW* items = NULL;
-    size_t count            = 0;
-
-    EXPECT_TRUE(restic_report_prepend_entry(&items, &count, L"PrependRepo", NULL) != FALSE && count == 1,
-                "The report is added to an empty listing");
-    EXPECT_WSTR_EQ(items[0].cFileName, RESTIC_REPORT_FILENAME_W, "...as its only entry");
-
-    /* A second call must not add a duplicate */
-    EXPECT_TRUE(restic_report_prepend_entry(&items, &count, L"PrependRepo", NULL) == FALSE && count == 1,
-                "The report is never listed twice");
-    free(items);
-
-    /* The report goes first, ahead of the existing entries */
-    items = (WIN32_FIND_DATAW*)calloc(2, sizeof(WIN32_FIND_DATAW));
-    EXPECT_TRUE(items != NULL, "Allocate a listing");
-    wcscpy_s(items[0].cFileName, MAX_PATH, L"first");
-    wcscpy_s(items[1].cFileName, MAX_PATH, L"second");
-    count = 2;
-    EXPECT_TRUE(restic_report_prepend_entry(&items, &count, L"PrependRepo", "aaaa1111") != FALSE &&
-                    count == 3,
-                "The report is added to an existing listing");
-    EXPECT_WSTR_EQ(items[0].cFileName, RESTIC_REPORT_FILENAME_W, "The report is first");
-    EXPECT_WSTR_EQ(items[1].cFileName, L"first", "The other entries keep their order");
-    EXPECT_WSTR_EQ(items[2].cFileName, L"second", "...all of them");
-
-    /* A backed-up file with the same name wins (case-insensitively): it must stay reachable */
-    wcscpy_s(items[0].cFileName, MAX_PATH, L"first");
-    wcscpy_s(items[1].cFileName, MAX_PATH, L"!RESTIC_Stats.HTML");
-    count = 3;
-    WIN32_FIND_DATAW* before = items;
-    EXPECT_TRUE(restic_report_prepend_entry(&items, &count, L"PrependRepo", NULL) == FALSE &&
-                    count == 3 && items == before,
-                "A real file of the same name keeps priority over the virtual one");
-    free(items);
-
-    EXPECT_TRUE(restic_report_prepend_entry(NULL, &count, L"PrependRepo", NULL) == FALSE &&
-                    restic_report_prepend_entry(&items, NULL, L"PrependRepo", NULL) == FALSE &&
-                    restic_report_prepend_entry(&items, &count, NULL, NULL) == FALSE,
-                "NULL arguments are refused");
+    md                = render_to_string(write_subtree_adapter, &subtree);
+    EXPECT_TRUE(md != NULL && strstr(md, "secret") == NULL, "The folder report masks the password");
+    free(md);
 }
 
 /* ------------------------------------------------------------------------------------------ */
-/* HTML writers                                                                                */
+/* Markdown writers                                                                            */
 /* ------------------------------------------------------------------------------------------ */
 
 /* Fills a snapshot record used by the writer tests */
@@ -719,7 +894,7 @@ static void make_snapshot_info(ResticSnapshotInfo* info, const char* short_id, c
 static char* render_to_string(void (*writer)(FILE*, const void*), const void* payload) {
     WCHAR path[MAX_PATH];
     if (GetTempPathW(MAX_PATH, path) == 0) return NULL;
-    wcscat_s(path, MAX_PATH, L"~rp_report_test.html");
+    wcscat_s(path, MAX_PATH, L"~rp_report_test.md");
     DeleteFileW(path);
 
     FILE* fp = NULL;
@@ -734,16 +909,16 @@ static char* render_to_string(void (*writer)(FILE*, const void*), const void* pa
 
 /* Adapters with the exact signature the writers expect */
 static void write_repo_adapter(FILE* fp, const void* payload) {
-    restic_report_write_repo_html(fp, (const ResticReportRepo*)payload);
+    restic_report_write_repo_md(fp, (const ResticReportRepo*)payload);
 }
 static void write_snapshot_adapter(FILE* fp, const void* payload) {
-    restic_report_write_snapshot_html(fp, (const ResticReportSnapshot*)payload);
+    restic_report_write_snapshot_md(fp, (const ResticReportSnapshot*)payload);
 }
 static void write_subtree_adapter(FILE* fp, const void* payload) {
-    restic_report_write_subtree_html(fp, (const ResticReportSubtree*)payload);
+    restic_report_write_subtree_md(fp, (const ResticReportSubtree*)payload);
 }
 
-static void test_html_report_generation(void) {
+static void test_markdown_report_generation(void) {
     static ResticSnapshotInfo snapshots[3];
     make_snapshot_info(&snapshots[0], "aaaa1111", "host<A>", 500, 1000);
     make_snapshot_info(&snapshots[1], "bbbb2222", "host&B", 700, 4000000);
@@ -766,28 +941,30 @@ static void test_html_report_generation(void) {
     repo.stored.space_saving_percent = 57.75;
     repo.stored.blob_count   = 24190;
 
-    char* html = render_to_string(write_repo_adapter, &repo);
-    EXPECT_TRUE(html != NULL, "The repository report is written");
-    EXPECT_TRUE(strstr(html, "<!DOCTYPE html>") != NULL && strstr(html, "<meta charset=\"utf-8\">") != NULL,
-                "A self-contained UTF-8 HTML document is produced");
-    EXPECT_TRUE(strstr(html, "Restic repository report") != NULL, "Headline present");
-    EXPECT_TRUE(strstr(html, "Storage and deduplication") != NULL, "Storage section present");
-    EXPECT_TRUE(strstr(html, "Deduplication factor") != NULL, "Deduplication factor is computed");
-    EXPECT_TRUE(strstr(html, "Snapshot history") != NULL, "History section present");
-    EXPECT_TRUE(strstr(html, "bbbb2222") != NULL && strstr(html, "aaaa1111") != NULL &&
-                    strstr(html, "cccc3333") != NULL,
+    char* md = render_to_string(write_repo_adapter, &repo);
+    EXPECT_TRUE(md != NULL, "The repository report is written");
+    EXPECT_TRUE(strncmp(md, "# Restic repository report ", 26) == 0,
+                "A Markdown document starts with its level-1 headline");
+    EXPECT_TRUE(strstr(md, "<!DOCTYPE") == NULL && strstr(md, "<pre>") == NULL &&
+                    strstr(md, "&lt;") == NULL && strstr(md, "&amp;") == NULL,
+                "No HTML tag or entity is left in the document");
+    EXPECT_TRUE(strstr(md, "| Property") != NULL && strstr(md, "| :---") != NULL,
+                "Tables use the pipe syntax with an alignment row");
+    EXPECT_TRUE(strstr(md, "## Storage and deduplication") != NULL, "Storage section present");
+    EXPECT_TRUE(strstr(md, "Deduplication factor") != NULL, "Deduplication factor is computed");
+    EXPECT_TRUE(strstr(md, "## Snapshot history") != NULL, "History section present");
+    EXPECT_TRUE(strstr(md, "bbbb2222") != NULL && strstr(md, "aaaa1111") != NULL &&
+                    strstr(md, "cccc3333") != NULL,
                 "Every snapshot is listed");
-    EXPECT_TRUE(strstr(html, "<title>Restic repository report</title>") != NULL,
-                "The document has a title");
-    EXPECT_TRUE(strstr(html, "1000.00 KB") != NULL, "The history shows the size of each snapshot");
-    EXPECT_TRUE(strstr(html, "Repo&lt;&amp;&gt;&quot;'") != NULL, "The alias is escaped");
-    EXPECT_TRUE(strstr(html, "D:\\backup&lt;1&gt;") != NULL, "The repository path is escaped");
-    EXPECT_TRUE(strstr(html, "18.30 GB") != NULL, "Sizes are human readable");
-    EXPECT_TRUE(strstr(html, "</html>") != NULL, "The document is closed");
-    EXPECT_TRUE(count_occurrences(html, "\xE2\x96\x88") > 0 &&
-                    count_occurrences(html, "\xE2\x96\x91") > 0,
-                "Growth bars show filled and empty blocks");
-    free(html);
+    EXPECT_TRUE(strstr(md, "1000.00 KB") != NULL, "The history shows the size of each snapshot");
+    EXPECT_TRUE(strstr(md, "Repo<&>\"'") != NULL, "The alias is written verbatim (no entity)");
+    EXPECT_TRUE(strstr(md, "D:\\backup<1>") != NULL, "The repository path is written verbatim");
+    EXPECT_TRUE(strstr(md, "18.30 GB") != NULL, "Sizes are human readable");
+    EXPECT_TRUE(count_occurrences(md, "#") > 0 && count_occurrences(md, "[") > 0,
+                "Growth bars are drawn with ASCII blocks");
+    EXPECT_TRUE(strstr(md, "\xE2\x96\x88") == NULL && strstr(md, "\xE2\x96\x91") == NULL,
+                "No Unicode block character survives");
+    free(md);
 
     static ResticReportDiff diff;
     memset(&diff, 0, sizeof(diff));
@@ -824,28 +1001,29 @@ static void test_html_report_generation(void) {
     strncpy_s(diff.changes[1].path, sizeof(diff.changes[1].path), "/D/old.jpg",
               _TRUNCATE);
 
-    html = render_to_string(write_snapshot_adapter, &snapshot);
-    EXPECT_TRUE(html != NULL, "The snapshot report is written");
-    EXPECT_TRUE(strstr(html, "Restic snapshot report") != NULL, "Snapshot headline present");
-    EXPECT_TRUE(strstr(html, "Files and directories") != NULL, "Breakdown section present");
-    EXPECT_TRUE(strstr(html, "Changes since the parent snapshot") != NULL, "Diff section present");
-    EXPECT_TRUE(strstr(html, "aaaa1111") != NULL, "The parent ID is shown");
-    EXPECT_TRUE(strstr(html, "[+]") != NULL && strstr(html, "[-]") != NULL,
-                "Added and removed paths are marked");
-    EXPECT_TRUE(strstr(html, "<script>") == NULL, "No script tag from a file name survives");
-    EXPECT_TRUE(strstr(html, "&lt;script&gt;") != NULL, "The path is escaped");
-    EXPECT_TRUE(strstr(html, "&lt;b&gt;tag&lt;/b&gt;") != NULL, "Tags are escaped");
-    EXPECT_TRUE(strstr(html, "42.10 MB") != NULL, "Added bytes are human readable");
-    free(html);
+    md = render_to_string(write_snapshot_adapter, &snapshot);
+    EXPECT_TRUE(md != NULL, "The snapshot report is written");
+    EXPECT_TRUE(strncmp(md, "# Restic snapshot report ", 24) == 0, "Snapshot headline present");
+    EXPECT_TRUE(strstr(md, "## Files and directories") != NULL, "Breakdown section present");
+    EXPECT_TRUE(strstr(md, "## Changes since the parent snapshot") != NULL,
+                "Diff section present");
+    EXPECT_TRUE(strstr(md, "aaaa1111") != NULL, "The parent ID is shown");
+    EXPECT_TRUE(strstr(md, "```text") != NULL && strstr(md, "[+] /D/<script>alert(1)</script>") != NULL,
+                "Added paths are listed in a fenced block, verbatim");
+    EXPECT_TRUE(strstr(md, "[-] /D/old.jpg") != NULL, "Removed paths are marked");
+    EXPECT_TRUE(strstr(md, "42.10 MB (142 files, 12 dirs, 0 blobs)") != NULL,
+                "Added bytes and item counts are on one line");
+    EXPECT_TRUE(strstr(md, "daily, <b>tag</b>") != NULL, "Tags are written verbatim");
+    free(md);
 
     /* A snapshot without a parent, and one whose diff failed */
     snapshot.info               = &snapshots[0];
     diff.valid                  = FALSE;
     snapshot.diff_note          = "Initial snapshot: there is no parent snapshot to compare with.";
-    html = render_to_string(write_snapshot_adapter, &snapshot);
-    EXPECT_TRUE(html != NULL && strstr(html, "Initial snapshot") != NULL,
+    md = render_to_string(write_snapshot_adapter, &snapshot);
+    EXPECT_TRUE(md != NULL && strstr(md, "Initial snapshot") != NULL,
                 "The missing parent is explained");
-    free(html);
+    free(md);
 
     static ResticReportFolder folder;
     memset(&folder, 0, sizeof(folder));
@@ -886,114 +1064,235 @@ static void test_html_report_generation(void) {
     subtree.display_path      = "\\RepoA\\2026-10-18_16-28-15_[bbbb2222]\\D\\data";
     subtree.folder            = &folder;
 
-    html = render_to_string(write_subtree_adapter, &subtree);
-    EXPECT_TRUE(html != NULL, "The folder report is written");
-    EXPECT_TRUE(strstr(html, "Restic folder report") != NULL, "Folder headline present");
-    EXPECT_TRUE(strstr(html, "Size by subfolder") != NULL, "Subfolder section present");
-    EXPECT_TRUE(strstr(html, "Largest file types") != NULL, "Extensions section present");
-    EXPECT_TRUE(strstr(html, "File size distribution") != NULL && strstr(html, "1 B - 10 KB") != NULL,
+    md = render_to_string(write_subtree_adapter, &subtree);
+    EXPECT_TRUE(md != NULL, "The folder report is written");
+    EXPECT_TRUE(strncmp(md, "# Restic folder report ", 22) == 0, "Folder headline present");
+    EXPECT_TRUE(strstr(md, "## Size by subfolder") != NULL, "Subfolder section present");
+    EXPECT_TRUE(strstr(md, "## Largest file types") != NULL, "Extensions section present");
+    EXPECT_TRUE(strstr(md, "## File size distribution") != NULL && strstr(md, "1 B - 10 KB") != NULL,
                 "Histogram section present");
-    EXPECT_TRUE(strstr(html, "Largest files") != NULL, "Largest files section present");
-    EXPECT_TRUE(strstr(html, "sub&lt;dir&gt;") != NULL, "Subfolder names are escaped");
-    EXPECT_TRUE(strstr(html, "big&lt;1&gt;.3dm") != NULL, "File names are escaped");
-    EXPECT_TRUE(strstr(html, "files in this folder") != NULL, "Direct file bytes are reported");
-    EXPECT_TRUE(strstr(html, "Modification span") != NULL, "The mtime span is shown");
-    EXPECT_TRUE(count_occurrences(html, "\xE2\x96\x88") > 0, "At least one bar block is filled");
-    free(html);
+    EXPECT_TRUE(strstr(md, "## Largest files") != NULL, "Largest files section present");
+    EXPECT_TRUE(strstr(md, "sub<dir>") != NULL, "Subfolder names are written verbatim");
+    EXPECT_TRUE(strstr(md, "sub\\big<1>.3dm") != NULL,
+                "File names use Windows separators and are written verbatim");
+    EXPECT_TRUE(strstr(md, "files in this folder") != NULL, "Direct file bytes are reported");
+    EXPECT_TRUE(strstr(md, "Modification span") != NULL, "The mtime span is shown");
+    EXPECT_TRUE(count_occurrences(md, "#") > 0, "At least one bar block is filled");
+    free(md);
 
     /* Invalid arguments must not crash or write anything */
-    restic_report_write_repo_html(NULL, &repo);
-    restic_report_write_snapshot_html(NULL, &snapshot);
-    restic_report_write_subtree_html(NULL, &subtree);
-    restic_report_write_snapshot_html(stdout, NULL);
+    restic_report_write_repo_md(NULL, &repo);
+    restic_report_write_snapshot_md(NULL, &snapshot);
+    restic_report_write_subtree_md(NULL, &subtree);
+    restic_report_write_snapshot_md(stdout, NULL);
     g_tests_run++; /* Reaching this point is the assertion */
 }
 
 /* ------------------------------------------------------------------------------------------ */
-/* Virtual file plumbing                                                                       */
+/* Report path and Lister opening                                                              */
 /* ------------------------------------------------------------------------------------------ */
 
-static void test_report_path_detection(void) {
-    WCHAR parent[256] = {0};
-    BOOL is_report    = FALSE;
+/* Records the path handed to the Lister by restic_report_open_in_lister() */
+static WCHAR g_lister_path[MAX_PATH] = {0};
+static int g_lister_calls             = 0;
 
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"\\Repo\\!restic_stats.html", parent,
-                                              _countof(parent), &is_report) != FALSE &&
-                    is_report != FALSE,
-                "A repository level report is detected");
-    EXPECT_WSTR_EQ(parent, L"\\Repo", "The parent path keeps the alias");
-
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"\\Repo\\2026-10-18_16-28-15_[aaaa1111]\\!RESTIC_STATS.HTML",
-                                              parent, _countof(parent), &is_report) != FALSE &&
-                    is_report != FALSE,
-                "The comparison is case insensitive");
-    EXPECT_WSTR_EQ(parent, L"\\Repo\\2026-10-18_16-28-15_[aaaa1111]", "Snapshot parent path");
-
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"\\Repo\\snap\\D\\data\\!restic_stats.html", parent,
-                                              _countof(parent), &is_report) != FALSE &&
-                    is_report != FALSE,
-                "A nested folder report is detected");
-    EXPECT_WSTR_EQ(parent, L"\\Repo\\snap\\D\\data", "Nested parent path");
-
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"!restic_stats.html", parent, _countof(parent),
-                                              &is_report) != FALSE &&
-                    is_report != FALSE,
-                "The bare name is detected");
-    EXPECT_WSTR_EQ(parent, L"", "The plugin root has no report");
-
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"\\Repo\\file.txt", parent, _countof(parent),
-                                              &is_report) != FALSE &&
-                    is_report == FALSE,
-                "A normal file is not a report");
-    EXPECT_WSTR_EQ(parent, L"\\Repo\\file.txt", "A normal path is copied unchanged");
-
-    WCHAR tiny[4] = {0};
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"\\Repo\\!restic_stats.html", tiny, _countof(tiny),
-                                              &is_report) == FALSE,
-                "A too small buffer is refused");
-    EXPECT_TRUE(wfx_path_strip_report_segment(NULL, parent, _countof(parent), &is_report) == FALSE,
-                "NULL path refused");
-    EXPECT_TRUE(wfx_path_strip_report_segment(L"\\Repo", NULL, 0, &is_report) == FALSE,
-                "NULL buffer refused");
+static BOOL lister_hook(const WCHAR* path) {
+    g_lister_calls++;
+    wcsncpy_s(g_lister_path, _countof(g_lister_path), path, _TRUNCATE);
+    return TRUE;
 }
 
-static void test_virtual_file_entry(void) {
-    ResticSnapshotInfo items[3];
-    make_snapshot_info(&items[0], "aaaa1111", "host", 10, 100);
-    make_snapshot_info(&items[1], "bbbb2222", "host", 20, 200);
-    make_snapshot_info(&items[2], "cccc3333", "host", 30, 300);
-    items[0].time.dwLowDateTime  = 1000;
-    items[1].time.dwLowDateTime  = 5000; /* Newest */
-    items[2].time.dwLowDateTime  = 2000;
+static BOOL failing_lister_hook(const WCHAR* path) {
+    (void)path;
+    return FALSE;
+}
 
-    EXPECT_TRUE(snapshot_stats_store(L"ReportRepo", items, _countof(items)) != FALSE,
-                "Store the snapshot cache");
+/* Removes the file name part of a path, leaving the trailing separator ("D:\tmp\") */
+static void temp_directory_of(const WCHAR* path, WCHAR* out, size_t capacity) {
+    size_t keep = 0;
+    for (size_t i = 0; path[i] != L'\0'; ++i) {
+        if (path[i] == L'\\' || path[i] == L'/') keep = i + 1;
+    }
+    if (keep + 1 > capacity) keep = 0;
+    wmemcpy(out, path, keep);
+    out[keep] = L'\0';
+}
 
-    WIN32_FIND_DATAW fd;
-    EXPECT_TRUE(restic_report_fill_find_data(L"ReportRepo", NULL, &fd) != FALSE, "Repository entry");
-    EXPECT_WSTR_EQ(fd.cFileName, RESTIC_REPORT_FILENAME_W, "The virtual file name is used");
-    EXPECT_TRUE((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
-                    (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0,
-                "It is a read-only file, not a directory");
-    EXPECT_U64_EQ(((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow,
-                  RESTIC_REPORT_PLACEHOLDER_SIZE, "The placeholder size is published");
-    EXPECT_U64_EQ(fd.ftLastWriteTime.dwLowDateTime, 5000, "The repository entry uses the newest snapshot");
+static void test_report_temp_path(void) {
+    WCHAR temp[MAX_PATH];
+    EXPECT_TRUE(GetTempPathW(MAX_PATH, temp) > 0, "The temporary directory is known");
 
-    EXPECT_TRUE(restic_report_fill_find_data(L"ReportRepo", "aaaa1111", &fd) != FALSE,
-                "Snapshot entry");
-    EXPECT_U64_EQ(fd.ftLastWriteTime.dwLowDateTime, 1000, "The snapshot timestamp is used");
+    WCHAR path[MAX_PATH];
+    EXPECT_TRUE(restic_report_build_temp_path(L"BackupLocale", NULL, NULL, path, _countof(path)) != FALSE,
+                "A repository report path is built");
+    WCHAR expected[MAX_PATH];
+    swprintf_s(expected, _countof(expected), L"%lsrestic_stats_BackupLocale.md", temp);
+    EXPECT_WSTR_EQ(path, expected, "Repository: %TEMP%\\restic_stats_<alias>.md");
 
-    EXPECT_TRUE(restic_report_fill_find_data(L"ReportRepo", "ffff0000", &fd) != FALSE,
-                "An unknown snapshot still produces an entry");
-    EXPECT_TRUE(fd.ftLastWriteTime.dwHighDateTime == 0xFFFFFFFF, "Unknown date is marked as such");
+    EXPECT_TRUE(restic_report_build_temp_path(L"BackupLocale", "5e395062", L"\\D\\data", path,
+                                              _countof(path)) != FALSE,
+                "A folder report path is built");
+    swprintf_s(expected, _countof(expected), L"%lsrestic_stats_BackupLocale_5e395062_data.md", temp);
+    EXPECT_WSTR_EQ(path, expected, "Folder: %TEMP%\\restic_stats_<alias>_<id>_<leaf>.md");
 
-    EXPECT_TRUE(restic_report_fill_find_data(L"NoSuchRepo", NULL, &fd) != FALSE,
-                "An alias without cache still produces an entry");
-    EXPECT_TRUE(fd.ftLastWriteTime.dwHighDateTime == 0xFFFFFFFF, "No date is available");
+    EXPECT_TRUE(restic_report_build_temp_path(L"BackupLocale", "5e395062", NULL, path,
+                                              _countof(path)) != FALSE,
+                "A snapshot report path is built");
+    swprintf_s(expected, _countof(expected), L"%lsrestic_stats_BackupLocale_5e395062.md", temp);
+    EXPECT_WSTR_EQ(path, expected, "Snapshot: %TEMP%\\restic_stats_<alias>_<id>.md");
 
-    EXPECT_TRUE(restic_report_fill_find_data(NULL, NULL, &fd) == FALSE, "NULL alias refused");
-    EXPECT_TRUE(restic_report_fill_find_data(L"ReportRepo", NULL, NULL) == FALSE, "NULL output refused");
-    snapshot_stats_invalidate(L"ReportRepo");
+    /* Characters that Windows rejects in a file name are replaced, the leaf is the last segment */
+    EXPECT_TRUE(restic_report_build_temp_path(L"My:Repo|?", "5e395062", L"\\a<b>\\c/d:e*f", path,
+                                              _countof(path)) != FALSE,
+                "An exotic alias still produces a path");
+    swprintf_s(expected, _countof(expected), L"%lsrestic_stats_My_Repo___5e395062_d_e_f.md", temp);
+    EXPECT_WSTR_EQ(path, expected, "Forbidden characters become underscores");
+
+    /* Long names are cut, the result stays well inside MAX_PATH */
+    char long_id[120];
+    memset(long_id, 'a', sizeof(long_id) - 1);
+    long_id[sizeof(long_id) - 1] = '\0';
+    EXPECT_TRUE(restic_report_build_temp_path(L"A-Very-Long-Alias-Name-That-Goes-On-And-On",
+                                              long_id, L"\\sub", path, _countof(path)) != FALSE,
+                "A long alias is accepted");
+    EXPECT_TRUE(wcslen(path) < 120, "The generated name is bounded");
+    EXPECT_TRUE(wcschr(path, L'/') == NULL, "Path separators inside names are replaced");
+
+    WCHAR tiny[8] = {0};
+    EXPECT_TRUE(restic_report_build_temp_path(L"BackupLocale", NULL, NULL, tiny, _countof(tiny)) == FALSE,
+                "A buffer that is too small is refused");
+    EXPECT_TRUE(restic_report_build_temp_path(NULL, NULL, NULL, path, _countof(path)) == FALSE,
+                "A NULL alias is refused");
+    EXPECT_TRUE(restic_report_build_temp_path(L"", NULL, NULL, path, _countof(path)) == FALSE,
+                "An empty alias is refused");
+    EXPECT_TRUE(restic_report_build_temp_path(L"Repo", NULL, NULL, NULL, 0) == FALSE,
+                "A NULL buffer is refused");
+}
+
+/* Another process (an open Lister) holding an earlier report must not break the next one */
+static void test_pick_destination(void) {
+    WCHAR path[MAX_PATH];
+    EXPECT_TRUE(restic_report_build_temp_path(L"PickRepo", "aa11bb22", NULL, path, _countof(path)) != FALSE,
+                "Build a report path");
+    WCHAR original[MAX_PATH];
+    wcscpy_s(original, _countof(original), path);
+    DeleteFileW(path);
+
+    WCHAR probe[MAX_PATH];
+    wcscpy_s(probe, _countof(probe), path);
+    EXPECT_TRUE(restic_report_pick_destination(probe, _countof(probe)) != FALSE &&
+                    wcscmp(probe, original) == 0,
+                "A missing file keeps its name");
+
+    /* An open reader without FILE_SHARE_DELETE is what a Lister may look like */
+    EXPECT_TRUE(write_text_file(path, "first", 5) != FALSE, "Create the earlier report");
+    HANDLE reader = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    EXPECT_TRUE(reader != INVALID_HANDLE_VALUE, "Hold the earlier report open");
+    wcscpy_s(probe, _countof(probe), path);
+    EXPECT_TRUE(restic_report_pick_destination(probe, _countof(probe)) != FALSE, "A free name is found");
+    WCHAR expected[MAX_PATH];
+    wcscpy_s(expected, _countof(expected), original);
+    expected[wcslen(expected) - 3] = L'\0';
+    wcscat_s(expected, _countof(expected), L" (2).md");
+    EXPECT_WSTR_EQ(probe, expected, "The name gets a \" (2)\" suffix before the extension");
+
+    /* The suffixed name is busy too: the next number is used */
+    EXPECT_TRUE(write_text_file(probe, "second", 6) != FALSE, "Create the second report");
+    HANDLE reader2 = CreateFileW(probe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+    EXPECT_TRUE(reader2 != INVALID_HANDLE_VALUE, "Hold the second report open");
+    WCHAR third[MAX_PATH];
+    wcscpy_s(third, _countof(third), path);
+    EXPECT_TRUE(restic_report_pick_destination(third, _countof(third)) != FALSE &&
+                    wcsstr(third, L" (3).md") != NULL,
+                "...and the next free number is chosen");
+    CloseHandle(reader2);
+    DeleteFileW(probe);
+
+    /* Once the reader is gone the original name is usable again, and a read-only file is no problem */
+    CloseHandle(reader);
+    SetFileAttributesW(path, FILE_ATTRIBUTE_READONLY);
+    wcscpy_s(probe, _countof(probe), path);
+    EXPECT_TRUE(restic_report_pick_destination(probe, _countof(probe)) != FALSE &&
+                    wcscmp(probe, original) == 0,
+                "A closed (even read-only) file is simply replaced");
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(path);
+
+    EXPECT_TRUE(restic_report_pick_destination(NULL, 0) == FALSE &&
+                    restic_report_pick_destination(probe, 0) == FALSE,
+                "Invalid arguments are refused");
+}
+
+/* Launches a stand-in for TOTALCMD64.EXE (a batch file) and checks the command line it receives */
+static void test_lister_launch_command_line(void) {
+    WCHAR dir[MAX_PATH], bat[MAX_PATH], log[MAX_PATH], report[MAX_PATH];
+    GetTempPathW(MAX_PATH, dir);
+    swprintf_s(bat, _countof(bat), L"%ls~rp_fake_tc.bat", dir);
+    swprintf_s(log, _countof(log), L"%ls~rp_fake_tc.log", dir);
+    swprintf_s(report, _countof(report), L"%lsrestic stats [x] (2).md", dir);
+    DeleteFileW(log);
+
+    char script[MAX_PATH * 3];
+    char log_a[MAX_PATH];
+    WideCharToMultiByte(CP_ACP, 0, log, -1, log_a, sizeof(log_a), NULL, NULL);
+    (void)snprintf(script, sizeof(script), "@echo off\r\n>\"%s\" echo %%*\r\n", log_a);
+    EXPECT_TRUE(write_text_file(bat, script, strlen(script)) != FALSE, "Write the stand-in executable");
+
+    WCHAR saved[MAX_PATH] = {0};
+    const DWORD had = GetEnvironmentVariableW(L"COMMANDER_EXE", saved, _countof(saved));
+    SetEnvironmentVariableW(L"RESTIC_WFX_NO_LISTER_GUI", NULL);
+    restic_report_set_lister_test_hook(NULL);
+    SetEnvironmentVariableW(L"COMMANDER_EXE", bat);
+
+    EXPECT_TRUE(restic_report_open_in_lister(report) != FALSE, "The stand-in is started");
+    char seen[512] = {0};
+    for (int i = 0; i < 100 && seen[0] == '\0'; ++i) { /* The process is not waited for */
+        Sleep(50);
+        char* content = read_file_utf8(log);
+        if (content != NULL) {
+            strncpy_s(seen, sizeof(seen), content, _TRUNCATE);
+            free(content);
+        }
+    }
+    EXPECT_TRUE(strstr(seen, "/S=L") != NULL, "Total Commander is asked to start the Lister (/S=L)");
+    EXPECT_TRUE(strstr(seen, "\"") != NULL && strstr(seen, "restic stats [x] (2).md") != NULL,
+                "...on the full report path, quoted because it contains spaces");
+
+    /* A host that does not exist is reported, not ignored */
+    SetEnvironmentVariableW(L"COMMANDER_EXE", L"C:\\no\\such\\dir\\totalcmd64.exe");
+    EXPECT_TRUE(restic_report_open_in_lister(report) == FALSE, "A missing executable makes the call fail");
+
+    SetEnvironmentVariableW(L"COMMANDER_EXE", had > 0 && had < _countof(saved) ? saved : NULL);
+    DeleteFileW(bat);
+    DeleteFileW(log);
+}
+
+static void test_lister_opening(void) {
+    restic_report_set_lister_test_hook(NULL);
+    EXPECT_TRUE(restic_report_open_in_lister(NULL) == FALSE, "A NULL path is refused");
+    EXPECT_TRUE(restic_report_open_in_lister(L"") == FALSE, "An empty path is refused");
+
+    /* The hook replaces the real launch, so no window is opened by the tests */
+    g_lister_calls = 0;
+    g_lister_path[0] = L'\0';
+    restic_report_set_lister_test_hook(lister_hook);
+    EXPECT_TRUE(restic_report_open_in_lister(L"C:\\Temp\\restic_stats_x.md") != FALSE,
+                "The hook reports success");
+    EXPECT_U64_EQ(g_lister_calls, 1, "The hook is called once");
+    EXPECT_WSTR_EQ(g_lister_path, L"C:\\Temp\\restic_stats_x.md", "The hook receives the report path");
+
+    restic_report_set_lister_test_hook(failing_lister_hook);
+    EXPECT_TRUE(restic_report_open_in_lister(L"C:\\Temp\\restic_stats_x.md") == FALSE,
+                "A failing hook makes the call fail");
+
+    /* Without a hook the environment variable suppresses the GUI launch */
+    restic_report_set_lister_test_hook(NULL);
+    SetEnvironmentVariableW(L"RESTIC_WFX_NO_LISTER_GUI", L"1");
+    EXPECT_TRUE(restic_report_open_in_lister(L"C:\\Temp\\restic_stats_x.md") != FALSE,
+                "RESTIC_WFX_NO_LISTER_GUI=1 suppresses the window");
+    SetEnvironmentVariableW(L"RESTIC_WFX_NO_LISTER_GUI", NULL);
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -1094,9 +1393,10 @@ static void test_live_report_generation(void) {
                 "The fixture snapshot is listed");
     free(items);
 
-    GetTempPathW(MAX_PATH, dest);
-    wcscat_s(dest, MAX_PATH, L"~rp_live_report.html");
+    EXPECT_TRUE(restic_report_build_temp_path(L"LiveRepo", NULL, NULL, dest, MAX_PATH) != FALSE,
+                "The repository report path is built");
     DeleteFileW(dest);
+    restic_report_clear_cache();
 
     ProgressRecorder recorder;
     memset(&recorder, 0, sizeof(recorder));
@@ -1105,17 +1405,39 @@ static void test_live_report_generation(void) {
     res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", NULL, NULL, dest, NULL,
                                  live_progress_callback, &recorder, err, _countof(err));
     EXPECT_TRUE(res == RESTIC_OK, "The repository report is generated");
-    char* html = read_file_utf8(dest);
-    EXPECT_TRUE(html != NULL, "The repository report exists");
-    EXPECT_TRUE(strstr(html, "Restic repository report") != NULL, "Repository headline");
-    EXPECT_TRUE(strstr(html, "LiveRepo") != NULL, "The alias appears in the report");
-    EXPECT_TRUE(strstr(html, "Snapshot history") != NULL && strstr(html, snapshot_id) != NULL,
+    char* md = read_file_utf8(dest);
+    EXPECT_TRUE(md != NULL, "The repository report exists");
+    EXPECT_TRUE(strstr(md, "Restic repository report") != NULL, "Repository headline");
+    EXPECT_TRUE(strstr(md, "LiveRepo") != NULL, "The alias appears in the report");
+    EXPECT_TRUE(strstr(md, "Snapshot history") != NULL && strstr(md, snapshot_id) != NULL,
                 "The snapshot appears in the history");
-    EXPECT_TRUE(strstr(html, "Deduplication factor") != NULL, "Storage statistics were read");
-    EXPECT_TRUE(strstr(html, "</html>") != NULL, "The document is complete");
-    free(html);
+    EXPECT_TRUE(strstr(md, "Deduplication factor") != NULL, "Storage statistics were read");
+    EXPECT_TRUE(strstr(md, "| :---") != NULL && strstr(md, "<!DOCTYPE") == NULL,
+                "The document is a complete Markdown document");
+    free(md);
     EXPECT_TRUE(recorder.calls > 0 && recorder.last_percent >= 80,
                 "Progress is reported up to the write phase");
+
+    /* The same request right after the previous one is answered from the RAM cache: only the first
+       5 % step of the generation is reported, no restic.exe process runs */
+    recorder.calls        = 0;
+    recorder.last_percent = 0;
+    res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", NULL, NULL, dest, NULL,
+                                 live_progress_callback, &recorder, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && recorder.calls == 1,
+                "A repeated request is served from the report cache without running restic.exe");
+    char* cached_md = read_file_utf8(dest);
+    EXPECT_TRUE(cached_md != NULL && strstr(cached_md, "## Snapshot history") != NULL,
+                "The cached document is written to the destination");
+    free(cached_md);
+
+    /* Clearing the cache forces a real generation again */
+    restic_report_clear_cache();
+    recorder.calls = 0;
+    res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", NULL, NULL, dest, NULL,
+                                 live_progress_callback, &recorder, err, _countof(err));
+    EXPECT_TRUE(res == RESTIC_OK && recorder.calls > 1,
+                "After restic_report_clear_cache the report is generated again");
 
     /* Level 2: snapshot report */
     recorder.calls        = 0;
@@ -1123,13 +1445,13 @@ static void test_live_report_generation(void) {
     res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", snapshot_id, NULL, dest,
                                  NULL, live_progress_callback, &recorder, err, _countof(err));
     EXPECT_TRUE(res == RESTIC_OK, "The snapshot report is generated");
-    html = read_file_utf8(dest);
-    EXPECT_TRUE(html != NULL, "The snapshot report exists");
-    EXPECT_TRUE(strstr(html, "Restic snapshot report") != NULL, "Snapshot headline");
-    EXPECT_TRUE(strstr(html, "Files and directories") != NULL, "The summary was read");
-    EXPECT_TRUE(strstr(html, "Initial snapshot") != NULL, "No parent: the diff is explained");
-    EXPECT_TRUE(strstr(html, "Compression ratio") != NULL, "Live storage statistics were read");
-    free(html);
+    md = read_file_utf8(dest);
+    EXPECT_TRUE(md != NULL, "The snapshot report exists");
+    EXPECT_TRUE(strstr(md, "Restic snapshot report") != NULL, "Snapshot headline");
+    EXPECT_TRUE(strstr(md, "Files and directories") != NULL, "The summary was read");
+    EXPECT_TRUE(strstr(md, "Initial snapshot") != NULL, "No parent: the diff is explained");
+    EXPECT_TRUE(strstr(md, "Compression ratio") != NULL, "Live storage statistics were read");
+    free(md);
 
     /* Level 3: subfolder report */
     WCHAR subpath[MAX_PATH];
@@ -1137,16 +1459,17 @@ static void test_live_report_generation(void) {
     res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", snapshot_id, subpath,
                                  dest, NULL, live_progress_callback, &recorder, err, _countof(err));
     EXPECT_TRUE(res == RESTIC_OK, "The folder report is generated");
-    html = read_file_utf8(dest);
-    EXPECT_TRUE(html != NULL, "The folder report exists");
-    EXPECT_TRUE(strstr(html, "Restic folder report") != NULL, "Folder headline");
-    EXPECT_TRUE(strstr(html, "readme.txt") != NULL, "Small file listed");
-    EXPECT_TRUE(strstr(html, "big.bin") != NULL, "Largest file listed");
-    EXPECT_TRUE(strstr(html, "Size by subfolder") != NULL && strstr(html, "sub") != NULL,
+    md = read_file_utf8(dest);
+    EXPECT_TRUE(md != NULL, "The folder report exists");
+    EXPECT_TRUE(strstr(md, "Restic folder report") != NULL, "Folder headline");
+    EXPECT_TRUE(strstr(md, "readme.txt") != NULL, "Small file listed");
+    EXPECT_TRUE(strstr(md, "big.bin") != NULL, "Largest file listed");
+    EXPECT_TRUE(strstr(md, "Size by subfolder") != NULL && strstr(md, "sub") != NULL,
                 "The subfolder is aggregated");
-    EXPECT_TRUE(strstr(html, ".3dm") != NULL, "The extension table is filled");
-    EXPECT_TRUE(count_occurrences(html, "\xE2\x96\x88") > 0, "Bars are drawn");
-    free(html);
+    EXPECT_TRUE(strstr(md, ".3dm") != NULL, "The extension table is filled");
+    EXPECT_TRUE(count_occurrences(md, "#") > 0 && count_occurrences(md, "[") > 0,
+                "ASCII bars are drawn");
+    free(md);
 
     /* A second backup: the snapshot now has a parent, so its report carries the diff */
     swprintf_s(path, _countof(path), L"%ls\\readme.txt", data);
@@ -1170,14 +1493,14 @@ static void test_live_report_generation(void) {
     EXPECT_TRUE(res == RESTIC_OK, "The report of a snapshot with a parent is generated");
     EXPECT_TRUE((GetFileAttributesW(dest) & FILE_ATTRIBUTE_READONLY) == 0,
                 "A read-only earlier copy is replaced");
-    html = read_file_utf8(dest);
-    EXPECT_TRUE(html != NULL, "The snapshot report exists");
-    EXPECT_TRUE(strstr(html, "Parent snapshot") != NULL && strstr(html, "Modified files") != NULL,
+    md = read_file_utf8(dest);
+    EXPECT_TRUE(md != NULL, "The snapshot report exists");
+    EXPECT_TRUE(strstr(md, "Parent snapshot") != NULL && strstr(md, "Modified files") != NULL,
                 "The diff summary is present");
-    EXPECT_TRUE(strstr(html, "[M]") != NULL && strstr(html, "readme.txt") != NULL,
+    EXPECT_TRUE(strstr(md, "[M]") != NULL && strstr(md, "readme.txt") != NULL,
                 "The modified file is listed");
-    EXPECT_TRUE(strstr(html, "Initial snapshot") == NULL, "...and the report is not the initial one");
-    free(html);
+    EXPECT_TRUE(strstr(md, "Initial snapshot") == NULL, "...and the report is not the initial one");
+    free(md);
 
     /* ESC during generation aborts and leaves the destination untouched */
     EXPECT_TRUE(write_text_file(dest, "keep", 4) != FALSE, "Pre-create the destination");
@@ -1187,14 +1510,15 @@ static void test_live_report_generation(void) {
     res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", NULL, NULL, dest, NULL,
                                  live_progress_callback, &recorder, err, _countof(err));
     EXPECT_TRUE(res == RESTIC_ERR_CANCELLED, "A user abort cancels the generation");
-    html = read_file_utf8(dest);
-    EXPECT_TRUE(html != NULL && strcmp(html, "keep") == 0,
+    md = read_file_utf8(dest);
+    EXPECT_TRUE(md != NULL && strcmp(md, "keep") == 0,
                 "A cancelled generation does not replace an existing file");
-    free(html);
+    free(md);
     DeleteFileW(dest);
 
     /* ESC while a secondary `restic stats` runs must abort the report, not blank one of its blocks */
     {
+        restic_report_clear_cache(); /* The same request must really run restic.exe again */
         ResticExecOptions cancel_options = {0, cancel_when_flagged, NULL};
         g_cancel_flag                    = 0;
         res = restic_report_generate(restic_bin, repo, password, L"LiveRepo", NULL, NULL, dest,
@@ -1237,22 +1561,29 @@ int main(void) {
     _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
 #endif
-    printf("Running Restic HTML statistics report tests...\n");
+    printf("Running Restic Markdown statistics report tests...\n");
 
-    test_unicode_bar_formatting();
+    test_ascii_bar_formatting();
     test_number_and_time_formatting();
-    test_html_escaping();
-    test_status_info_filtering();
+    test_markdown_text_escaping();
+    test_f3_panel_path_parsing();
+    test_f3_path_guard_scan();
+    test_f3_request_marker();
+    test_f3_native_view_request();
+    test_f3_panel_list_class();
+    test_f3_hook_lifecycle();
     test_storage_json_parsing();
     test_diff_parsing();
     test_folder_aggregation();
     test_folder_extensions_and_truncation();
     test_folder_remainder_rows();
-    test_html_report_generation();
+    test_folder_root_must_be_a_directory();
+    test_markdown_report_generation();
     test_location_redaction();
-    test_prepend_entry();
-    test_report_path_detection();
-    test_virtual_file_entry();
+    test_report_temp_path();
+    test_pick_destination();
+    test_lister_opening();
+    test_lister_launch_command_line();
     test_live_report_generation();
 
 #if defined(_DEBUG) && !defined(__SANITIZE_ADDRESS__)

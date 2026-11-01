@@ -8,10 +8,10 @@ EXPORTS
     FsFindNext
     FsFindNextW
     FsFindClose
-    FsStatusInfo
-    FsStatusInfoW
     FsGetFile
     FsGetFileW
+    FsExecuteFile
+    FsExecuteFileW
     FsContentGetSupportedField
     FsContentGetValue
     FsContentGetValueW

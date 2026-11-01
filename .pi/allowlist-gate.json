@@ -37,7 +37,9 @@
     "shell:python *",
     "shell:od *",
     "shell:python - <<'PY' *",
-    "edit:tmp *"
+    "edit:tmp *",
+    "shell:sort *",
+    "edit:tmp/ *"
   ],
   "deny": []
 }
