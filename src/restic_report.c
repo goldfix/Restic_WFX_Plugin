@@ -29,6 +29,9 @@
 #define BAR_EMPTY_CHAR  '.'
 /* Width used by every table of the reports */
 #define BAR_WIDTH 20
+#define BAR_MAX_WIDTH 40
+/* A bar is `[` + blocks + `]` inside backticks: BAR_WIDTH + 4 characters */
+#define BAR_CELL_WIDTH (BAR_WIDTH + 4)
 
 /* Largest value Total Commander can display as a signed 64-bit number */
 #define REPORT_COUNTER_MAX 9223372036854775807.0
@@ -140,7 +143,7 @@ void restic_report_format_bar(char* out, size_t out_capacity, double ratio, int 
     if (out == NULL || out_capacity == 0) return;
     out[0] = '\0';
     if (width <= 0) width = 1;
-    if (width > 40) width = 40;
+    if (width > BAR_MAX_WIDTH) width = BAR_MAX_WIDTH;
     if (ratio < 0.0) ratio = 0.0;
     if (ratio > 1.0) ratio = 1.0;
 
@@ -148,14 +151,20 @@ void restic_report_format_bar(char* out, size_t out_capacity, double ratio, int 
     if (ratio > 0.0 && filled == 0) filled = 1; /* Never show an empty bar for a non-zero value */
     if (filled > width) filled = width;
 
-    size_t pos = 0;
-    if (pos + 1 < out_capacity) out[pos++] = '[';
-    for (int i = 0; i < width; ++i) {
-        if (pos + 2 >= out_capacity) break;
-        out[pos++] = (i < filled) ? BAR_FILLED_CHAR : BAR_EMPTY_CHAR;
-    }
-    if (pos + 1 < out_capacity) out[pos++] = ']';
-    out[pos] = '\0';
+    /* Backticks make the bar a Markdown code span: monospace, so the bars of a column line up in a
+       rendered document as they do in plain text. Built in full, then truncated to the buffer. */
+    char full[BAR_MAX_WIDTH + 5];
+    size_t n = 0;
+    full[n++] = '`';
+    full[n++] = '[';
+    for (int i = 0; i < width; ++i) full[n++] = (i < filled) ? BAR_FILLED_CHAR : BAR_EMPTY_CHAR;
+    full[n++] = ']';
+    full[n++] = '`';
+    full[n]   = '\0';
+
+    if (n >= out_capacity) n = out_capacity - 1;
+    memcpy(out, full, n);
+    out[n] = '\0';
 }
 
 void restic_report_format_bytes(unsigned long long bytes, char* out, size_t out_capacity) {
@@ -720,7 +729,7 @@ static const MdColumn kHistoryColumns[] = {
     {"Files", 7, TRUE},
     {"Size", 10, TRUE},
     {"Data added", 10, TRUE},
-    {"Growth", BAR_WIDTH + 2, FALSE}
+    {"Growth", BAR_CELL_WIDTH, FALSE}
 };
 
 void restic_report_write_repo_md(FILE* fp, const ResticReportRepo* report) {
@@ -760,7 +769,7 @@ void restic_report_write_repo_md(FILE* fp, const ResticReportRepo* report) {
         char files[32] = "-";
         char size[32]  = "-";
         char added[32] = "-";
-        char bar[BAR_WIDTH + 4];
+        char bar[BAR_CELL_WIDTH + 1];
         snapshot_time_text(info, when, sizeof(when));
         double ratio = 0.0;
         if (info->has_summary) { /* Snapshots written without a summary have no figures */
@@ -800,7 +809,7 @@ static const MdColumn kCategoryColumns[] = {
     {"Category", 20, FALSE},
     {"Count", 9, TRUE},
     {"Share", 7, TRUE},
-    {"Distribution", BAR_WIDTH + 2, FALSE}
+    {"Distribution", BAR_CELL_WIDTH, FALSE}
 };
 
 /* Writes one "new / changed / unmodified" row with its share and bar */
@@ -808,7 +817,7 @@ static void write_category_row(FILE* fp, const char* label, unsigned long long v
                                unsigned long long total) {
     char count[32];
     char share[32];
-    char bar[BAR_WIDTH + 4];
+    char bar[BAR_CELL_WIDTH + 1];
     const double percent = percentage_of(value, total);
 
     restic_report_format_uint(value, count, sizeof(count));
@@ -969,14 +978,14 @@ static const MdColumn kSubdirColumns[] = {
     {"Size", 10, TRUE},
     {"Share", 7, TRUE},
     {"Files", 7, TRUE},
-    {"Bar", BAR_WIDTH + 2, FALSE},
+    {"Bar", BAR_CELL_WIDTH, FALSE},
     {"Name", 5, FALSE}
 };
 static const MdColumn kExtensionColumns[] = {
     {"Size", 10, TRUE},
     {"Share", 7, TRUE},
     {"Files", 7, TRUE},
-    {"Bar", BAR_WIDTH + 2, FALSE},
+    {"Bar", BAR_CELL_WIDTH, FALSE},
     {"Extension", 5, FALSE}
 };
 
@@ -986,7 +995,7 @@ static void write_share_row(FILE* fp, const MdColumn* columns, unsigned long lon
     char size_text[64];
     char percent_text[32];
     char count_text[32];
-    char bar[BAR_WIDTH + 4];
+    char bar[BAR_CELL_WIDTH + 1];
     const double share = percentage_of(size, total);
 
     restic_report_format_bytes(size, size_text, sizeof(size_text));
@@ -1004,7 +1013,7 @@ static const MdColumn kHistogramColumns[] = {
     {"Files", 7, TRUE},
     {"Share", 7, TRUE},
     {"Total size", 11, TRUE},
-    {"Distribution", BAR_WIDTH + 2, FALSE}
+    {"Distribution", BAR_CELL_WIDTH, FALSE}
 };
 
 /* Column layout of the "largest files" table */
@@ -1103,7 +1112,7 @@ void restic_report_write_subtree_md(FILE* fp, const ResticReportSubtree* report)
         const double share = percentage_of(folder->hist_files[i], folder->total_files);
         char files_text[32];
         char percent_text[32];
-        char bar[BAR_WIDTH + 4];
+        char bar[BAR_CELL_WIDTH + 1];
         restic_report_format_bytes(folder->hist_bytes[i], size_text, sizeof(size_text));
         restic_report_format_uint(folder->hist_files[i], files_text, sizeof(files_text));
         (void)snprintf(percent_text, sizeof(percent_text), "%.1f%%", share);
@@ -1262,9 +1271,9 @@ BOOL restic_report_open_in_lister(const WCHAR* local_report_path) {
     const size_t cmd_chars = wcslen(tc_exe) + wcslen(local_report_path) + 16;
     WCHAR* cmd_line        = (WCHAR*)malloc(cmd_chars * sizeof(WCHAR));
     if (cmd_line == NULL) return FALSE;
-    /* /S=L starts the Lister, ":T7" forces its internal UTF-8 text mode: a third-party Lister
-       plugin registered for .md (for example a PDF reader) must not intercept the report */
-    if (swprintf_s(cmd_line, cmd_chars, L"\"%ls\" /S=L:T7 \"%ls\"", tc_exe, local_report_path) < 0) {
+    /* /S=L starts the Lister, which picks the viewer as for any file: a Lister plugin registered for
+       .md (a Markdown renderer) is used when present, the internal text mode otherwise */
+    if (swprintf_s(cmd_line, cmd_chars, L"\"%ls\" /S=L \"%ls\"", tc_exe, local_report_path) < 0) {
         free(cmd_line);
         return FALSE;
     }
