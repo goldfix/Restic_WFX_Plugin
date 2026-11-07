@@ -150,17 +150,18 @@ static void test_ascii_bar_formatting(void) {
     char bar[256];
 
     restic_report_format_bar(bar, sizeof(bar), 0.0, 10);
-    EXPECT_TRUE(bar[0] == '[' && bar[strlen(bar) - 1] == ']', "A bar is enclosed in brackets");
+    EXPECT_TRUE(bar[0] == '`' && bar[1] == '[' && bar[strlen(bar) - 2] == ']' && bar[strlen(bar) - 1] == '`',
+                "A bar is a code span enclosing brackets");
     EXPECT_U64_EQ(count_occurrences(bar, "#"), 0, "0 % shows no filled block");
     EXPECT_U64_EQ(count_occurrences(bar, "."), 10, "0 % shows ten empty blocks");
-    EXPECT_STR_EQ(bar, "[..........]", "Only ASCII characters are used");
+    EXPECT_STR_EQ(bar, "`[..........]`", "Only ASCII characters are used");
 
     restic_report_format_bar(bar, sizeof(bar), 0.001, 10);
     EXPECT_U64_EQ(count_occurrences(bar, "#"), 1, "A tiny ratio still shows one block");
 
     restic_report_format_bar(bar, sizeof(bar), 0.5, 10);
     EXPECT_U64_EQ(count_occurrences(bar, "#"), 5, "Half full bar has half the blocks");
-    EXPECT_STR_EQ(bar, "[#####.....]", "Half bar rendering");
+    EXPECT_STR_EQ(bar, "`[#####.....]`", "Half bar rendering");
 
     restic_report_format_bar(bar, sizeof(bar), 1.0, 10);
     EXPECT_U64_EQ(count_occurrences(bar, "#"), 10, "100 % fills the bar");
@@ -174,9 +175,9 @@ static void test_ascii_bar_formatting(void) {
     /* Degenerate parameters must never overrun or produce an unterminated string */
     restic_report_format_bar(bar, sizeof(bar), 0.5, 0);
     EXPECT_TRUE(strlen(bar) > 0, "A zero width still produces a valid bar");
-    /* The bar never exceeds 40 blocks plus the brackets, whatever the buffer */
+    /* The bar never exceeds 40 blocks plus brackets and backticks, whatever the buffer */
     restic_report_format_bar(bar, sizeof(bar), 0.5, 1000);
-    EXPECT_TRUE(strlen(bar) == 42, "The width is capped to 40 blocks");
+    EXPECT_TRUE(strlen(bar) == 44, "The width is capped to 40 blocks");
     restic_report_format_bar(bar, 3, 0.5, 10);
     EXPECT_TRUE(strlen(bar) < 3, "A tiny buffer stays within bounds");
     restic_report_format_bar(NULL, 0, 0.5, 10);
@@ -964,6 +965,24 @@ static void test_markdown_report_generation(void) {
                 "Growth bars are drawn with ASCII blocks");
     EXPECT_TRUE(strstr(md, "\xE2\x96\x88") == NULL && strstr(md, "\xE2\x96\x91") == NULL,
                 "No Unicode block character survives");
+    EXPECT_TRUE(strstr(md, "`[") != NULL && strstr(md, "]`") != NULL,
+                "Growth bars are Markdown code spans (monospace in a rendered document)");
+    {
+        /* Every row of the history table has the same width, so the columns line up as plain text */
+        const char* table = strstr(md, "| Short ID");
+        size_t first_width = 0;
+        int rows = 0;
+        BOOL all_equal = TRUE;
+        while (table != NULL && *table == '|') {
+            const char* eol = strchr(table, '\n');
+            const size_t width = (eol != NULL) ? (size_t)(eol - table) : strlen(table);
+            if (first_width == 0) first_width = width;
+            if (width != first_width) all_equal = FALSE;
+            ++rows;
+            table = (eol != NULL) ? eol + 1 : NULL;
+        }
+        EXPECT_TRUE(rows >= 5 && all_equal, "History table rows (header, alignment, snapshots) have equal width");
+    }
     free(md);
 
     static ResticReportDiff diff;
@@ -1257,6 +1276,7 @@ static void test_lister_launch_command_line(void) {
         }
     }
     EXPECT_TRUE(strstr(seen, "/S=L") != NULL, "Total Commander is asked to start the Lister (/S=L)");
+    EXPECT_TRUE(strstr(seen, ":T") == NULL, "No Lister mode is forced: a Markdown Lister plugin may render the report");
     EXPECT_TRUE(strstr(seen, "\"") != NULL && strstr(seen, "restic stats [x] (2).md") != NULL,
                 "...on the full report path, quoted because it contains spaces");
 

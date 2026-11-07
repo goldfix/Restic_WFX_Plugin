@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX64-orange.svg" alt="Total Commander WFX64" />
-  <img src="https://img.shields.io/badge/Version-1.3.2-success.svg" alt="Version: 1.3.2" />
+  <img src="https://img.shields.io/badge/Version-1.3.3-success.svg" alt="Version: 1.3.3" />
 </p>
 
 ---
@@ -289,11 +289,12 @@ leaves any earlier copy untouched.
 ### About the report
 
 - The format is **Markdown**: pipe tables aligned with monospace padding and bars drawn with `#` and
-  `.` (`[##########..........]`), so the document is perfectly readable as plain text in the built-in
-  Lister and renders as a formatted document in a Markdown Lister plugin or an external editor.
-- The report is opened with Total Commander's own Lister (`"<TOTALCMD64.EXE>" /S=L:T7 "<file>"`); `:T7`
-  forces the internal UTF-8 text mode, so a third-party Lister plugin registered for `.md` cannot
-  intercept it. Close it with `ESC`. If `%COMMANDER_EXE%` is not available the plugin falls back to the
+  `.` inside a code span (`` `[##########..........]` ``), so the document is readable as plain text in
+  the built-in Lister and renders as a formatted document, with the bars aligned in monospace, in a
+  Markdown Lister plugin or an external editor.
+- The report is opened with Total Commander's own Lister (`"<TOTALCMD64.EXE>" /S=L "<file>"`), exactly
+  like any other `.md` file: if you have a Lister plugin that renders Markdown, it is used; otherwise the
+  built-in text view is shown. Close it with `ESC`. If `%COMMANDER_EXE%` is not available the plugin falls back to the
   host module path, and `RESTIC_WFX_NO_LISTER_GUI=1` suppresses the window entirely (used by the
   automated tests). If the Lister of an earlier report still has the file open, the new report gets a
   free name (`... (2).md`) instead of failing.

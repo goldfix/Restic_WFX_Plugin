@@ -2,6 +2,15 @@
 
 All notable changes to the Restic WFX plugin.
 
+## [1.3.3] — 2026-11-07
+
+### Changed
+
+- The bars of the statistics report are written as code (`` `[##....]` ``), so a Markdown renderer shows them in
+  monospace and keeps them aligned.
+- The report is no longer forced into the Lister's text mode: a Lister plugin that renders Markdown is used when
+  installed, and the built-in text view remains the fallback.
+
 ## [1.3.2] — 2026-11-01
 
 Reworks the statistics report introduced in 1.3.0 and makes it reachable with `F3`.

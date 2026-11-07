@@ -189,7 +189,7 @@ void restic_report_finalize_folder(ResticReportFolder* folder);
 /* Formatting helpers (UTF-8 input/output, unit tested)                                        */
 /* ------------------------------------------------------------------------------------------ */
 
-/* Writes "[####....]", `width` characters wide, in pure ASCII (see format_bar). */
+/* Writes "`[####....]`" (a Markdown code span), `width` blocks wide, in pure ASCII. */
 void restic_report_format_bar(char* out, size_t out_capacity, double ratio, int width);
 
 /* Formats a byte count as "1.23 GB" (B, KB, MB, GB, TB). */
