@@ -370,7 +370,7 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
   - Format: `logo\restic_wfx.ico` linked into the plugin DLL (32-bit and 64-bit image, see §8.6) via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
   - Included frames inside `logo\restic_wfx.ico` (5 resolutions): **16×16, 24×24, 32×32, 48×48** (32-bit BGRA uncompressed BMP/DIB frames) plus **256×256** (32-bit RGBA PNG-compressed), built from `logo\logo_16x16.ico`, `logo\logo_24x24.ico`, `logo\logo_32x32.ico`, `logo\logo_48x48.ico`, and `logo\logo_256x256.png`.
 - **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
-- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.3.0` / `"1.3.3"`), embedded into the plugin DLL via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
+- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.4.0` / `"1.3.4"`), embedded into the plugin DLL via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
 
 ---
 
@@ -401,7 +401,7 @@ Restic_WFX_Plugin/
 │   ├── wfx_path.h              # Plugin-namespace path decomposition (WfxParsedPath)
 │   ├── wfx_status.h            # F3 hook, Path Guard core, request marker, cm_List hand-back
 │   ├── restic_report.h         # Statistics report: data model, parsers, Markdown writers, Lister
-│   └── version.h               # Single source of truth for plugin version macros (1.3.3)
+│   └── version.h               # Single source of truth for plugin version macros (1.3.4)
 ├── src/
 │   ├── main.c                  # DllMain, WFX entry points, virtual path routing
 │   ├── config.c                # restic_plugin.ini resolution & parsing
