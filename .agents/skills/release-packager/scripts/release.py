@@ -3,8 +3,8 @@
 
 Bumps every version reference in the repository, refreshes the documentation,
 builds and tests the plugin (Debug, /analyze, AddressSanitizer, Release) and
-creates the Total Commander installation ZIP (build/wfx_restic_<version>.zip), which
-contains both the 32-bit (restic.wfx) and the 64-bit (restic.wfx64) plugin.
+creates the two Total Commander installation ZIPs (build/wfx_restic_<version>_x64.zip with the 64-bit
+restic.wfx64 and build/wfx_restic_<version>_x86.zip with the 32-bit restic.wfx).
 
 Usage (from anywhere; the repository root is detected automatically):
     python .agents/skills/release-packager/scripts/release.py 1.1.0
@@ -32,19 +32,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 
 VERSION_H = ROOT / "include" / "version.h"
-PLUGINST = ROOT / "pluginst.inf"
+# One install manifest per architecture (each names the DLL of its own package)
+PLUGINST_FILES = {"x64": ROOT / "pluginst_x64.inf", "x86": ROOT / "pluginst_x86.inf"}
 PYPROJECT = ROOT / "pyproject.toml"
 README = ROOT / "README.md"
 AGENT_MD = ROOT / "AGENT.md"
 MEMORY_MD = ROOT / "MEMORY.md"
 BUILD_DIR = ROOT / "build"
 
-# Files that must be in the ZIP root (Total Commander looks for pluginst.inf there).
-# One package serves both architectures: restic.wfx (32-bit) and restic.wfx64 (64-bit)
-# share the base name, and pluginst.inf registers the base name only.
-ZIP_EXPECTED = {"pluginst.inf", "restic.wfx", "restic.wfx64", "restic_plugin.ini", "README.md", "LICENSE"}
-# DLLs inside the ZIP -> expected IMAGE_FILE_HEADER.Machine
-ZIP_DLLS = {"restic.wfx": 0x014C, "restic.wfx64": 0x8664}
+# One package per architecture; its files sit in the ZIP root (Total Commander looks for pluginst.inf there).
+# restic_plugin.ini is NOT packaged (it would overwrite the user's repositories on an upgrade); the commented
+# sample travels as restic_plugin.ini.sample, a name the plugin never reads.
+# architecture -> (DLL, expected IMAGE_FILE_HEADER.Machine)
+ZIP_ARCHES = {"x64": ("restic.wfx64", 0x8664), "x86": ("restic.wfx", 0x014C)}
+ZIP_SAMPLE = "restic_plugin.ini.sample"
+ZIP_COMMON = {"pluginst.inf", ZIP_SAMPLE, "README.md", "LICENSE"}
 
 # Build actions executed through build.sh, in order. `analyze` already builds and runs the whole Debug
 # suite (with /analyze on top), so a separate `test` run would only repeat it. `package` cleans, builds
@@ -113,9 +115,9 @@ def update_version_h(major: int, minor: int, patch: int, ver: str) -> str:
     return text
 
 
-def update_pluginst(ver: str) -> str:
-    text, _ = read_text(PLUGINST)
-    return sub_once(text, r"^version=.*$", f"version={ver}", "pluginst.inf version", re.MULTILINE)
+def update_pluginst(path: Path, ver: str) -> str:
+    text, _ = read_text(path)
+    return sub_once(text, r"^version=.*$", f"version={ver}", f"{path.name} version", re.MULTILINE)
 
 
 def update_pyproject(ver: str) -> str:
@@ -171,19 +173,19 @@ def update_memory(ver: str, notes: str, mode: str) -> str:
             heading,
             f"- **Objective:** Prepare release `v{ver}`.",
             "- **Changes:**",
-            f"  - Version bumped to `{ver}` in `include/version.h`, `pluginst.inf`, `pyproject.toml`, `README.md` (badge), `AGENT.md` and `MEMORY.md`.",
+            f"  - Version bumped to `{ver}` in `include/version.h`, `pluginst_x64.inf`, `pluginst_x86.inf`, `pyproject.toml`, `README.md` (badge), `AGENT.md` and `MEMORY.md`.",
         ]
         if mode == "full":
             entry.append("  - Debug tests, `/analyze`, AddressSanitizer and Release tests passed.")
         elif mode == "quick":
             entry.append("  - Release tests passed (`--skip-tests`: Debug, `/analyze` and ASan were not run).")
         if mode in ("full", "quick"):
-            entry.append(f"  - `build/wfx_restic_{ver}.zip` created and verified (ZIP contents, `pluginst.inf` version, PE machine type and `VERSIONINFO` of both DLLs).")
+            entry.append(f"  - `build/wfx_restic_{ver}_x64.zip` and `build/wfx_restic_{ver}_x86.zip` created and verified (ZIP contents with the INI sample but without `restic_plugin.ini`, `pluginst.inf` file name and version, PE machine type and `VERSIONINFO` of the DLL).")
         else:
             entry.append("  - Files and documentation only (`--no-build`): nothing was built, tested or packaged.")
         if notes:
             entry.append(f"  - Notes: {notes}")
-        entry.append(f"- **Next step:** upload `build/wfx_restic_{ver}.zip` to a GitHub Release tagged `v{ver}`.")
+        entry.append(f"- **Next step:** upload `build/wfx_restic_{ver}_x64.zip` and `build/wfx_restic_{ver}_x86.zip` to a GitHub Release tagged `{ver}` (the repository tags carry no `v` prefix).")
         text = text.rstrip("\n") + "\n" + "\n".join(entry) + "\n"
     return text
 
@@ -250,45 +252,47 @@ def pe_machine(path: Path) -> int:
     return int.from_bytes(data[offset + 4:offset + 6], "little")
 
 
-def verify_zip(ver: str) -> Path:
-    zip_path = BUILD_DIR / f"wfx_restic_{ver}.zip"
+def verify_zip(ver: str, arch: str) -> Path:
+    """Checks one architecture package and writes its .sha256; returns the ZIP path."""
+    dll_name, machine = ZIP_ARCHES[arch]
+    expected = ZIP_COMMON | {dll_name}
+    zip_path = BUILD_DIR / f"wfx_restic_{ver}_{arch}.zip"
     if not zip_path.is_file():
         raise SystemExit(f"Expected package not found: {zip_path}")
 
     with zipfile.ZipFile(zip_path) as zf:
         names = set(zf.namelist())
-        if names != ZIP_EXPECTED:
-            raise SystemExit(f"Unexpected ZIP contents.\n  missing: {sorted(ZIP_EXPECTED - names)}\n  extra: {sorted(names - ZIP_EXPECTED)}")
+        if names != expected:
+            raise SystemExit(f"Unexpected contents of {zip_path.name}.\n  missing: {sorted(expected - names)}\n  extra: {sorted(names - expected)}")
         if zf.testzip() is not None:
-            raise SystemExit("ZIP integrity check failed")
+            raise SystemExit(f"{zip_path.name}: ZIP integrity check failed")
 
-        inf = zf.read("pluginst.inf").decode("ascii", "replace")
-        # The manifest must register the base name: Total Commander appends 64 to the
-        # extension by itself when it runs as a 64-bit process.
-        for needle in ("[plugininstall]", "type=wfx", "file=restic.wfx", f"version={ver}"):
-            if needle not in inf:
-                raise SystemExit(f"pluginst.inf inside the ZIP lacks '{needle}'")
-        if "file=restic.wfx64" in inf:
-            raise SystemExit("pluginst.inf registers restic.wfx64 instead of the base name restic.wfx")
+        # The sample must be the repository's commented template, byte for byte
+        if zf.read(ZIP_SAMPLE) != (ROOT / "restic_plugin.ini").read_bytes():
+            raise SystemExit(f"{ZIP_SAMPLE} inside {zip_path.name} differs from restic_plugin.ini in the repository")
 
-        versions = []
+        # The manifest must name exactly the DLL of this package
+        lines = zf.read("pluginst.inf").decode("ascii", "replace").replace("\r\n", "\n").split("\n")
+        for needle in ("[plugininstall]", "type=wfx", f"file={dll_name}", f"version={ver}"):
+            if needle not in lines:
+                raise SystemExit(f"pluginst.inf inside {zip_path.name} lacks '{needle}'")
+        files = [line for line in lines if line.startswith("file=")]
+        if files != [f"file={dll_name}"]:
+            raise SystemExit(f"pluginst.inf inside {zip_path.name} must register only {dll_name}, found {files}")
+
         with tempfile.TemporaryDirectory() as tmp:
-            for name, machine in ZIP_DLLS.items():
-                dll = Path(tmp) / name
-                dll.write_bytes(zf.read(name))
-                found = pe_machine(dll)
-                if found != machine:
-                    raise SystemExit(f"{name} has PE machine {found:#06x}, expected {machine:#06x}")
-                versions.append(read_dll_version(dll))
-    if len(set(versions)) != 1:
-        raise SystemExit(f"The two DLLs carry different FileVersion values: {sorted(set(versions))}")
-    dll_version = versions[0]
+            dll = Path(tmp) / dll_name
+            dll.write_bytes(zf.read(dll_name))
+            found = pe_machine(dll)
+            if found != machine:
+                raise SystemExit(f"{dll_name} has PE machine {found:#06x}, expected {machine:#06x}")
+            dll_version = read_dll_version(dll)
     if dll_version != f"{ver}.0":
-        raise SystemExit(f"DLL FileVersion is {dll_version}, expected {ver}.0")
+        raise SystemExit(f"{dll_name} FileVersion is {dll_version}, expected {ver}.0")
 
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     (zip_path.parent / (zip_path.name + ".sha256")).write_text(f"{digest} *{zip_path.name}\n", encoding="ascii")
-    log(f"ZIP verified: {zip_path.name} ({zip_path.stat().st_size} bytes, x86 + x64), DLL FileVersion {dll_version}")
+    log(f"ZIP verified: {zip_path.name} ({zip_path.stat().st_size} bytes), DLL FileVersion {dll_version}")
     log(f"SHA-256: {digest}")
     return zip_path
 
@@ -306,17 +310,22 @@ def main() -> int:
 
     major, minor, patch = parse_version(args.version)
     ver = f"{major}.{minor}.{patch}"
+    # The release notes are written by hand: refuse (before touching any file) to build a release that has none.
+    # --dry-run and --no-build are the way to prepare the files first.
+    if not (args.dry_run or args.no_build) and f"## [{ver}]" not in (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"):
+        raise SystemExit(f"CHANGELOG.md has no '## [{ver}]' section: write it first (the script does not touch any file)")
     old = current_version()
     log(f"Repository: {ROOT}")
     log(f"Version: {old} -> {ver}")
 
     updates = {
         VERSION_H: (update_version_h(major, minor, patch, ver), read_text(VERSION_H)[1]),
-        PLUGINST: (update_pluginst(ver), read_text(PLUGINST)[1]),
         PYPROJECT: (update_pyproject(ver), read_text(PYPROJECT)[1]),
         README: (update_readme(ver), read_text(README)[1]),
         AGENT_MD: (update_agent(ver), read_text(AGENT_MD)[1]),
     }
+    for path in PLUGINST_FILES.values():
+        updates[path] = (update_pluginst(path, ver), read_text(path)[1])
     mode = "nobuild" if args.no_build else ("quick" if args.skip_tests else "full")
 
     for path, (new_text, newline) in updates.items():
@@ -344,9 +353,9 @@ def main() -> int:
     if args.mutation:
         actions.insert(actions.index("package"), MUTATION_ACTION)
     run_build(actions)
-    zip_path = verify_zip(ver)
+    zip_paths = [verify_zip(ver, arch) for arch in ZIP_ARCHES]
     finish_memory()
-    log(f"DONE. Upload {zip_path.relative_to(ROOT)} to a GitHub Release tagged v{ver}.")
+    log("DONE. Upload " + " and ".join(str(p.relative_to(ROOT)) for p in zip_paths) + f" to a GitHub Release tagged {ver}.")
     return 0
 
 

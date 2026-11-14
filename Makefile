@@ -14,7 +14,7 @@
 #   nmake /nologo test ASAN=1         -> Build and run unit tests with AddressSanitizer
 #   nmake /nologo analyze             -> Run MSVC static analysis (/analyze)
 #   nmake /nologo package             -> Build Release plugin and stage the install files
-#   nmake /nologo zip                 -> Create the install ZIP from both architectures
+#   nmake /nologo zip                 -> Create the two install ZIPs (x86, x64)
 #   nmake /nologo clean               -> Remove the artifacts of ARCH only
 #   nmake /nologo cleanall            -> Remove the whole build tree
 # ==============================================================================
@@ -61,7 +61,8 @@ RC_FILE         = src\restic_wfx.rc
 ICO_FILE        = logo\restic_wfx.ico
 INI_TEMPLATE    = restic_plugin.ini
 INI_OUT         = $(BUILD_DIR)\restic_plugin.ini
-PLUGINST_FILE   = pluginst.inf
+# One install manifest per architecture: it names the DLL that the package carries
+PLUGINST_FILE   = pluginst_$(ARCH_DIR).inf
 PLUGINST_OUT    = $(BUILD_DIR)\pluginst.inf
 
 CC   = cl.exe
@@ -211,7 +212,7 @@ analyze:
 package:
 	$(MAKE) /nologo ARCH=$(ARCH) CONFIG=Release all
 
-# Install package with both architectures (32-bit restic.wfx and 64-bit restic.wfx64)
+# Install packages: one ZIP per architecture (32-bit restic.wfx, 64-bit restic.wfx64)
 zip:
 	python tools\package.py
 
