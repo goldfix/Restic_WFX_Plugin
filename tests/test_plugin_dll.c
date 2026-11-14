@@ -327,10 +327,11 @@ static void test_export_surface(void) {
     GetPrivateProfileStringW(L"plugininstall", L"type", L"", infType, _countof(infType), PLUGIN_INF);
     GetPrivateProfileStringW(L"plugininstall", L"file", L"", infFile, _countof(infFile), PLUGIN_INF);
     GetPrivateProfileStringW(L"plugininstall", L"version", L"", infVer, _countof(infVer), PLUGIN_INF);
-    /* Each architecture has its own installer package, so its manifest names exactly the DLL it carries */
-    EXPECT_TRUE(wcscmp(infType, L"wfx") == 0 && wcscmp(infFile, PLUGIN_NAME) == 0 &&
+    /* The manifest registers the base name: Total Commander appends 64 to the extension
+       when it runs as a 64-bit process, so one installer serves both architectures */
+    EXPECT_TRUE(wcscmp(infType, L"wfx") == 0 && wcscmp(infFile, L"restic.wfx") == 0 &&
                 wcscmp(infVer, L"" RESTIC_WFX_PRODUCT_VER) == 0,
-                "Staged pluginst.inf has valid [plugininstall] type, the DLL file name of this architecture, and version");
+                "Staged pluginst.inf has valid [plugininstall] type, base file name, and version");
 
     FreeLibrary(m);
 }

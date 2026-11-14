@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""Creates the Total Commander installation packages of the Restic WFX plugin.
+"""Creates the Total Commander installation package of the Restic WFX plugin.
 
-One ZIP per architecture, because each one carries its own `pluginst.inf`:
+ONE ZIP carries both architectures, as the WFX SDK ("64-bit Support") describes: the 32-bit plugin is
+`restic.wfx`, the 64-bit one has the same base name with `64` appended to the extension, `restic.wfx64`, and
+both sit in the same folder. `pluginst.inf` registers the base name `restic.wfx`; a 64-bit Total Commander
+loads `restic.wfx64` automatically when it exists, a 32-bit one loads `restic.wfx`.
 
-    wfx_restic_<version>_x64.zip   pluginst.inf (file=restic.wfx64), restic.wfx64, restic_plugin.ini.sample, README.md, LICENSE
-    wfx_restic_<version>_x86.zip   pluginst.inf (file=restic.wfx),   restic.wfx,   restic_plugin.ini.sample, README.md, LICENSE
+    wfx_restic_<version>.zip:  pluginst.inf (file=restic.wfx), restic.wfx, restic.wfx64,
+                               restic_plugin.ini.sample, README.md, LICENSE
 
 `restic_plugin.ini` itself is deliberately NOT packaged: Total Commander extracts the archive over the existing
 plugin folder on an upgrade, and a shipped INI would overwrite the repositories the user configured. The
-commented sample travels as `restic_plugin.ini.sample`, a name the plugin never reads, so it can be extracted over
-and over without touching the real configuration (the user copies it to `restic_plugin.ini` once).
+commented sample travels as `restic_plugin.ini.sample`, a name the plugin never reads, so it can be extracted
+over and over without touching the real configuration (the user copies it to `restic_plugin.ini` once).
 
 Usage (from anywhere; the repository root is detected automatically):
-    python tools/package.py            # both architectures
-    python tools/package.py x64        # only the listed architecture(s)
+    python tools/package.py
 
-Preconditions: the Release DLL and the staged `pluginst.inf` of each requested architecture exist in
-`build\\<arch>` (i.e. `./build.sh package` ran). The script validates the staged files and the PE machine type
-of the DLL, then writes `build/wfx_restic_<version>_<arch>.zip` plus its `.sha256`.
+Preconditions: `build\\x64\\restic.wfx64` and `build\\x86\\restic.wfx` exist, each with the staged `pluginst.inf`
+and `restic_plugin.ini`, i.e. `./build.sh package` (Release build + tests of both architectures) has run.
+The script validates the staged files and the PE machine type of both DLLs, then writes
+`build/wfx_restic_<version>.zip` plus its `.sha256`.
 """
 from __future__ import annotations
 
@@ -33,18 +36,20 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION_H = ROOT / "include" / "version.h"
 BUILD_DIR = ROOT / "build"
 
-# architecture -> DLL file name, expected PE machine, `file=` value of its pluginst.inf
-ARCHES = {
-    "x86": {"dll": "restic.wfx", "machine": 0x014C},
-    "x64": {"dll": "restic.wfx64", "machine": 0x8664},
+# architecture -> (staged DLL, expected PE machine)
+DLLS = {
+    "x86": (BUILD_DIR / "x86" / "restic.wfx", 0x014C),
+    "x64": (BUILD_DIR / "x64" / "restic.wfx64", 0x8664),
 }
 PE_MACHINE_NAMES = {0x014C: "x86 (PE32)", 0x8664: "x64 (PE32+)", 0xAA64: "arm64 (PE32+)"}
 
+# `file=` must name the 32-bit DLL (the base name): the 64-bit one is found by appending 64 to the extension
+MANIFEST_LINES = ("[plugininstall]", "type=wfx", "file=restic.wfx", "defaultdir=restic")
+# The sample configuration is staged next to every DLL; it travels under a name the plugin never reads
+SAMPLE_INI = ("restic_plugin.ini.sample", "restic_plugin.ini")
 # Documents copied to the ZIP root next to pluginst.inf (Total Commander only auto-installs an archive
 # whose pluginst.inf sits in the root, and it extracts everything else beside it).
 EXTRA_FILES = [("README.md", ROOT / "README.md"), ("LICENSE", ROOT / "LICENSE")]
-# The sample configuration (the file the build stages next to the DLL), shipped under a name that is never loaded
-SAMPLE_INI = ("restic_plugin.ini.sample", "restic_plugin.ini")
 
 
 def fail(message: str) -> NoReturn:
@@ -72,45 +77,40 @@ def pe_machine(path: Path) -> int:
         return struct.unpack("<H", handle.read(2))[0]
 
 
-def manifest_lines(path: Path) -> list[str]:
-    return path.read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
-
-
-def check_manifest(path: Path, dll_name: str, version: str) -> None:
-    """The manifest of an architecture must name exactly the DLL that its package carries."""
-    lines = manifest_lines(path)
-    for needle in ("[plugininstall]", "type=wfx", "defaultdir=restic", f"file={dll_name}", f"version={version}"):
+def check_manifest(path: Path, version: str) -> None:
+    """The manifest must register the base name, once: no restic.wfx64 line, no second file=."""
+    lines = path.read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+    for needle in MANIFEST_LINES + (f"version={version}",):
         if needle not in lines:
             fail(f"{path} lacks the line '{needle}'")
     files = [line for line in lines if line.startswith("file=")]
-    if files != [f"file={dll_name}"]:
-        fail(f"{path} must register only {dll_name}, found {files}")
+    if files != ["file=restic.wfx"]:
+        fail(f"{path} must register only the base name restic.wfx, found {files}")
 
 
-def check_staging(arch: str, version: str) -> tuple[Path, Path]:
-    """Returns (DLL, manifest) of one architecture after validating them."""
-    info = ARCHES[arch]
-    stage = BUILD_DIR / arch
-    dll = stage / info["dll"]
-    manifest = stage / "pluginst.inf"
-    if not dll.is_file():
-        fail(f"{dll} not found: run ./build.sh package first")
-    if not manifest.is_file():
-        fail(f"{manifest} not found: the Release build did not stage it")
-    found = pe_machine(dll)
-    if found != info["machine"]:
-        fail(f"{dll.name} is {PE_MACHINE_NAMES.get(found, hex(found))}, expected {PE_MACHINE_NAMES[info['machine']]}")
-    check_manifest(manifest, info["dll"], version)
-    return dll, manifest
+def check_staging(version: str) -> None:
+    """Every architecture folder must carry a valid DLL and the files that go next to it."""
+    for arch, (dll, machine) in DLLS.items():
+        if not dll.is_file():
+            fail(f"{dll} not found: run ./build.sh package first")
+        found = pe_machine(dll)
+        if found != machine:
+            fail(f"{dll.name} is {PE_MACHINE_NAMES.get(found, hex(found))}, expected {PE_MACHINE_NAMES[machine]}")
+        for name in ("pluginst.inf", SAMPLE_INI[1]):
+            if not (dll.parent / name).is_file():
+                fail(f"{dll.parent / name} not found: the Release build did not stage it")
+        check_manifest(dll.parent / "pluginst.inf", version)
+    if (BUILD_DIR / "x86" / SAMPLE_INI[1]).read_bytes() != (BUILD_DIR / "x64" / SAMPLE_INI[1]).read_bytes():
+        fail("the staged sample configurations of x86 and x64 differ")
 
 
-def build_zip(arch: str, version: str) -> Path:
-    dll, manifest = check_staging(arch, version)
-    zip_path = BUILD_DIR / f"wfx_restic_{version}_{arch}.zip"
-    sample = dll.parent / SAMPLE_INI[1]
-    if not sample.is_file():
-        fail(f"{sample} not found: the Release build did not stage it")
-    entries = [("pluginst.inf", manifest), (dll.name, dll), (SAMPLE_INI[0], sample)] + EXTRA_FILES
+def build_zip(version: str) -> Path:
+    zip_path = BUILD_DIR / f"wfx_restic_{version}.zip"
+    x64_stage = BUILD_DIR / "x64"
+    entries = [("pluginst.inf", x64_stage / "pluginst.inf")]
+    entries += [(dll.name, dll) for dll, _ in DLLS.values()]
+    entries += [(SAMPLE_INI[0], x64_stage / SAMPLE_INI[1])]
+    entries += EXTRA_FILES
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for arcname, source in entries:
@@ -124,26 +124,22 @@ def build_zip(arch: str, version: str) -> Path:
     return zip_path
 
 
-def main(argv: list[str]) -> int:
-    arches = argv or ["x64", "x86"]
-    for arch in arches:
-        if arch not in ARCHES:
-            fail(f"unknown architecture '{arch}' (expected one of {', '.join(ARCHES)})")
-
+def main() -> int:
     version = read_version()
-    # Packages of another version would be confused with the new ones
+    check_staging(version)
+
+    # Packages of another version (or of an older naming scheme) would be confused with the new one
     for old in BUILD_DIR.glob("wfx_restic_*"):
-        if not old.name.startswith(f"wfx_restic_{version}_"):
+        if old.name not in (f"wfx_restic_{version}.zip", f"wfx_restic_{version}.zip.sha256"):
             old.unlink()
 
-    for arch in arches:
-        zip_path = build_zip(arch, version)
-        digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
-        (zip_path.parent / (zip_path.name + ".sha256")).write_text(f"{digest} *{zip_path.name}\n", encoding="ascii")
-        print(f"[PACKAGE] {zip_path.relative_to(ROOT)} ({zip_path.stat().st_size} bytes, {arch}, version {version})")
-        print(f"[PACKAGE] SHA-256 {digest}")
+    zip_path = build_zip(version)
+    digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    (zip_path.parent / (zip_path.name + ".sha256")).write_text(f"{digest} *{zip_path.name}\n", encoding="ascii")
+    print(f"[PACKAGE] {zip_path.relative_to(ROOT)} ({zip_path.stat().st_size} bytes, x86 + x64, version {version})")
+    print(f"[PACKAGE] SHA-256 {digest}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())

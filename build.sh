@@ -12,9 +12,8 @@
 #   ./build.sh release-test # Build and run unit tests against the optimized /MT build
 #   ./build.sh asan         # Build and run unit tests with AddressSanitizer
 #   ./build.sh analyze      # Run MSVC static code analysis (/analyze)
-#   ./build.sh package      # Release build + tests for BOTH architectures, then one install ZIP each
-#   ./build.sh zip          # Only create the install ZIPs from existing build\x64 and build\x86
-#                           # (ARCH=x64|x86 limits both `package` and `zip` to one architecture)
+#   ./build.sh package      # Release build + tests for BOTH architectures, then the install ZIP
+#   ./build.sh zip          # Only create the install ZIP from existing build\x64 and build\x86
 #   ./build.sh clean        # Clean the build directory of the selected architecture
 #   ./build.sh cleanall     # Clean the whole build directory
 #   ./build.sh mutate [ids] # Mutation check of the tests (x64, ~10 min); e.g. ./build.sh mutate M5 M53
@@ -125,13 +124,6 @@ run_nmake() {
     MSYS2_ARG_CONV_EXCL="*" nmake -nologo ARCH="${arch}" "$@"
 }
 
-# Architectures whose install ZIP is created: both, unless ARCH names a single one
-package_arches() {
-    if [[ -n "${ARCH_REQUEST}" && "${ARCH_REQUEST}" != "all" ]]; then
-        echo "${ARCH_REQUEST}"
-    fi
-}
-
 # Architectures to visit: an explicit ARCH=all means both, `package` always needs both
 arches_for() {
     if [[ "${ARCH_REQUEST}" == "all" || ( -z "${ARCH_REQUEST}" && "$1" == "package" ) ]]; then
@@ -189,10 +181,10 @@ case "${ACTION}" in
             run_nmake "${arch}" CONFIG=Release test
             run_nmake "${arch}" CONFIG=Release package
         done
-        python tools/package.py $(package_arches)
+        python tools/package.py
         ;;
     zip)
-        python tools/package.py $(package_arches)
+        python tools/package.py
         ;;
     mutate)
         # Deliberate defects must be caught by the tests (see tests/mutation/run.sh)
