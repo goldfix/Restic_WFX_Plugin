@@ -1,6 +1,6 @@
 [plugininstall]
 description=Restic Backup Browser - Read-only WFX plugin for Restic repositories
 type=wfx
-file=restic.wfx
+file=restic.wfx64
 defaultdir=restic
-version=1.3.4
+version=1.3.5
