@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Language-C11-00599C.svg" alt="Language: Pure C11" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x86%20%7C%20x64-0078D6.svg" alt="Platform: Windows 32-bit and 64-bit" />
   <img src="https://img.shields.io/badge/Total%20Commander-WFX%20%7C%20WFX64-orange.svg" alt="Total Commander WFX and WFX64" />
-  <img src="https://img.shields.io/badge/Version-1.3.5-success.svg" alt="Version: 1.3.5" />
+  <img src="https://img.shields.io/badge/Version-1.3.6-success.svg" alt="Version: 1.3.6" />
 </p>
 
 ---
@@ -77,15 +77,15 @@ This plugin uses the official **Restic** command-line binary (`restic.exe`) unde
 
 ### Option A: Automatic Installation (Recommended)
 
-1. Download the package that matches your Total Commander from the [GitHub Releases](https://github.com/goldfix/Restic_WFX_Plugin/releases) page: `wfx_restic_<version>_x64.zip` for the 64-bit Total Commander (`TOTALCMD64.EXE`) or `wfx_restic_<version>_x86.zip` for the 32-bit one (`TOTALCMD.EXE`). A DLL of the wrong architecture cannot be loaded.
+1. Download `wfx_restic_<version>.zip` from the [GitHub Releases](https://github.com/goldfix/Restic_WFX_Plugin/releases) page. The same package works with 32-bit and 64-bit Total Commander: it contains both `restic.wfx` and `restic.wfx64`, and Total Commander loads the one matching its own architecture.
 2. In Total Commander, navigate to the ZIP file and **double-click it** (or press `Enter`).
 3. Total Commander reads the bundled `pluginst.inf`, asks where to install the plugin (default: `plugins\wfx\restic`) and registers it automatically as **`Restic Backups`** in Network Neighborhood.
 4. On a first installation, copy `restic_plugin.ini.sample` (extracted next to the plugin DLL) to `restic_plugin.ini` and add your repositories (see below).
 5. Open **Network Neighborhood** (`Alt+F1` / `Alt+F2` -> `\`) and enter **`Restic Backups`**.
 
-Each ZIP contains `pluginst.inf`, the plugin DLL of that architecture (`restic.wfx64` in the x64 package, `restic.wfx` in the x86 one), `restic_plugin.ini.sample`, `README.md` and `LICENSE`. `pluginst.inf` registers exactly that DLL.
+The ZIP contains: `pluginst.inf`, `restic.wfx` (32-bit), `restic.wfx64` (64-bit), `restic_plugin.ini.sample` (commented example configuration), `README.md` and `LICENSE`. `pluginst.inf` registers the base name `restic.wfx`; Total Commander uses `restic.wfx64` on its own when it runs as a 64-bit process, which is why both files must stay in the same folder with the same base name.
 
-> The packages deliberately do **not** contain `restic_plugin.ini`: upgrading by installing a newer ZIP over the existing plugin folder never overwrites your configuration. The commented example travels as `restic_plugin.ini.sample`, a name the plugin never reads, so it can be refreshed on every upgrade without risk. Without a `restic_plugin.ini` the plugin simply lists no repositories.
+> The package deliberately does **not** contain `restic_plugin.ini`: upgrading by installing a newer ZIP over the existing plugin folder never overwrites your configuration. The commented example travels as `restic_plugin.ini.sample`, a name the plugin never reads, so it can be refreshed on every upgrade without risk. Without a `restic_plugin.ini` the plugin simply lists no repositories.
 
 ### Option B: Manual Installation
 
@@ -317,7 +317,7 @@ leaves any earlier copy untouched.
 ### Prerequisites
 
 - **Windows 10/11**
-- **MSVC Build Tools (Visual Studio 2022+)** with `cl.exe`, `link.exe`, `rc.exe` and `nmake.exe` active in your shell environment, including **both the x86 and the x64 toolset** (`MSVC v143 - VS 2022 C++ x86/x64 build tools`). One architecture is enough to build that architecture only.
+- **MSVC Build Tools (Visual Studio 2022+)** with `cl.exe`, `link.exe`, `rc.exe` and `nmake.exe` active in your shell environment, including **both the x86 and the x64 toolset** (`MSVC v143 - VS 2022 C++ x86/x64 build tools`). One architecture is enough to build that architecture only; `package` and `zip` need both, because the install ZIP carries both DLLs.
 - **Git** (with submodules initialized: `git submodule update --init --recursive`)
 - *(Optional)* `tmp\restic.exe` placed in the `tmp\` folder to enable the live end-to-end integration tests (otherwise live tests are gracefully reported as `[SKIP]`).
 
@@ -332,8 +332,8 @@ Using the Git Bash / MSYS2 wrapper (`build.sh`) or directly via `nmake`:
 ./build.sh release-test  # Build & run all 5 test suites against the Release build
 ./build.sh analyze       # Run MSVC Static Code Analyzer (/analyze) with warnings-as-errors (/W4 /WX)
 ./build.sh asan          # Run unit tests under MSVC AddressSanitizer (/fsanitize=address)
-./build.sh package       # Both architectures: clean, Release build, tests, then build/wfx_restic_<version>_x64.zip and _x86.zip
-./build.sh zip           # Only rebuild the two ZIPs from the already built build/x64 and build/x86 (ARCH=x64|x86 for one)
+./build.sh package       # Both architectures: clean, Release build, tests, then build/wfx_restic_<version>.zip
+./build.sh zip           # Only rebuild the ZIP from the already built build/x64 and build/x86
 ./build.sh clean         # Clean the build directory of the selected architecture
 ./build.sh cleanall      # Clean the whole build directory
 ./build.sh mutate        # Mutation tests of the tests (~15 min): plant deliberate defects, every one must be caught
@@ -352,15 +352,15 @@ Or with `nmake` from a Native Tools Command Prompt:
 ```bat
 nmake /nologo CONFIG=Release all
 nmake /nologo ARCH=x86 CONFIG=Debug test
-nmake /nologo zip                   # both install ZIPs from the staged folders (x64 and x86)
+nmake /nologo zip                   # the install ZIP from both staged folders (x64 and x86)
 ```
 
 Build artifacts are generated per architecture (`build\x64`, `build\x86`):
 - `build\x64\restic.wfx64` — 64-bit Total Commander WFX plugin DLL (embedded multi-resolution icon and `VERSIONINFO`)
 - `build\x86\restic.wfx` — 32-bit Total Commander WFX plugin DLL (same sources, `restic_wfx32.def` export table)
 - `build\<arch>\restic_plugin.ini` — Commented sample configuration file (packaged as `restic_plugin.ini.sample`)
-- `build\<arch>\pluginst.inf` — Total Commander auto-install manifest (`[plugininstall]`) of that architecture, from `pluginst_x64.inf` / `pluginst_x86.inf`
-- `build\wfx_restic_<version>_x64.zip`, `build\wfx_restic_<version>_x86.zip` — Release packages (only with `./build.sh package`), installable by double-clicking them in Total Commander; each contains only the DLL of its architecture, its `pluginst.inf`, `restic_plugin.ini.sample`, `README.md` and `LICENSE` (no `restic_plugin.ini`, so an upgrade keeps the user's configuration). The version is read from `include\version.h`.
+- `build\<arch>\pluginst.inf` — Total Commander auto-install manifest (`[plugininstall]`), registering the base name `restic.wfx`
+- `build\wfx_restic_<version>.zip` — Release package (only with `./build.sh package`), installable by double-clicking it in Total Commander; contains both DLLs, `pluginst.inf`, `restic_plugin.ini.sample` (never `restic_plugin.ini`, so an upgrade keeps the user's configuration), `README.md` and `LICENSE`. The version is read from `include\version.h`.
 
 ---
 

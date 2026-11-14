@@ -370,7 +370,7 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
   - Format: `logo\restic_wfx.ico` linked into the plugin DLL (32-bit and 64-bit image, see §8.6) via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
   - Included frames inside `logo\restic_wfx.ico` (5 resolutions): **16×16, 24×24, 32×32, 48×48** (32-bit BGRA uncompressed BMP/DIB frames) plus **256×256** (32-bit RGBA PNG-compressed), built from `logo\logo_16x16.ico`, `logo\logo_24x24.ico`, `logo\logo_32x32.ico`, `logo\logo_48x48.ico`, and `logo\logo_256x256.png`.
 - **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
-- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.5.0` / `"1.3.5"`), embedded into the plugin DLL via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
+- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.6.0` / `"1.3.6"`), embedded into the plugin DLL via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
 
 ---
 
@@ -383,10 +383,9 @@ Restic_WFX_Plugin/
 ├── .clang-format               # Code formatting rules (C11, 4 spaces, 100 cols)
 ├── restic_wfx.def              # Explicit DLL exports for the x64 build (no name decoration)
 ├── restic_wfx32.def            # Explicit DLL exports for the x86 build (__stdcall, _FsInit@16 aliases)
-├── tools/package.py            # Creates one install ZIP per architecture from build\x64 and build\x86 (verification included)
+├── tools/package.py            # Creates the install ZIP from build\x64 and build\x86 (both DLLs + the INI sample + verification)
 ├── restic_plugin.ini           # Commented sample configuration file (copied to build\<arch>\)
-├── pluginst_x64.inf            # Total Commander auto-install manifest of the 64-bit package (file=restic.wfx64)
-├── pluginst_x86.inf            # Total Commander auto-install manifest of the 32-bit package (file=restic.wfx)
+├── pluginst.inf                # Total Commander auto-install manifest (registers the base name restic.wfx)
 ├── .agents/skills/             # Agent skills: memory-updater, kroki-diagrams, release-packager (scripts/release.py: bump version, docs, tests, ZIP)
 ├── logo/                       # Plugin icons (.ico 16/24/32/48 + multi-res restic_wfx.ico) & PNG logos (256/512/2048)
 ├── cJSON/
@@ -402,7 +401,7 @@ Restic_WFX_Plugin/
 │   ├── wfx_path.h              # Plugin-namespace path decomposition (WfxParsedPath)
 │   ├── wfx_status.h            # F3 hook, Path Guard core, request marker, cm_List hand-back
 │   ├── restic_report.h         # Statistics report: data model, parsers, Markdown writers, Lister
-│   └── version.h               # Single source of truth for plugin version macros (1.3.5)
+│   └── version.h               # Single source of truth for plugin version macros (1.3.6)
 ├── src/
 │   ├── main.c                  # DllMain, WFX entry points, virtual path routing
 │   ├── config.c                # restic_plugin.ini resolution & parsing
@@ -574,20 +573,18 @@ from the same sources; only the export table, the `VERSIONINFO` file name and th
   `analyze`/`package` actions (always fresh) trigger a `clean` of that architecture first; the stamp is written
   *after* the clean, because the clean removes the folder. Without it a Debug test run after `package` linked
   Release objects (`unresolved external symbol _malloc_dbg`).
-- **Installer:** one ZIP per architecture, each with its own manifest naming exactly the DLL it carries:
-  `pluginst_x64.inf` has `file=restic.wfx64`, `pluginst_x86.inf` has `file=restic.wfx`. The Makefile stages
-  the right one as `build\<arch>\pluginst.inf`. (Total Commander also accepts the base name `restic.wfx` and
-  appends `64` itself when it loads a plugin: 1.3.4 shipped a single dual-architecture ZIP registering the base name;
-  1.3.5 replaced it with two explicit packages, which make the download choice obvious and ship no unused binary.)
-  **`restic_plugin.ini` is not packaged**: extracting a ZIP over the plugin folder on an upgrade would
-  overwrite the repositories the user configured. The commented sample is packaged as
+- **Installer:** one ZIP for both Total Commanders. `pluginst.inf` registers the **base name** `file=restic.wfx`
+  (a single `file=` line); a 64-bit Total Commander uses `restic.wfx64` by itself when it exists next to it,
+  which is exactly why both files must share the base name and the folder. History: 1.3.4 shipped this layout,
+  1.3.5 tried two ZIPs with one manifest each (`file=restic.wfx64` / `file=restic.wfx`) and was withdrawn, 1.3.6
+  went back to the single package. **`restic_plugin.ini` is not packaged**: extracting a ZIP over the plugin
+  folder on an upgrade would overwrite the repositories the user configured. The commented sample is packaged as
   `restic_plugin.ini.sample` (a name the plugin never reads, so it is safe to overwrite on every upgrade; the
   user copies it to `restic_plugin.ini` once). It is the very file staged in `build\<arch>` (the tests use it).
 - **Tests:** every test program is built for the architecture under test (a 64-bit test process cannot
   load the 32-bit DLL). `test_plugin_dll.c` stages its own folder (`build\x64` or `build\x86`), reads
   `IMAGE_FILE_HEADER.Machine` of the DLL file and asserts that it matches the process bitness, that the
-  file name follows the `64` suffix rule and that the staged `pluginst.inf` registers exactly this
-  architecture's DLL (`PLUGIN_NAME`).
+  file name follows the `64` suffix rule and that the staged `pluginst.inf` registers `restic.wfx`.
 - **Sanitizers/analysis on x86:** `/analyze` and `/fsanitize=address` work for both targets; the x86 ASan
   runs report 84 + 332 + 450 + 327 assertions, because the DLL smoke test needs the plugin binary and is
   skipped in that configuration.
@@ -601,7 +598,7 @@ from the same sources; only the export table, the `VERSIONINFO` file name and th
 ./build.sh release-test  # Same tests against the optimized /MT /O2 build
 ./build.sh asan      # Rebuild and run unit tests under MSVC AddressSanitizer (DLL smoke test is skipped)
 ./build.sh analyze   # Rebuild plugin & tests with MSVC Static Analyzer (/analyze)
-./build.sh package   # Both architectures: clean + Release build + tests, then build/wfx_restic_<version>_x64.zip and _x86.zip
+./build.sh package   # Both architectures: clean + Release build + tests, then build/wfx_restic_<version>.zip
 ./build.sh zip       # Rebuild only the install ZIP from the existing build/x64 and build/x86
 ./build.sh clean     # Remove the build folder of the selected architecture
 ./build.sh cleanall  # Remove the whole build folder
@@ -611,21 +608,20 @@ ARCH=all ./build.sh test    # x64 and then x86 in one run
 ```
 
 **Release package (`package`):** `./build.sh package` builds and tests both architectures and then calls
-`tools/package.py`, which is the only place that knows the ZIP rules (`ARCH=x64|x86` limits `package` and `zip`
-to one architecture; `python tools/package.py [x64] [x86]` works too). For every architecture the script reads the
-version from `include\version.h` (`RESTIC_WFX_PRODUCT_VER`), checks the staged manifest (`type=wfx`,
-`defaultdir=restic`, `version=`, and a **single** `file=` line naming the DLL of that architecture), verifies
-`IMAGE_FILE_HEADER.Machine` of the DLL (`build\x86\restic.wfx` = `I386`, `build\x64\restic.wfx64` = `AMD64`), then
-writes `build/wfx_restic_<version>_x64.zip` / `build/wfx_restic_<version>_x86.zip` and their `.sha256`, and removes
-packages of other versions. Contents of each ZIP (all in the root, otherwise Total Commander does not detect
-`pluginst.inf`): `pluginst.inf`, the DLL of that architecture, `restic_plugin.ini.sample`, `README.md`, `LICENSE` -
-**never `restic_plugin.ini`** (`release.py` also compares the sample byte for byte with the repository file).
-**Releases are prepared with the
-`release-packager` skill** (`.agents/skills/release-packager/`):
-`python .agents/skills/release-packager/scripts/release.py X.Y.Z` bumps every version reference, runs
-Debug/`/analyze`/ASan/Release tests for both architectures (`ARCH=all`), creates and verifies the two ZIPs
-(contents, manifest, PE machine type, `VERSIONINFO` of the DLL, `.sha256`). **Manually, when bumping the version,
-update `include/version.h`, `pluginst_x64.inf` and `pluginst_x86.inf`** (`test_plugin_dll.c` fails if they diverge).
+`tools/package.py`, which is the only place that knows the ZIP rules. The script reads the version from
+`include\version.h` (`RESTIC_WFX_PRODUCT_VER`), checks the staged manifests (`type=wfx`, `defaultdir=restic`,
+`version=`, and a **single** `file=restic.wfx` line), verifies `IMAGE_FILE_HEADER.Machine` of every DLL
+(`build\x86\restic.wfx` = `I386`, `build\x64\restic.wfx64` = `AMD64`) and that both staged folders carry
+`pluginst.inf` and `restic_plugin.ini` (identical samples), then writes `build/wfx_restic_<version>.zip` and its
+`.sha256`, removing packages of other versions or naming schemes. Contents (all in the ZIP root, otherwise Total
+Commander does not detect `pluginst.inf`): `pluginst.inf`, `restic.wfx`, `restic.wfx64`,
+`restic_plugin.ini.sample`, `README.md`, `LICENSE` - **never `restic_plugin.ini`** (`release.py` also compares the
+sample byte for byte with the repository file). **Releases are prepared with the `release-packager` skill**
+(`.agents/skills/release-packager/`): `python .agents/skills/release-packager/scripts/release.py X.Y.Z` refuses to
+start without a `## [X.Y.Z]` section in `CHANGELOG.md`, bumps every version reference, runs
+Debug/`/analyze`/ASan/Release tests for both architectures (`ARCH=all`), creates and verifies the ZIP (exact
+contents, manifest, PE machine types, `VERSIONINFO` of both DLLs, `.sha256`). **Manually, when bumping the
+version, update both `include/version.h` and `pluginst.inf`** (`test_plugin_dll.c` fails if they diverge).
 
 If Total Commander still has a plugin DLL loaded (`build/x64/restic.wfx64` or `build/x86/restic.wfx`),
 `build.sh` renames it to `.old` so the link can proceed; run `cm_UnloadPlugins` in Total Commander (or
