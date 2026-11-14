@@ -105,3 +105,6 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Backup left by the mutation harness while a mutation is applied
+*.mutbak

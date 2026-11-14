@@ -2,6 +2,20 @@
 
 All notable changes to the Restic WFX plugin.
 
+## [1.3.4] — 2026-11-14
+
+### Added
+
+- **32-bit Total Commander is supported.** The plugin is now also built as `restic.wfx`, from the same sources
+  and with the same features as the 64-bit `restic.wfx64`.
+- The build scripts can target the 32-bit build, the 64-bit build or both.
+
+### Changed
+
+- **One installation package for both versions of Total Commander.** `wfx_restic_<version>.zip` (previously
+  `wfx_restic_<version>_x64.zip`) contains both DLLs, and the installer registers the base plugin name so that
+  Total Commander loads the one matching its own architecture.
+
 ## [1.3.3] — 2026-11-07
 
 ### Changed
@@ -87,13 +101,3 @@ Reworks the statistics report introduced in 1.3.0 and makes it reachable with `F
 ### Added
 
 - **Statistics columns.** File listing can show backup statistics (time, host, tags, file/dir counts, sizes, data added, duration, hashes, paths, summary availability) as native content columns. Values come from the snapshot list already loaded by the plugin, so displaying a column never starts a new process. Ships with a ready-to-use default view that works regardless of the name the plugin is registered under.
-
-## [Unreleased]
-
-### Planned
-
-- Optional extra-process columns: repository statistics and differences against the parent snapshot.
-- Streaming directory listing for very deep or very wide folders.
-- Optional directory cache.
-- Child process tree termination on cancellation.
-- UTF-8 configuration file support.

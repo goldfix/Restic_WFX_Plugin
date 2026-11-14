@@ -38,7 +38,9 @@
     "shell:od *",
     "shell:python - <<'PY' *",
     "shell:sort *",
-    "edit:tmp/*"
+    "edit:tmp/*",
+    "shell:sleep *",
+    "edit:tests/mutation/*"
   ],
   "deny": []
 }

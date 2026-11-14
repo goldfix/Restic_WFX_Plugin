@@ -1,0 +1,53 @@
+# id  kind  script  description
+# kind: cli | config | stats | report (test program the mutated source is linked into),
+#       dll (the plugin DLL is rebuilt and test_plugin_dll.exe loads it)
+
+M1|cli|mut_m1.py|snapshot-id strictness
+M2|cli|mut_m2.py|node name separators
+M3|cli|mut_m3.py|utf8 truncation
+M4|config|mut_m4.py|COMMANDER_INI_PATH
+M5|dll|mut_m5.py|cold start fill
+M6|dll|mut_m6.py|MSGTYPE_TRANSFERCOMPLETE
+M7|stats|mut_m7.py|join utf8 boundary
+M8|stats|mut_m8.py|describe utf8
+M9|stats|mut_m9.py|loose alias preference
+M10|stats|mut_m10.py|trace utf8
+M11|stats|mut_m11.py|trace surrogate boundary
+M12|cli|mut_m12.py|unc display -> real name
+M13|cli|mut_m13.py|unc volumes from snapshots
+M14|cli|mut_m14.py|unc root name mapping
+M15|cli|mut_m15.py|device paths refused
+M16|report|mut_m16.py|bar minimum block
+M17|report|mut_m17.py|histogram lower bounds
+M18|report|mut_m18.py|direct file classification
+M20|report|mut_m20.py|diff statistics parsed
+M21|report|mut_m21.py|largest ranking order
+M23|report|mut_m23.py|report: swallow fatal stats errors
+M24|report|mut_m24.py|report: hidden file extension
+M25|report|mut_m25.py|report: remainder row
+M26|report|mut_m26.py|report: credentials masked
+M28|report|mut_m28.py|report: utf8 boundary
+M29|report|mut_m29.py|report: unknown folder
+M30|report|mut_m30.py|report: read-only copy replaced
+M38|report|mut_m38.py|report: name sanitization
+M39|report|mut_m39.py|report: cache never hits
+M40|report|mut_m40.py|report: file root accepted
+M41|dll|mut_m41.py|execute: open not forwarded
+M42|report|mut_m42.py|pick destination: in-use probe
+M44|dll|mut_m44.py|execute: quote stats is exact
+M45|dll|mut_m45.py|execute: file is not applicable
+M46|report|mut_m46.py|lister command line
+M58|report|mut_m58.py|report: bar without backticks
+M59|report|mut_m59.py|report: Lister mode forced
+M32|cli|mut_m32.py|exec_lines: terminator removed
+M33|cli|mut_m33.py|exec_lines: unterminated tail
+M34|cli|mut_m34.py|exec_lines: callback stops stream
+M47|report|mut_m47.py|f3: prefix boundary
+M48|report|mut_m48.py|f3: wildcard mask ignored
+M51|report|mut_m51.py|f3: native view posted
+M52|report|mut_m52.py|f3: focus class checked
+M53|dll|mut_m53.py|execute: file handed back
+M54|report|mut_m54.py|f3: prompt decides
+M55|report|mut_m55.py|f3: local bar refuses
+M56|report|mut_m56.py|f3: request expires
+M57|report|mut_m57.py|f3: empty marker refused

@@ -1,7 +1,8 @@
 /*
  * Black-box smoke test of the built plugin DLL: it is loaded the way Total Commander loads it
  * (LoadLibrary + GetProcAddress) and driven through the exported WFX entry points only.
- * Requires build\restic.wfx64 (skipped when absent, e.g. in AddressSanitizer test runs).
+ * Requires the DLL of this architecture: build\x64\restic.wfx64 in a 64-bit build,
+ * build\x86\restic.wfx in a 32-bit one (skipped when absent, as in AddressSanitizer runs).
  */
 #ifndef UNICODE
 #define UNICODE
@@ -15,7 +16,17 @@
 #include <wchar.h>
 #include "version.h"
 
-#define PLUGIN_DLL L"build\\restic.wfx64"
+/* The DLL under test always has the architecture of this process, so the staged
+   folder and the WFX file name (64-bit plugins end with `64`) follow the compiler. */
+#ifdef _WIN64
+#define PLUGIN_DIR  L"build\\x64"
+#define PLUGIN_NAME L"restic.wfx64"
+#else
+#define PLUGIN_DIR  L"build\\x86"
+#define PLUGIN_NAME L"restic.wfx"
+#endif
+#define PLUGIN_DLL  PLUGIN_DIR L"\\" PLUGIN_NAME
+#define PLUGIN_INF  PLUGIN_DIR L"\\pluginst.inf"
 
 static int g_tests_run    = 0;
 static int g_tests_failed = 0;
@@ -155,7 +166,7 @@ static BOOL write_file(const WCHAR* path, const char* text) {
 static BOOL load_plugin_copy(const WCHAR* dir, Plugin* p) {
     WCHAR dest[MAX_PATH];
     memset(p, 0, sizeof(*p));
-    swprintf_s(dest, MAX_PATH, L"%ls\\restic.wfx64", dir);
+    swprintf_s(dest, MAX_PATH, L"%ls\\" PLUGIN_NAME, dir);
     if (!CopyFileW(PLUGIN_DLL, dest, FALSE)) return FALSE;
     p->module = LoadLibraryW(dest);
     if (!p->module) return FALSE;
@@ -177,8 +188,64 @@ static void unload_plugin_copy(Plugin* p, const WCHAR* dir) {
     WCHAR dest[MAX_PATH];
     if (p->module) FreeLibrary(p->module);
     p->module = NULL;
-    swprintf_s(dest, MAX_PATH, L"%ls\\restic.wfx64", dir);
+    swprintf_s(dest, MAX_PATH, L"%ls\\" PLUGIN_NAME, dir);
     DeleteFileW(dest);
+}
+
+/* Reads IMAGE_FILE_HEADER.Machine from a PE file without loading it */
+static BOOL read_pe_machine(const WCHAR* path, WORD* machine) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+
+    BOOL ok = FALSE;
+    DWORD read = 0;
+    unsigned char dos[0x40];
+    if (ReadFile(file, dos, sizeof(dos), &read, NULL) && read == sizeof(dos) &&
+        dos[0] == 'M' && dos[1] == 'Z') {
+        const DWORD nt = (DWORD)dos[0x3C] | ((DWORD)dos[0x3D] << 8) |
+                         ((DWORD)dos[0x3E] << 16) | ((DWORD)dos[0x3F] << 24);
+        const LONG moved = SetFilePointer(file, (LONG)nt, NULL, FILE_BEGIN);
+        unsigned char signature[6];
+        if (nt != 0 && nt < 0x1000000u && moved == (LONG)nt &&
+            ReadFile(file, signature, sizeof(signature), &read, NULL) && read == sizeof(signature) &&
+            signature[0] == 'P' && signature[1] == 'E' && signature[2] == 0 && signature[3] == 0) {
+            *machine = (WORD)(signature[4] | (signature[5] << 8));
+            ok = TRUE;
+        }
+    }
+    CloseHandle(file);
+    return ok;
+}
+
+/*
+ * The plugin is shipped for both architectures (build\x86\restic.wfx and build\x64\restic.wfx64):
+ * each binary must really be a PE image of its own architecture and must follow the WFX naming
+ * rule, otherwise Total Commander would try to load a 32-bit DLL into a 64-bit process.
+ */
+static void test_binary_architecture(void) {
+    EXPECT_TRUE(GetFileAttributesW(PLUGIN_DLL) != INVALID_FILE_ATTRIBUTES,
+                "The plugin DLL of this architecture is staged");
+
+    WORD machine = 0;
+    EXPECT_TRUE(read_pe_machine(PLUGIN_DLL, &machine), "The plugin file is a PE image (MZ + PE headers)");
+
+    const WORD expected = (sizeof(void*) == 8) ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
+    EXPECT_TRUE(machine == expected,
+                "The DLL machine type matches the architecture of the Total Commander that loads it");
+}
+
+/* Value of a string entry of the raw VS_VERSION_INFO block (key and value are UTF-16, the value starts
+   on the next 4-byte boundary after the key's terminator). Returns NULL when the key is absent. */
+static const WCHAR* version_string_value(const BYTE* block, DWORD size, const WCHAR* key) {
+    const size_t key_bytes = (wcslen(key) + 1) * sizeof(WCHAR);
+    for (DWORD off = 0; block != NULL && off + key_bytes + sizeof(WCHAR) <= size; off += 2) {
+        if (memcmp(block + off, key, key_bytes) == 0) {
+            const DWORD value = (DWORD)((off + key_bytes + 3) & ~(size_t)3);
+            return (value + sizeof(WCHAR) <= size) ? (const WCHAR*)(block + value) : NULL;
+        }
+    }
+    return NULL;
 }
 
 /* Exact export surface: read-only + file extraction entry points present, write/delete/move absent */
@@ -247,14 +314,24 @@ static void test_export_surface(void) {
     }
     EXPECT_TRUE(foundFixed, "VS_FIXEDFILEINFO matches RESTIC_WFX_VERSION_CSV and VFT_DLL");
 
+    /* The resource script names the file after the architecture it is built for */
+    const WCHAR* original = version_string_value(verBytes, verSize, L"OriginalFilename");
+    const WCHAR* internal = version_string_value(verBytes, verSize, L"InternalName");
+    EXPECT_TRUE(original != NULL && wcscmp(original, PLUGIN_NAME) == 0,
+                "VERSIONINFO OriginalFilename is the file name of this architecture (restic.wfx / restic.wfx64)");
+    EXPECT_TRUE(internal != NULL && wcscmp(internal, PLUGIN_NAME) == 0,
+                "VERSIONINFO InternalName is the file name of this architecture");
+
     /* Verify staged build\pluginst.inf manifest matches Total Commander auto-install specification */
     WCHAR infType[32] = {0}, infFile[64] = {0}, infVer[32] = {0};
-    GetPrivateProfileStringW(L"plugininstall", L"type", L"", infType, _countof(infType), L"build\\pluginst.inf");
-    GetPrivateProfileStringW(L"plugininstall", L"file", L"", infFile, _countof(infFile), L"build\\pluginst.inf");
-    GetPrivateProfileStringW(L"plugininstall", L"version", L"", infVer, _countof(infVer), L"build\\pluginst.inf");
-    EXPECT_TRUE(wcscmp(infType, L"wfx") == 0 && wcscmp(infFile, L"restic.wfx64") == 0 &&
+    GetPrivateProfileStringW(L"plugininstall", L"type", L"", infType, _countof(infType), PLUGIN_INF);
+    GetPrivateProfileStringW(L"plugininstall", L"file", L"", infFile, _countof(infFile), PLUGIN_INF);
+    GetPrivateProfileStringW(L"plugininstall", L"version", L"", infVer, _countof(infVer), PLUGIN_INF);
+    /* The manifest registers the base name: Total Commander appends 64 to the extension
+       when it runs as a 64-bit process, so one installer serves both architectures */
+    EXPECT_TRUE(wcscmp(infType, L"wfx") == 0 && wcscmp(infFile, L"restic.wfx") == 0 &&
                 wcscmp(infVer, L"" RESTIC_WFX_PRODUCT_VER) == 0,
-                "Staged build\\pluginst.inf has valid [plugininstall] type, file, and version");
+                "Staged pluginst.inf has valid [plugininstall] type, base file name, and version");
 
     FreeLibrary(m);
 }
@@ -1680,11 +1757,12 @@ static void test_content_unicode_entry_points(void) {
 int main(void) {
     printf("Running Restic WFX plugin DLL smoke tests...\n");
     if (GetFileAttributesW(PLUGIN_DLL) == INVALID_FILE_ATTRIBUTES) {
-        printf("[SKIP] build\\restic.wfx64 not found: DLL smoke tests skipped.\n");
+        printf("[SKIP] %ls not found: DLL smoke tests skipped.\n", PLUGIN_DLL);
         return 0;
     }
 
     test_export_surface();
+    test_binary_architecture();
     test_content_fields();
     test_content_unicode_entry_points();
     test_primary_ini_next_to_dll();

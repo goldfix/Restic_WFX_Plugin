@@ -1,21 +1,55 @@
 # ==============================================================================
-# NMake Makefile for Restic Total Commander WFX Plugin (x64)
-# Usage (with MSVC x64 environment configured, or via ./build.sh):
-#   nmake /nologo                  -> Build Debug plugin (build\restic.wfx64)
-#   nmake /nologo CONFIG=Release   -> Build Release plugin (static CRT /MT)
-#   nmake /nologo test             -> Build and run unit tests
-#   nmake /nologo test ASAN=1      -> Build and run unit tests with AddressSanitizer
-#   nmake /nologo analyze          -> Run MSVC static analysis (/analyze)
-#   nmake /nologo package          -> Build Release plugin and create installation ZIP
-#   nmake /nologo clean            -> Remove build artifacts
+# NMake Makefile for Restic Total Commander WFX Plugin (x64 and x86)
+#
+# ARCH selects the target architecture (the compiler/linker must be initialized
+# for it, ./build.sh switches the environment for you):
+#   ARCH=x64 (default) -> build\x64\restic.wfx64
+#   ARCH=x86           -> build\x86\restic.wfx
+#
+# Usage (with an initialized MSVC environment, or via ./build.sh):
+#   nmake /nologo                     -> Build Debug plugin
+#   nmake /nologo CONFIG=Release      -> Build Release plugin (static CRT /MT)
+#   nmake /nologo ARCH=x86            -> Build the 32-bit Debug plugin
+#   nmake /nologo test                -> Build and run unit tests
+#   nmake /nologo test ASAN=1         -> Build and run unit tests with AddressSanitizer
+#   nmake /nologo analyze             -> Run MSVC static analysis (/analyze)
+#   nmake /nologo package             -> Build Release plugin and stage the install files
+#   nmake /nologo zip                 -> Create the install ZIP from both architectures
+#   nmake /nologo clean               -> Remove the artifacts of ARCH only
+#   nmake /nologo cleanall            -> Remove the whole build tree
 # ==============================================================================
 
 !IF "$(CONFIG)" == ""
 CONFIG = Debug
 !ENDIF
 
-BUILD_DIR  = build
-PLUGIN_OUT = $(BUILD_DIR)\restic.wfx64
+!IF "$(ARCH)" == ""
+ARCH = x64
+!ENDIF
+
+# Total Commander loads <name>.wfx from 32-bit and <name>.wfx64 from 64-bit,
+# both files sitting in the same folder (WFX SDK, "64-bit Support").
+!IF "$(ARCH)" == "x86"
+ARCH_DIR     = x86
+PLUGIN_NAME  = restic.wfx
+DEF_FILE     = restic_wfx32.def
+CFLAGS_ARCH  =
+RCFLAGS_ARCH = /DRC_ARCH_X86
+LFLAGS_ARCH  = /MACHINE:X86 /SAFESEH
+!ELSEIF "$(ARCH)" == "x64"
+ARCH_DIR     = x64
+PLUGIN_NAME  = restic.wfx64
+DEF_FILE     = restic_wfx.def
+CFLAGS_ARCH  =
+RCFLAGS_ARCH =
+LFLAGS_ARCH  = /MACHINE:X64
+!ELSE
+!ERROR ARCH must be x64 or x86, not "$(ARCH)"
+!ENDIF
+
+BUILD_ROOT = build
+BUILD_DIR  = $(BUILD_ROOT)\$(ARCH_DIR)
+PLUGIN_OUT = $(BUILD_DIR)\$(PLUGIN_NAME)
 PLUGIN_LIB = $(BUILD_DIR)\restic.lib
 PLUGIN_RES = $(BUILD_DIR)\restic_wfx.res
 TEST_CONFIG_OUT = $(BUILD_DIR)\test_config.exe
@@ -23,7 +57,6 @@ TEST_CLI_OUT    = $(BUILD_DIR)\test_restic_cli.exe
 TEST_DLL_OUT    = $(BUILD_DIR)\test_plugin_dll.exe
 TEST_STATS_OUT  = $(BUILD_DIR)\test_stats.exe
 TEST_REPORT_OUT = $(BUILD_DIR)\test_report.exe
-DEF_FILE        = restic_wfx.def
 RC_FILE         = src\restic_wfx.rc
 ICO_FILE        = logo\restic_wfx.ico
 INI_TEMPLATE    = restic_plugin.ini
@@ -32,7 +65,6 @@ PLUGINST_FILE   = pluginst.inf
 PLUGINST_OUT    = $(BUILD_DIR)\pluginst.inf
 
 CC   = cl.exe
-LINK = link.exe
 RC   = rc.exe
 
 # Strict pure C11 (/TC /std:c11) compiler flags and security hardening (/GS)
@@ -40,19 +72,20 @@ CFLAGS_COMMON = /nologo /TC /std:c11 /permissive- /W4 /WX /we4013 /GS \
                 /DUNICODE /D_UNICODE /DCJSON_HIDE_SYMBOLS /Iinclude /IcJSON \
                 /Fo$(BUILD_DIR)\ /Fd$(BUILD_DIR)\vc.pdb
 
-# Linker security hardening (/DYNAMICBASE for ASLR, /NXCOMPAT for DEP)
-LFLAGS_COMMON = /NOLOGO /DEBUG /DYNAMICBASE /NXCOMPAT
+# Linker security hardening (/DYNAMICBASE for ASLR, /NXCOMPAT for DEP).
+# /SAFESEH and /MACHINE are architecture specific (see LFLAGS_ARCH).
+LFLAGS_COMMON = /NOLOGO /DEBUG /DYNAMICBASE /NXCOMPAT $(LFLAGS_ARCH)
 SYSLIBS       = User32.lib
 TEST_LIBS     = Shell32.lib
 
 !IF "$(CONFIG)" == "Release"
 CFLAGS_CFG = /MT /O2 /Zi /DNDEBUG
 LFLAGS_CFG = $(LFLAGS_COMMON) /OPT:REF /OPT:ICF
-RCFLAGS    = /nologo /Iinclude /DNDEBUG
+RCFLAGS    = /nologo /Iinclude /DNDEBUG $(RCFLAGS_ARCH)
 !ELSE
 CFLAGS_CFG = /MTd /Zi /Od /D_DEBUG
 LFLAGS_CFG = $(LFLAGS_COMMON)
-RCFLAGS    = /nologo /Iinclude /D_DEBUG
+RCFLAGS    = /nologo /Iinclude /D_DEBUG $(RCFLAGS_ARCH)
 !ENDIF
 
 CFLAGS_EXTRA =
@@ -67,7 +100,7 @@ CFLAGS_SAN   = /fsanitize=address
 LFLAGS_CFG   = $(LFLAGS_CFG) /INCREMENTAL:NO
 !ENDIF
 
-CFLAGS = $(CFLAGS_COMMON) $(CFLAGS_CFG) $(CFLAGS_EXTRA)
+CFLAGS = $(CFLAGS_COMMON) $(CFLAGS_CFG) $(CFLAGS_EXTRA) $(CFLAGS_ARCH)
 
 PLUGIN_OBJS = $(BUILD_DIR)\main.obj $(BUILD_DIR)\config.obj $(BUILD_DIR)\restic_cli.obj \
               $(BUILD_DIR)\restic_stats.obj $(BUILD_DIR)\wfx_path.obj $(BUILD_DIR)\fscontent.obj \
@@ -82,6 +115,7 @@ TEST_REPORT_OBJS = $(BUILD_DIR)\test_report.obj $(PLUGIN_OBJS)
 all: $(BUILD_DIR) $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT)
 
 $(BUILD_DIR):
+	@if not exist "$(BUILD_ROOT)" mkdir "$(BUILD_ROOT)"
 	@if not exist "$(BUILD_DIR)" mkdir "$(BUILD_DIR)"
 
 $(INI_OUT): $(BUILD_DIR) $(INI_TEMPLATE)
@@ -98,9 +132,6 @@ $(BUILD_DIR)\config.obj: $(BUILD_DIR) src\config.c include\config.h
 
 $(BUILD_DIR)\restic_cli.obj: $(BUILD_DIR) src\restic_cli.c include\restic_cli.h include\fsplugin.h cJSON\cJSON.h
 	$(CC) /c $(CFLAGS) src\restic_cli.c
-
-
-
 
 $(BUILD_DIR)\restic_stats.obj: $(BUILD_DIR) src\restic_stats.c include\restic_stats.h include\restic_cli.h cJSON\cJSON.h
 	$(CC) /c $(CFLAGS) src\restic_stats.c
@@ -121,7 +152,7 @@ $(BUILD_DIR)\wfx_trace.obj: $(BUILD_DIR) src\wfx_trace.c include\wfx_trace.h
 	$(CC) /c $(CFLAGS) src\wfx_trace.c
 
 $(BUILD_DIR)\cJSON.obj: $(BUILD_DIR) cJSON\cJSON.c cJSON\cJSON.h
-	$(CC) /c /nologo /TC /std:c11 /W3 /GS /DCJSON_HIDE_SYMBOLS $(CFLAGS_CFG) $(CFLAGS_SAN) /IcJSON /Fo$(BUILD_DIR)\ /Fd$(BUILD_DIR)\vc.pdb cJSON\cJSON.c
+	$(CC) /c /nologo /TC /std:c11 /W3 /GS /DCJSON_HIDE_SYMBOLS $(CFLAGS_CFG) $(CFLAGS_SAN) $(CFLAGS_ARCH) /IcJSON /Fo$(BUILD_DIR)\ /Fd$(BUILD_DIR)\vc.pdb cJSON\cJSON.c
 
 $(BUILD_DIR)\test_config.obj: $(BUILD_DIR) tests\test_config.c include\config.h include\fsplugin.h
 	$(CC) /c $(CFLAGS) tests\test_config.c
@@ -156,7 +187,7 @@ $(TEST_REPORT_OUT): $(TEST_REPORT_OBJS)
 $(BUILD_DIR)\test_plugin_dll.obj: $(BUILD_DIR) tests\test_plugin_dll.c include\version.h
 	$(CC) /c $(CFLAGS) tests\test_plugin_dll.c
 
-# Black-box smoke test: loads build\restic.wfx64 like Total Commander does (links no plugin code)
+# Black-box smoke test: loads the plugin DLL like Total Commander does (links no plugin code)
 $(TEST_DLL_OUT): $(BUILD_DIR)\test_plugin_dll.obj
 	$(CC) /nologo $(CFLAGS_CFG) $(CFLAGS_SAN) $(BUILD_DIR)\test_plugin_dll.obj /link $(LFLAGS_CFG) $(SYSLIBS) /OUT:$(TEST_DLL_OUT)
 
@@ -174,11 +205,18 @@ test: $(TEST_DEPS)
 	$(TEST_DLL_OUT)
 
 analyze:
-	$(MAKE) /nologo ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_REPORT_OUT) $(TEST_DLL_OUT)
+	$(MAKE) /nologo ARCH=$(ARCH) ANALYZE=1 $(PLUGIN_OUT) $(INI_OUT) $(PLUGINST_OUT) $(TEST_CONFIG_OUT) $(TEST_CLI_OUT) $(TEST_STATS_OUT) $(TEST_REPORT_OUT) $(TEST_DLL_OUT)
 
+# Release build of one architecture plus the files that go next to the DLL
 package:
-	$(MAKE) /nologo CONFIG=Release all
-	python -c "import re, zipfile; ver = re.search(r'RESTIC_WFX_PRODUCT_VER\s+\"([^\"]+)\"', open('include/version.h').read()).group(1); inf = open('build/pluginst.inf').read(); assert f'version={ver}' in inf and 'file=restic.wfx64' in inf; zpath = f'build/wfx_restic_{ver}_x64.zip'; zf = zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED); [zf.write(src, arc) for src, arc in [('build/pluginst.inf','pluginst.inf'),('build/restic.wfx64','restic.wfx64'),('build/restic_plugin.ini','restic_plugin.ini'),('README.md','README.md'),('LICENSE','LICENSE')]]; zf.close(); print(f'[PACKAGE] Created {zpath} ({len(zf.namelist())} files)')"
+	$(MAKE) /nologo ARCH=$(ARCH) CONFIG=Release all
+
+# Install package with both architectures (32-bit restic.wfx and 64-bit restic.wfx64)
+zip:
+	python tools\package.py
 
 clean:
 	@if exist "$(BUILD_DIR)" rmdir /s /q "$(BUILD_DIR)"
+
+cleanall:
+	@if exist "$(BUILD_ROOT)" rmdir /s /q "$(BUILD_ROOT)"
