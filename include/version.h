@@ -9,7 +9,6 @@
 
 #define RESTIC_WFX_VERSION_CSV    1,3,3,0
 #define RESTIC_WFX_VERSION_STR    "1.3.3.0"
-#define RESTIC_WFX_VERSION_WSTR  L"1.3.3.0"
 #define RESTIC_WFX_PRODUCT_VER    "1.3.3"
 
 #endif /* RESTIC_WFX_VERSION_H */

@@ -1,5 +1,6 @@
 /*
- * Windows Resource Script for Restic Total Commander WFX Plugin (restic.wfx64)
+ * Windows Resource Script for Restic Total Commander WFX Plugin
+ * (restic.wfx64 for x64 builds, restic.wfx for x86 builds: see RC_ARCH_X86)
  *
  * 1. Icon resource (ID 1): Total Commander loads the FIRST icon resource (by index)
  *    found in the WFX DLL and displays it next to "Restic Backups" in Network Neighborhood.
@@ -18,6 +19,14 @@
 #define VER_FILEFLAGS 0x0L
 #endif
 
+/* The Makefile passes /DRC_ARCH_X86 for the 32-bit build: the file name must match
+   the DLL that is produced, or the Details tab shows the wrong name. */
+#ifdef RC_ARCH_X86
+#define PLUGIN_FILE_NAME "restic.wfx"
+#else
+#define PLUGIN_FILE_NAME "restic.wfx64"
+#endif
+
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     RESTIC_WFX_VERSION_CSV
 PRODUCTVERSION  RESTIC_WFX_VERSION_CSV
@@ -34,9 +43,9 @@ BEGIN
             VALUE "CompanyName",      "Pietro Partescano\0"
             VALUE "FileDescription",  "Restic Backup Browser - Total Commander File System Plugin (WFX)\0"
             VALUE "FileVersion",      RESTIC_WFX_VERSION_STR "\0"
-            VALUE "InternalName",     "restic.wfx64\0"
+            VALUE "InternalName",     PLUGIN_FILE_NAME "\0"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Pietro Partescano. Licensed under the MIT License.\0"
-            VALUE "OriginalFilename", "restic.wfx64\0"
+            VALUE "OriginalFilename", PLUGIN_FILE_NAME "\0"
             VALUE "ProductName",      "Restic WFX Plugin for Total Commander\0"
             VALUE "ProductVersion",   RESTIC_WFX_PRODUCT_VER "\0"
         END

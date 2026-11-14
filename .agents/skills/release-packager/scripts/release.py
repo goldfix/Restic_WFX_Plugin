@@ -3,7 +3,8 @@
 
 Bumps every version reference in the repository, refreshes the documentation,
 builds and tests the plugin (Debug, /analyze, AddressSanitizer, Release) and
-creates the Total Commander installation ZIP (build/wfx_restic_<version>_x64.zip).
+creates the Total Commander installation ZIP (build/wfx_restic_<version>.zip), which
+contains both the 32-bit (restic.wfx) and the 64-bit (restic.wfx64) plugin.
 
 Usage (from anywhere; the repository root is detected automatically):
     python .agents/skills/release-packager/scripts/release.py 1.1.0
@@ -11,14 +12,15 @@ Usage (from anywhere; the repository root is detected automatically):
     python .agents/skills/release-packager/scripts/release.py 1.1.0 --skip-tests
     python .agents/skills/release-packager/scripts/release.py 1.1.0 --notes "Fixed X"
 
-Requirements: an initialized MSVC x64 environment (cl, link, rc, nmake) and `bash`
-(Git Bash / MSYS2) in PATH, exactly like ./build.sh.
+Requirements: an initialized MSVC environment (cl, link, rc, nmake) that includes the
+x86 and x64 toolsets, and `bash` (Git Bash / MSYS2) in PATH, exactly like ./build.sh.
 """
 from __future__ import annotations
 
 import argparse
 import datetime
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -37,13 +39,23 @@ AGENT_MD = ROOT / "AGENT.md"
 MEMORY_MD = ROOT / "MEMORY.md"
 BUILD_DIR = ROOT / "build"
 
-# Files that must be in the ZIP root (Total Commander looks for pluginst.inf there)
-ZIP_EXPECTED = {"pluginst.inf", "restic.wfx64", "restic_plugin.ini", "README.md", "LICENSE"}
+# Files that must be in the ZIP root (Total Commander looks for pluginst.inf there).
+# One package serves both architectures: restic.wfx (32-bit) and restic.wfx64 (64-bit)
+# share the base name, and pluginst.inf registers the base name only.
+ZIP_EXPECTED = {"pluginst.inf", "restic.wfx", "restic.wfx64", "restic_plugin.ini", "README.md", "LICENSE"}
+# DLLs inside the ZIP -> expected IMAGE_FILE_HEADER.Machine
+ZIP_DLLS = {"restic.wfx": 0x014C, "restic.wfx64": 0x8664}
 
-# Build actions executed through build.sh, in order. `package` cleans, builds Release,
-# runs the Release tests and creates the ZIP, so it must come last.
-FULL_ACTIONS = ["test", "analyze", "asan", "package"]
+# Build actions executed through build.sh, in order. `analyze` already builds and runs the whole Debug
+# suite (with /analyze on top), so a separate `test` run would only repeat it. `package` cleans, builds
+# Release, runs the Release tests and creates the ZIP, so it must come last.
+FULL_ACTIONS = ["analyze", "asan", "package"]
 QUICK_ACTIONS = ["package"]
+# Optional (--mutation, ~15 min): the tests must catch every planted defect (tests/mutation). It runs before
+# `package`, which starts from a clean Release build anyway.
+MUTATION_ACTION = "mutate"
+# `test`, `analyze` and `asan` must cover both architectures: DEBUG_ARCH is exported to build.sh
+ARCH_ALL = "all"
 
 
 # --------------------------------------------------------------------------- helpers
@@ -97,7 +109,6 @@ def update_version_h(major: int, minor: int, patch: int, ver: str) -> str:
     text = sub_once(text, r"#define\s+RESTIC_WFX_VER_BUILD\s+\d+", "#define RESTIC_WFX_VER_BUILD      0", "VER_BUILD")
     text = sub_once(text, r"#define\s+RESTIC_WFX_VERSION_CSV\s+[\d,]+", f"#define RESTIC_WFX_VERSION_CSV    {major},{minor},{patch},0", "VERSION_CSV")
     text = sub_once(text, r'#define\s+RESTIC_WFX_VERSION_STR\s+"[^"]*"', f'#define RESTIC_WFX_VERSION_STR    "{ver}.0"', "VERSION_STR")
-    text = sub_once(text, r'#define\s+RESTIC_WFX_VERSION_WSTR\s+L"[^"]*"', f'#define RESTIC_WFX_VERSION_WSTR  L"{ver}.0"', "VERSION_WSTR")
     text = sub_once(text, r'#define\s+RESTIC_WFX_PRODUCT_VER\s+"[^"]*"', f'#define RESTIC_WFX_PRODUCT_VER    "{ver}"', "PRODUCT_VER")
     return text
 
@@ -167,12 +178,12 @@ def update_memory(ver: str, notes: str, mode: str) -> str:
         elif mode == "quick":
             entry.append("  - Release tests passed (`--skip-tests`: Debug, `/analyze` and ASan were not run).")
         if mode in ("full", "quick"):
-            entry.append(f"  - `build/wfx_restic_{ver}_x64.zip` created and verified (ZIP contents, `pluginst.inf` version, DLL `VERSIONINFO`).")
+            entry.append(f"  - `build/wfx_restic_{ver}.zip` created and verified (ZIP contents, `pluginst.inf` version, PE machine type and `VERSIONINFO` of both DLLs).")
         else:
             entry.append("  - Files and documentation only (`--no-build`): nothing was built, tested or packaged.")
         if notes:
             entry.append(f"  - Notes: {notes}")
-        entry.append(f"- **Next step:** upload `build/wfx_restic_{ver}_x64.zip` to a GitHub Release tagged `v{ver}`.")
+        entry.append(f"- **Next step:** upload `build/wfx_restic_{ver}.zip` to a GitHub Release tagged `v{ver}`.")
         text = text.rstrip("\n") + "\n" + "\n".join(entry) + "\n"
     return text
 
@@ -183,8 +194,10 @@ def run_build(actions: list[str]) -> None:
     if not bash:
         raise SystemExit("`bash` not found in PATH (Git Bash / MSYS2 is required, as for ./build.sh)")
     for action in actions:
-        log(f"./build.sh {action}")
-        result = subprocess.run([bash, "build.sh", action], cwd=ROOT)
+        log(f"./build.sh {action} (ARCH={ARCH_ALL})")
+        # Both architectures are gated: a 32-bit only regression must not reach the release
+        env = dict(os.environ, ARCH=ARCH_ALL)
+        result = subprocess.run([bash, "build.sh", action], cwd=ROOT, env=env)
         if result.returncode != 0:
             raise SystemExit(
                 f"`./build.sh {action}` failed (exit {result.returncode}). "
@@ -226,8 +239,19 @@ def read_dll_version(dll_path: Path) -> str:
     return f"{info.dwFileVersionMS >> 16}.{info.dwFileVersionMS & 0xFFFF}.{info.dwFileVersionLS >> 16}.{info.dwFileVersionLS & 0xFFFF}"
 
 
+def pe_machine(path: Path) -> int:
+    """Returns IMAGE_FILE_HEADER.Machine of a PE file without loading it."""
+    data = path.read_bytes()
+    if data[:2] != b"MZ":
+        raise SystemExit(f"{path.name} is not a PE file")
+    offset = int.from_bytes(data[0x3C:0x40], "little")
+    if data[offset:offset + 4] != b"PE\0\0":
+        raise SystemExit(f"{path.name} has no PE signature")
+    return int.from_bytes(data[offset + 4:offset + 6], "little")
+
+
 def verify_zip(ver: str) -> Path:
-    zip_path = BUILD_DIR / f"wfx_restic_{ver}_x64.zip"
+    zip_path = BUILD_DIR / f"wfx_restic_{ver}.zip"
     if not zip_path.is_file():
         raise SystemExit(f"Expected package not found: {zip_path}")
 
@@ -239,20 +263,32 @@ def verify_zip(ver: str) -> Path:
             raise SystemExit("ZIP integrity check failed")
 
         inf = zf.read("pluginst.inf").decode("ascii", "replace")
-        for needle in ("[plugininstall]", "type=wfx", "file=restic.wfx64", f"version={ver}"):
+        # The manifest must register the base name: Total Commander appends 64 to the
+        # extension by itself when it runs as a 64-bit process.
+        for needle in ("[plugininstall]", "type=wfx", "file=restic.wfx", f"version={ver}"):
             if needle not in inf:
                 raise SystemExit(f"pluginst.inf inside the ZIP lacks '{needle}'")
+        if "file=restic.wfx64" in inf:
+            raise SystemExit("pluginst.inf registers restic.wfx64 instead of the base name restic.wfx")
 
+        versions = []
         with tempfile.TemporaryDirectory() as tmp:
-            dll = Path(tmp) / "restic.wfx64"
-            dll.write_bytes(zf.read("restic.wfx64"))
-            dll_version = read_dll_version(dll)
+            for name, machine in ZIP_DLLS.items():
+                dll = Path(tmp) / name
+                dll.write_bytes(zf.read(name))
+                found = pe_machine(dll)
+                if found != machine:
+                    raise SystemExit(f"{name} has PE machine {found:#06x}, expected {machine:#06x}")
+                versions.append(read_dll_version(dll))
+    if len(set(versions)) != 1:
+        raise SystemExit(f"The two DLLs carry different FileVersion values: {sorted(set(versions))}")
+    dll_version = versions[0]
     if dll_version != f"{ver}.0":
         raise SystemExit(f"DLL FileVersion is {dll_version}, expected {ver}.0")
 
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     (zip_path.parent / (zip_path.name + ".sha256")).write_text(f"{digest} *{zip_path.name}\n", encoding="ascii")
-    log(f"ZIP verified: {zip_path.name} ({zip_path.stat().st_size} bytes), DLL FileVersion {dll_version}")
+    log(f"ZIP verified: {zip_path.name} ({zip_path.stat().st_size} bytes, x86 + x64), DLL FileVersion {dll_version}")
     log(f"SHA-256: {digest}")
     return zip_path
 
@@ -264,6 +300,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="show what would change without touching any file")
     parser.add_argument("--skip-tests", action="store_true", help="only run `./build.sh package` (Release build + Release tests + ZIP)")
     parser.add_argument("--no-build", action="store_true", help="update files/docs only; do not build, test or package")
+    parser.add_argument("--mutation", action="store_true", help="also run the mutation tests (./build.sh mutate, ~15 minutes) before packaging")
     parser.add_argument("--notes", default="", help="free text added to the MEMORY.md session log entry")
     args = parser.parse_args()
 
@@ -303,7 +340,10 @@ def main() -> int:
         log("Files updated (--no-build): build, test and package skipped.")
         return 0
 
-    run_build(QUICK_ACTIONS if args.skip_tests else FULL_ACTIONS)
+    actions = list(QUICK_ACTIONS if args.skip_tests else FULL_ACTIONS)
+    if args.mutation:
+        actions.insert(actions.index("package"), MUTATION_ACTION)
+    run_build(actions)
     zip_path = verify_zip(ver)
     finish_memory()
     log(f"DONE. Upload {zip_path.relative_to(ROOT)} to a GitHub Release tagged v{ver}.")

@@ -367,10 +367,10 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
 ### 5.1 Plugin Icon Specification (Total Commander WFX Standard)
 
 - **Network Neighborhood Root Icon (implemented):** Total Commander automatically displays the **first `ICON` resource (by index)** embedded inside `restic.wfx64` to the left of `"Restic Backups"` in Network Neighborhood (no extra exported function is required). Per the official WFX specification:
-  - Format: `logo\restic_wfx.ico` linked into `restic.wfx64` via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
+  - Format: `logo\restic_wfx.ico` linked into the plugin DLL (32-bit and 64-bit image, see §8.6) via `src\restic_wfx.rc` (`rc.exe /nologo /fobuild\restic_wfx.res src\restic_wfx.rc`).
   - Included frames inside `logo\restic_wfx.ico` (5 resolutions): **16×16, 24×24, 32×32, 48×48** (32-bit BGRA uncompressed BMP/DIB frames) plus **256×256** (32-bit RGBA PNG-compressed), built from `logo\logo_16x16.ico`, `logo\logo_24x24.ico`, `logo\logo_32x32.ico`, `logo\logo_48x48.ico`, and `logo\logo_256x256.png`.
 - **Per-Item Custom Icons (`FsExtractCustomIconW`, optional):** only needed if custom icons are desired for individual repositories or snapshots inside the file list (`FS_ICONFLAG_SMALL` requests 16×16, otherwise 32×32). When omitted, Total Commander uses standard folder icons and normal Windows file-extension associations.
-- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.3.0` / `"1.3.3"`), embedded into `restic.wfx64` via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
+- **DLL Version Resource (`VS_VERSION_INFO`, implemented):** `include\version.h` defines the single source of truth for the plugin version (`1.3.3.0` / `"1.3.3"`), embedded into the plugin DLL via `src\restic_wfx.rc` so Windows Explorer and Total Commander display the version and metadata in file properties ("Details" tab).
 
 ---
 
@@ -378,12 +378,14 @@ backup. It is produced on demand for the folder the cursor is on and opened in t
 
 ```text
 Restic_WFX_Plugin/
-├── Makefile                    # NMake incremental build & test rules (Debug/Release/ASan/Analyze)
-├── build.sh                    # Bash wrapper (expects an initialized MSVC x64 environment) invoking NMake
+├── Makefile                    # NMake incremental build & test rules, per architecture (ARCH=x64|x86)
+├── build.sh                    # Bash wrapper (switches the MSVC toolset for ARCH=x64|x86|all) invoking NMake
 ├── .clang-format               # Code formatting rules (C11, 4 spaces, 100 cols)
-├── restic_wfx.def              # Explicit DLL exports to prevent MSVC name mangling
-├── restic_plugin.ini           # Commented sample configuration file (copied to build\restic_plugin.ini)
-├── pluginst.inf                # Total Commander auto-install manifest (copied to build\ and packed in the ZIP)
+├── restic_wfx.def              # Explicit DLL exports for the x64 build (no name decoration)
+├── restic_wfx32.def            # Explicit DLL exports for the x86 build (__stdcall, _FsInit@16 aliases)
+├── tools/package.py            # Creates the install ZIP from build\x64 and build\x86 (both DLLs + verification)
+├── restic_plugin.ini           # Commented sample configuration file (copied to build\<arch>\)
+├── pluginst.inf                # Total Commander auto-install manifest (registers the base name restic.wfx)
 ├── .agents/skills/             # Agent skills: memory-updater, kroki-diagrams, release-packager (scripts/release.py: bump version, docs, tests, ZIP)
 ├── logo/                       # Plugin icons (.ico 16/24/32/48 + multi-res restic_wfx.ico) & PNG logos (256/512/2048)
 ├── cJSON/
@@ -416,7 +418,8 @@ Restic_WFX_Plugin/
     ├── test_restic_cli.c       # Parsers, quoting, process execution (cmd.exe stand-in) + live restic.exe tests
     ├── test_stats.c            # Path decomposition, statistics parser, cache, FsContent* columns
     ├── test_report.c           # Statistics report: bars, parsers, F3 Path Guard/decision, Markdown writers, live run
-    └── test_plugin_dll.c       # Black-box smoke test: LoadLibrary(restic.wfx64) + exported WFX surface
+    ├── test_plugin_dll.c       # Black-box smoke test: LoadLibrary(restic.wfx64|restic.wfx) + exported WFX surface
+    └── mutation/               # Mutation tests of the tests (./build.sh mutate): harness, helper, 49 mutation scripts, table
 ```
 
 ---
@@ -499,7 +502,11 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 - `/permissive-`: Disable non-conforming MSVC language extensions.
 - `/W4`: Enable high warning level across all project source files (third-party `cJSON.c` is compiled with `/W3`).
 - `/WX`: Treat all warnings as errors so implicit conversions or uninitialized variables cannot slip through.
-- `/we4013`: Treat implicit function declarations (missing prototypes) as errors—critical on 64-bit x64 architectures to prevent pointer truncation.
+- `/we4013`: Treat implicit function declarations (missing prototypes) as errors—critical to prevent pointer
+  truncation, on both architectures.
+- **Same flags for both architectures.** The code compiles warning-free with `/W4 /WX` as x64 and as x86: the
+  size conversions that `C4267` flags on x64 (`size_t` -> `int`) are the reverse ones (`C4244`) on x86, so
+  every narrowing conversion is explicit, and nothing relies on a 64-bit `size_t` or on pointer == `int`.
 
 ### 8.2 Static CRT Linking (`/MT` & `/MTd`)
 - **Release (`/MT`):** Links the C Runtime statically into `restic.wfx64`. The plugin works out-of-the-box on any clean Windows installation without requiring the user to install matching *Visual C++ Redistributable* packages (`VCRUNTIME140.dll`).
@@ -514,7 +521,16 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
 
 ### 8.5 Binary Security Hardening
 - **Compiler:** `/GS` (Buffer Security Check / stack cookie protection).
-- **Linker:** `/DYNAMICBASE` (ASLR - Address Space Layout Randomization) and `/NXCOMPAT` (DEP - Data Execution Prevention), plus `/DEF:restic_wfx.def` to export undecorated symbol names.
+- **Linker:** `/DYNAMICBASE` (ASLR - Address Space Layout Randomization) and `/NXCOMPAT` (DEP - Data Execution Prevention).
+- **Architecture:** `/MACHINE:X64` for the 64-bit plugin and `/MACHINE:X86 /SAFESEH` for the 32-bit one.
+  `/SAFESEH` makes the linker refuse to produce a 32-bit image unless every object carries a safe
+  exception handler table (LNK2026 otherwise); it only exists for x86, x64 describes the handlers in the
+  PDATA section. `/HIGHENTROPYVA` and `/LARGEADDRESSAWARE` are x64-only and are not used.
+- **Exports:** `/DEF:restic_wfx.def` for x64 and `/DEF:restic_wfx32.def` for x86, because a 32-bit
+  `__stdcall` function is stored as `_FsInit@16` in the object file: the x86 table maps every public name
+  to its decorated symbol (`FsInit=_FsInit@16`), the x64 one lists the plain names (x64 has a single
+  calling convention and no decoration). `tests\test_plugin_dll.c` loads the DLL and looks the names up
+  with `GetProcAddress`, so a wrong decoration fails the build's test run instead of Total Commander.
 - **Export surface:** `cJSON` is compiled with `/DCJSON_HIDE_SYMBOLS`. Without it the library marks
   every API `__declspec(dllexport)` and the plugin would export ~90 `cJSON_*` functions next to the
   WFX entry points. `tests/test_plugin_dll.c` asserts the exact surface: the 15 read-only
@@ -526,34 +542,176 @@ Because the plugin runs in-process inside `TOTALCMD64.EXE` and handles dynamic m
   (the injected Alt+Enter) (`SYSLIBS = User32.lib`; the tests also use
   `Shell32.lib` for `CommandLineToArgvW`).
 
-### 8.6 Build & Test Commands (`build.sh` & `Makefile`)
+### 8.6 Dual-Architecture Build (x64 and x86)
+
+Total Commander exists as a 32-bit and as a 64-bit program, and a process can only load a DLL of its own
+architecture. The WFX SDK therefore asks for **two binaries with the same base name in the same folder**,
+the 64-bit one carrying the `64` suffix: `restic.wfx` (32-bit) and `restic.wfx64` (64-bit). Both are built
+from the same sources; only the export table, the `VERSIONINFO` file name and the linker settings differ.
+
+- **Layout:** one build folder per architecture, `build\x64` and `build\x86`, with the same file names
+  inside (`restic.wfx*`, `pluginst.inf`, `restic_plugin.ini`, `test_*.exe`). Object files of the two
+  architectures never mix, so switching architecture needs no `clean` and both builds can coexist.
+- **`ARCH` (`Makefile`):** `x64` (default) or `x86`, selected with `nmake ARCH=x86`. It picks the DLL name,
+  the `.def` file, `/MACHINE`, `/SAFESEH`, the `RC_ARCH_X86` define for the resource script and the
+  `/DARCH_X86` define for the sources; an invalid value is rejected with `!ERROR`.
+- **`ARCH` (`build.sh`):** `x64` (default), `x86`, or `all` (every action twice, x64 first; `package`
+  always defaults to `all`). The wrapper translates `INCLUDE`/`LIB`/`PATH` of the *active* environment to
+  the requested toolset: it rewrites the architecture segment of every `LIB` entry, of the
+  `…\bin\Host<host>\<target>` entry of `PATH` (the SDK tools in `…\Windows Kits\10\bin\<sdk>\<host>`
+  stay the host ones on purpose, exactly as `vcvarsall.bat` does) and then verifies that `cl.exe` exists.
+  Nothing is hardcoded, so the same script works with a Visual Studio installation, with
+  `vcvarsall.bat x86`, or with any portable MSVC layout that ships one activation script per target.
+- **Toolset requirement:** both architectures must be installed (`MSVC v143 - VS 2022 C++ x86/x64 build
+  tools`, or `portable-msvc.py --target x64,x86`). If the x86 toolset is missing, `./build.sh` stops with
+  an explicit message instead of linking the wrong CRT.
+- **32-bit resource script:** `rc.exe` gets `/DRC_ARCH_X86`, so `InternalName` and `OriginalFilename` of
+  the 32-bit DLL say `restic.wfx` while the 64-bit one says `restic.wfx64`.
+- **One configuration per folder (`build.sh`).** Debug, Release, ASan and `/analyze` objects use different CRTs
+  and cannot be linked together, so `build/<arch>/.config` records the configuration of the folder
+  (`prepare_config`). A different request, a folder without the stamp (an interrupted or old build) and the
+  `analyze`/`package` actions (always fresh) trigger a `clean` of that architecture first; the stamp is written
+  *after* the clean, because the clean removes the folder. Without it a Debug test run after `package` linked
+  Release objects (`unresolved external symbol _malloc_dbg`).
+- **Installer:** `pluginst.inf` registers the **base name** `file=restic.wfx`; a 64-bit Total Commander
+  appends `64` to the extension by itself when it loads a plugin, which is exactly why both files must
+  share the base name and the folder. The ZIP therefore contains both DLLs and one manifest, and a single
+  download serves both Total Commanders.
+- **Tests:** every test program is built for the architecture under test (a 64-bit test process cannot
+  load the 32-bit DLL). `test_plugin_dll.c` stages its own folder (`build\x64` or `build\x86`), reads
+  `IMAGE_FILE_HEADER.Machine` of the DLL file and asserts that it matches the process bitness, that the
+  file name follows the `64` suffix rule and that the staged `pluginst.inf` registers `restic.wfx`.
+- **Sanitizers/analysis on x86:** `/analyze` and `/fsanitize=address` work for both targets; the x86 ASan
+  runs report 84 + 332 + 450 + 327 assertions, because the DLL smoke test needs the plugin binary and is
+  skipped in that configuration.
+
+### 8.7 Build & Test Commands (`build.sh` & `Makefile`)
 
 ```bash
-./build.sh debug     # Incremental Debug build (build/restic.wfx64, /MTd)
-./build.sh release   # Optimized Release build (build/restic.wfx64, /MT)
+./build.sh debug     # Incremental Debug build (build/x64/restic.wfx64, /MTd)
+./build.sh release   # Optimized Release build (build/x64/restic.wfx64, /MT)
 ./build.sh test      # Build plugin + run all five test programs (CRT heap & leak verification)
 ./build.sh release-test  # Same tests against the optimized /MT /O2 build
 ./build.sh asan      # Rebuild and run unit tests under MSVC AddressSanitizer (DLL smoke test is skipped)
 ./build.sh analyze   # Rebuild plugin & tests with MSVC Static Analyzer (/analyze)
-./build.sh package   # Clean, Release build + tests, then build/wfx_restic_<version>_x64.zip (Total Commander installable package)
-./build.sh clean     # Remove build/ directory (required when switching between Debug/Release/ASan/Analyze)
+./build.sh package   # Both architectures: clean + Release build + tests, then build/wfx_restic_<version>.zip
+./build.sh zip       # Rebuild only the install ZIP from the existing build/x64 and build/x86
+./build.sh clean     # Remove the build folder of the selected architecture
+./build.sh cleanall  # Remove the whole build folder
+
+ARCH=x86 ./build.sh test    # 32-bit build, artifacts in build/x86
+ARCH=all ./build.sh test    # x64 and then x86 in one run
 ```
 
-**Release package (`package`):** the ZIP is created by an inline `python -c` command in the `Makefile` (`package` target; Python is available in the shell). The version is read from `include/version.h` (`RESTIC_WFX_PRODUCT_VER`) and cross-checked against `pluginst.inf` (`version=` and `file=restic.wfx64`) before zipping. Contents (all in the ZIP root, otherwise Total Commander does not detect `pluginst.inf`): `pluginst.inf`, `restic.wfx64`, `restic_plugin.ini`, `README.md`, `LICENSE`. **Releases are prepared with the `release-packager` skill** (`.agents/skills/release-packager/`): `python .agents/skills/release-packager/scripts/release.py X.Y.Z` bumps every version reference, runs Debug/`/analyze`/ASan/Release tests, creates and verifies the ZIP (and a `.sha256`). **Manually, when bumping the version, update both `include/version.h` and `pluginst.inf`** (`test_plugin_dll.c` fails if they diverge). Per the WFX SDK, a 64-bit plugin must carry the `64` suffix (`restic.wfx64`); `pluginst.inf` uses `type=wfx`, `defaultdir=restic`.
+**Release package (`package`):** `./build.sh package` builds and tests both architectures and then calls
+`tools/package.py`, which is the only place that knows the ZIP rules. The script reads the version from
+`include\version.h` (`RESTIC_WFX_PRODUCT_VER`), cross-checks `pluginst.inf` (`type=wfx`,
+`file=restic.wfx`, `defaultdir=restic`, `version=`), verifies `IMAGE_FILE_HEADER.Machine` of every DLL
+(`build\x86\restic.wfx` = `I386`, `build\x64\restic.wfx64` = `AMD64`) and that both staged folders carry
+`pluginst.inf` and `restic_plugin.ini`, then writes `build/wfx_restic_<version>.zip` and its `.sha256`.
+Contents (all in the ZIP root, otherwise Total Commander does not detect `pluginst.inf`): `pluginst.inf`,
+`restic.wfx`, `restic.wfx64`, `restic_plugin.ini`, `README.md`, `LICENSE`. **Releases are prepared with the
+`release-packager` skill** (`.agents/skills/release-packager/`):
+`python .agents/skills/release-packager/scripts/release.py X.Y.Z` bumps every version reference, runs
+Debug/`/analyze`/ASan/Release tests for both architectures (`ARCH=all`), creates and verifies the ZIP
+(contents, PE machine types, `VERSIONINFO` of both DLLs, `.sha256`). **Manually, when bumping the version,
+update both `include/version.h` and `pluginst.inf`** (`test_plugin_dll.c` fails if they diverge).
 
-If Total Commander still has `build/restic.wfx64` loaded, `build.sh` renames the locked DLL to `restic.wfx64.old` so the link can proceed; run `cm_UnloadPlugins` in Total Commander (or restart it) to load the new build, then delete the `.old` file.
+If Total Commander still has a plugin DLL loaded (`build/x64/restic.wfx64` or `build/x86/restic.wfx`),
+`build.sh` renames it to `.old` so the link can proceed; run `cm_UnloadPlugins` in Total Commander (or
+restart it) to load the new build, then delete the `.old` file.
 
 
-### 8.7 Test Suites (`tests/`)
+### 8.8 Test Suites (`tests/`)
 
 | Program | Scope |
 | --- | --- |
-| `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty), and verification that the staged `build\restic_plugin.ini` sample template is valid and has 0 active repositories, plus the **ANSI-unmappable `DefaultIniName`** cases (a `?` in the converted path or an empty name falls back to `%COMMANDER_INI_PATH%`, trailing separators are stripped, a usable name still wins, and no source leaves the fallback empty) (85 assertions). |
+| `test_config.c` | Directory normalization, INI primary/fallback priority (verifying no INI file is auto-created when missing), `restic.exe` resolution order, **PATH-only lookup (a planted `restic.exe` in the cwd must be ignored)**, `[Repositories]` parsing edge cases, 301-alias scaling (array and INI-section buffer growth), root enumeration through `FsFindFirstW/Next/Close`, WFX path validation, missing-`restic.exe` diagnostic, password prompt cancellation, the **missing-INI scenario** (`FsInitW`/`FsSetDefaultParams`/`FsFindFirstW`/`FsGetFileW` stay inert, no password prompt or popup, and plugin/fallback directories remain empty), and verification that the staged `build\<arch>\restic_plugin.ini` sample template is valid and has 0 active repositories, plus the **ANSI-unmappable `DefaultIniName`** cases (a `?` in the converted path or an empty name falls back to `%COMMANDER_INI_PATH%`, trailing separators are stripped, a usable name still wins, and no source leaves the fallback empty) (85 assertions). |
 | `test_restic_cli.c` | ISO-8601 edge cases (exact epoch value, offsets, fractions, invalid calendar dates), snapshot naming, path normalization (1023-char CJK path), `restic_quote_arg` round-trip, snapshot/NDJSON parsers (prefix-sharing siblings, missing/empty/file targets, symlinks, 64-bit sizes, corrupt lines, `\` and `/` inside a node name), snapshot-name strictness (`report_[deadbeef].txt` and `file[deadbeef]` are refused, the exact `YYYY-MM-DD_HH-MM-SS_[<hex>]` shape is accepted), truncation of a long non-ASCII Restic error message on a character boundary (no `U+FFFD`), **UNC share backups** (display name <-> real name mapping in `restic_normalize_filter_path`, a UNC volume at the root, `restic_add_unc_volumes` with duplicates/device paths/garbage, and a live backup taken through `\\localhost\C$\...` that is listed, navigated and dumped), process execution with `cmd.exe` as a deterministic stand-in (stdout/stderr separation, exit codes, environment injection/stripping/inheritance, timeout, cancellation, >100 KB output, >6000-char command line, spawn failures), and a **self-contained live test** against `tmp\restic.exe` including `restic_dump_file` streaming extraction, mtime preservation, 0-byte and 100 KB files, overwrite protection, binary fidelity (`00/0A/0D/1A` bytes), existing target preserved on every failure or abort, no leftover `~rp*.tmp`, local-side failures, argument validation, plus `test_dump_with_fake_restic` (a fake `restic` batch file that deterministically covers exit codes 10/11/12/other, stderr classification, partial output then failure, empty stderr, environment injection and the inactivity timeout: a silent child is killed, a slow but steady one survives) plus **`restic_exec_lines`** (a 4000-line / >100 KB stream delivered line by line, CR LF terminators removed, empty lines and an unterminated last line, callback abort, exit-code mapping with earlier lines still delivered, timeout, cancellation, argument checks) (332 assertions). |
 | `test_stats.c` | Path decomposition (`wfx_parse_path`: root, alias, snapshot, deep path, malformed/non-hex/empty IDs), statistics parser (`ResticSnapshotInfo` from a fixture with/without `summary`, tags/paths joining and counts, derived duration, `short_id` fallback, skipped entries, `null`/empty/malformed payloads, NULL arguments), per-alias cache (store/lookup/invalidate/clear, case-insensitive alias, replaced entries, 12-alias eviction, empty record list), and the `FsContent*` surface (field enumeration and naming rules, unit strings, values per field with unit scaling, fields inherited by files inside a snapshot, empty alias/root/unknown paths, `ft_nosuchfield`/`ft_fileerror`/`ft_fieldempty` edge cases, buffer truncation, delayed flag, default view/headers/widths/options consistency, NULL buffers, truncated `maxlen`, sort order, no field flags, unloading clears the cache) and the **Code Review 4 hardening tests** (statistics parser vs. listing parser stay index-aligned on non-hex/empty/non-ASCII IDs and bad dates, counters saturate at 2^63-1 for `1e30`/`2^64-1`/negative/string values and never turn negative through `FsContentGetValue`, 200-tag lists are cut without a dangling separator and still counted, UTF-8 host/tag/path text is converted to the ANSI code page and cut on a character boundary, emoji aliases resolve through their ANSI spelling, ambiguous spellings are refused, a literal `?` alias never overwrites a Unicode alias, 4 reader threads + 1 writer thread hammering the cache for 16 000 lookups), plus the **path-spelling and diagnostic tests** (8 accepted spellings of the same snapshot folder - relative, plugin root prepended, bare name, deep file, trailing backslash - with the canonical form still refusing another alias; `snapshot_stats_lookup_any` unique/unknown/NULL/duplicate-alias/conflicting-ID cases and the `snapshot_stats_describe` format; the `RESTIC_WFX_TRACE` switch writing nothing when unset, a full call record when set and UTF-8 paths (accent + CJK) in the log; UTF-8 truncation of 600-byte tags and of the diagnostic summary lands on a character boundary and still counts every alias; the loose lookup prefers the alias segment when two repositories share a short ID; the trace UTF-8 converters truncate on a character / surrogate-pair boundary instead of failing) (450 assertions). |
 | `test_report.c` | Statistics report: bar formatting as an ASCII code span (0 %, tiny ratio, 100 %, out-of-range ratios, degenerate widths/buffers), equal-width history table rows, no forced Lister mode on the launch command line, byte/count/timestamp formatting, Markdown cell text (`|` becomes `/`, control characters become spaces, markup kept verbatim), the `F3` Path Guard (panel text parsing at every level, both path bar and command line prompt spellings, plugin vs. local/UNC/other-plugin paths, a root name that only starts with the same characters, trailing separators, case and leading spaces, the file-list class predicate), the Path Guard scan (prompt authoritative in both directions, panels side by side and above each other, command line hidden, ambiguous layout refused, status bars ignored, deepest plugin bar wins), the request marker (window, single use, clock going backwards, zero tick), the `cm_List` request received by a stand-in window and the hook lifecycle (never installed from a thread without focus, idempotent shutdown), `restic stats` JSON parsing (restore-size, raw-data, format-v1 fallback, garbage), `restic diff` NDJSON parsing (change list capped at 100 while every event is counted), `restic ls --recursive` aggregation (self node ignored, a file named by the filter is not a folder, sibling with a shared prefix ignored, direct vs. nested counts, histogram buckets summing to the totals, sorted subfolder/extension buckets, top-15 ranking with Windows separators, timestamps converted to UTC), the three Markdown writers with hostile file names (`<script>`, quotes, `&`) and the absence of HTML, report paths in `%TEMP%` (repository/snapshot/folder names, forbidden characters, length bounds, small buffer), the Lister opening (test hook, failing hook, `RESTIC_WFX_NO_LISTER_GUI`), and a live end-to-end generation for all three levels with the real `tmp\restic.exe` (progress callbacks, the RAM cache answering a repeated request with a single progress step, `restic_report_clear_cache`, `ESC` cancellation that leaves an existing file untouched, unknown snapshot/folder refused, argument validation), plus the review hardening tests (hidden-file and trailing-dot extensions, long paths cut on a UTF-8 boundary, the `(other ...)` remainder rows, credential masking in every writer, a history table with sizes, a live second backup whose report carries the diff, a read-only earlier copy replaced, `ESC` inside a secondary `restic stats`), the in-use report probe (`restic_report_pick_destination`: suffix numbering, read-only and missing files) and the real Lister launch through a stand-in executable (`/S=L`, quoting of a path with spaces and brackets, missing host) (327 assertions). |
-| `test_plugin_dll.c` | Loads the built `restic.wfx64` like Total Commander: exact 23-function export surface (`FsGetFile`/`FsGetFileW` and the 10 `FsContent*` entry points included; write/delete/move functions forbidden), custom-column surface through `GetProcAddress` (field enumeration terminates, names unique, default view references `[=<fs>.` with one header per column, empty values for unknown paths, sort order, unloading), embedded `RT_GROUP_ICON` #1 + 5 `RT_ICON` frames (`16x16`..`256x256`), embedded `RT_VERSION` (`VS_VERSION_INFO` / `VS_FIXEDFILEINFO` matching `include/version.h`), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads, plus the statistics columns end to end on the live fixture (host name, `FILETIME`, short ID, file count vs. `has_summary`, inheritance for files inside a snapshot, empty columns for a repository that was never listed, independent entry per alias, cold start filled by one extra `restic snapshots` run when a snapshot folder is entered directly, one `MSGTYPE_TRANSFERCOMPLETE` with the documented `Download complete: <src> -> <dst>` text after a successful extraction, a snapshot of a UNC share navigated and extracted through the entry points, and the **statistics report** end to end: no artificial entry in any listing, `FsExecuteFileW` with `properties` (what `F3` and Alt+Enter end in) on a repository, a snapshot and a subfolder and with `quote stats` producing the Markdown, an Alt+Enter on a file or a folder posting no `cm_List` request to a stand-in main window, the command line verb tolerating case and spacing but refusing `quote statsx`/`quote ls`, `open` forwarded to Total Commander, a file or the plugin root answered `FS_EXEC_OK` without a message, an unknown repository `FS_EXEC_ERROR`, NULL arguments refused, all without a new password prompt and with the Lister suppressed by `RESTIC_WFX_NO_LISTER_GUI` (260 assertions in Debug/Release; skipped in ASan runs). |
+| `test_plugin_dll.c` | Loads the built DLL of its own architecture (`restic.wfx64` in a 64-bit build, `restic.wfx` in a 32-bit one) like Total Commander does: `IMAGE_FILE_HEADER.Machine` matching the process bitness, the WFX `64` suffix rule on the file name, the exact 23-function export surface (`FsGetFile`/`FsGetFileW` and the 10 `FsContent*` entry points included; write/delete/move functions forbidden), custom-column surface through `GetProcAddress` (field enumeration terminates, names unique, default view references `[=<fs>.` with one header per column, empty values for unknown paths, sort order, unloading), embedded `RT_GROUP_ICON` #1 + 5 `RT_ICON` frames (`16x16`..`256x256`), embedded `RT_VERSION` (`VS_VERSION_INFO` / `VS_FIXEDFILEINFO` matching `include/version.h`), root name, primary INI next to the DLL, fallback INI via `FsSetDefaultParams` (no file auto-created when missing), two concurrent find handles, ANSI stub behavior, and **end-to-end live navigation & extraction** across Level 0 -> Level 1 -> Level 2+, `FsGetFileW` single-file and recursive folder copy (`F5`), overwrite prompt protocol (`FS_FILE_EXISTS` -> `FS_COPYFLAGS_OVERWRITE`), `FS_COPYFLAGS_MOVE` rejection, binary fidelity and mtime, failed overwrite keeps the old file, local-side `FS_FILE_WRITEERROR`, invalid remote names, NULL arguments, `ESC` at start and mid-transfer, password flows inside `FsGetFileW` (cancel, 3 wrong, retry, cache reuse), password retry, per-repository sessions (8-slot eviction), empty/cancelled password, 3-strike failure, missing repository, 250-character alias error message, `ProgressProc` (`ESC`) cancellation and 6 concurrent worker threads, plus the statistics columns end to end on the live fixture (host name, `FILETIME`, short ID, file count vs. `has_summary`, inheritance for files inside a snapshot, empty columns for a repository that was never listed, independent entry per alias, cold start filled by one extra `restic snapshots` run when a snapshot folder is entered directly, one `MSGTYPE_TRANSFERCOMPLETE` with the documented `Download complete: <src> -> <dst>` text after a successful extraction, a snapshot of a UNC share navigated and extracted through the entry points, and the **statistics report** end to end: no artificial entry in any listing, `FsExecuteFileW` with `properties` (what `F3` and Alt+Enter end in) on a repository, a snapshot and a subfolder and with `quote stats` producing the Markdown, an Alt+Enter on a file or a folder posting no `cm_List` request to a stand-in main window, the command line verb tolerating case and spacing but refusing `quote statsx`/`quote ls`, `open` forwarded to Total Commander, a file or the plugin root answered `FS_EXEC_OK` without a message, an unknown repository `FS_EXEC_ERROR`, NULL arguments refused, all without a new password prompt and with the Lister suppressed by `RESTIC_WFX_NO_LISTER_GUI`, and the staged `pluginst.inf` registering the base name `restic.wfx` (265 assertions in Debug/Release; skipped in ASan runs). |
 
 The live test needs only `tmp\restic.exe` (git-ignored; reported as `[SKIP]` when absent). On every run it rebuilds `tmp\test_fixture\{data,repo}` from scratch (300-file directory, Unicode and shell-metacharacter names, empty directory, 100 KB file, fixed mtime), initializes a repository whose password contains quotes, `%PATH%` and CJK text, takes two snapshots and verifies per-snapshot listings, timestamps and the error mapping (wrong password, missing repository, unknown snapshot, missing path, file used as directory, quote-injection attempt). The fixture stays on disk for inspection.
 
 Test-quality note: the security-relevant tests were mutation-checked (reverting to `SearchPathW`, or removing the quote escaping, makes them fail).
+
+Tests must prove something about the product, not about themselves: an assertion that compares a constant
+defined in the test with another constant of the same test (the former "the file name follows the 64 suffix
+rule" check) was removed, and the real check was put in its place (the `VERSIONINFO` `OriginalFilename` and
+`InternalName` of the built DLL must equal the file name of the architecture). Likewise, a test must never
+depend on a file that an old build layout left behind: `test_config.c` used to read `build\restic_plugin.ini`
+and passed on a stale copy; it now reads the staged template of its own architecture (`build\<arch>\`) and fails
+when that file is missing.
+
+### 8.9 Test Duration
+
+Measured on the development machine (Debug, one architecture, `restic.exe` 0.19.1):
+
+| Program | Time | What takes the time |
+| --- | --- | --- |
+| `test_config`, `test_stats` | < 1 s | unit tests only |
+| `test_report` | ~11 s | `test_live_report_generation` ~10 s (real `restic` runs) |
+| `test_restic_cli` | ~32 s | `test_live_restic_cli` ~18 s, `test_live_unc_share` ~7 s, `test_dump_with_fake_restic` ~4 s |
+| `test_plugin_dll` | ~41 s | `test_live_end_to_end_navigation` ~40 s (about 55 `restic` runs) |
+
+Every `restic` invocation costs ~0.7 s because the repository key is derived with scrypt (`N=32768, r=8, p=9`
+as calibrated by `restic init`; restic offers no option to lower it), and a wrong-password scenario pays it
+too. The live tests are therefore bounded by the number of `restic` runs, not by the code under test; they were
+kept (each covers a different layer) and only the redundant repetitions around them were removed:
+
+- `./build.sh test` ~85 s per architecture; `analyze` ~110 s (it already runs the whole Debug suite with
+  `/analyze`); `asan` ~50 s; `package` ~90 s. The release skill runs `analyze` -> `asan` -> `package`
+  (no separate `test`: `analyze` is a superset) for both architectures: ~8 min instead of ~11 min.
+- **Mutation harness (`./build.sh mutate`, section 8.10): ~30 min -> ~15 min.** It used to run every test
+  program to the end after each mutation and, for the DLL mutations, to rebuild and run `test_restic_cli` first just to
+  recreate the fixture. It now stops the run at the first `[FAIL]` (`tests/mutation/run_until_fail.py`: a detected
+  mutation needs no further assertions) and creates the fixture once at the start.
+- Not done on purpose: running x64 and x86 in parallel (both use `tmp\test_fixture`, `tmp\report_fixture` and
+  `tmp\unc_repo`, so they would corrupt each other) and crafting a repository with a cheap KDF (it would test a key
+  format that restic never writes).
+
+### 8.10 Mutation Tests (`tests/mutation/`)
+
+A passing test proves nothing if it would also pass with a broken implementation. A **mutation test** plants
+one deliberate defect in the source, rebuilds, runs the test program that is supposed to guard that code and
+requires it to **fail**; a defect nobody notices (`[MISSED]`) means a missing or too weak assertion.
+
+```bash
+./build.sh mutate            # every mutation, ~15 minutes (x64 Debug; the logic is architecture independent)
+./build.sh mutate M5 M53     # only the listed ids
+python tests/mutation/check_mutations.py   # static check, no build (also run first by `mutate`)
+```
+
+| File | Role |
+| --- | --- |
+| `mutations.txt` | Table `id|kind|script|description`. `kind` names the binary that is rebuilt and run: `cli`, `config`, `stats`, `report` (the test program) or `dll` (the plugin DLL **and** `test_plugin_dll.exe`) |
+| `mut_mNN.py` | One mutation: `mut.run(<source>, <original text>, <broken text>, sys.argv[1])`, with `apply` / `revert` as argument |
+| `mut.py` | Applies or reverts a replacement; requires exactly one match, copes with CRLF sources, keeps `<file>.mutbak` while applied (git-ignored) |
+| `run.sh` | The harness: clean Debug build, fixture, then apply -> `nmake` of the affected binary -> run -> **always revert** |
+| `run_until_fail.py` | Runs a test program and kills the whole process tree (the `restic.exe` children included) at the first `[FAIL]`. Exit code `0` passed (mutation **missed**), `1` failed or crashed (**detected**), `2` the runner could not run the program, `3` the program passed but printed `[SKIP]` (inconclusive) |
+| `check_mutations.py` | Every pattern matches exactly once, replacement differs, table and scripts agree |
+
+Rules for a new mutation (add one whenever a security- or behaviour-critical test is written):
+
+1. Pick one line whose change must break the behaviour the new test asserts; write `mut_mNN.py` with a
+   **single-line** pattern (sources are CRLF; `mut.py` converts) that occurs once.
+2. Add `Mnn|kind|mut_mNN.py|short description` to `mutations.txt` (ids are unique and never reused).
+3. `python tests/mutation/check_mutations.py`, then `./build.sh mutate Mnn` must print `[OK]`.
+4. Mutations that survive because the change is behaviourally equivalent are not "fixed" in the test: change the
+   mutation instead.
+
+Pitfalls the harness guards against (all of them happened while it was written):
+
+- A **crash of the harness is not a detection.** For a while the six `dll` mutations were "detected" only
+  because `test_plugin_dll.exe` did not exist after the initial clean build and the runner died with a
+  traceback (non-zero exit code). Exit code `2` is reported as `[RUN-FAIL]`; the `dll` kind names both the DLL
+  and the smoke test as `nmake` targets.
+- A **skipped test is not a verdict.** `test_restic_cli` rebuilds `tmp\test_fixture` from scratch and is killed at
+  the first failure, so a mutation detected in the middle of its live part left a half-built fixture; the next DLL
+  mutation then ran with its end-to-end test skipped, passed, and was reported as "missed". The harness now keeps a
+  pristine copy of the fixture (restored before every `dll` mutation) and treats `[SKIP]` as `[SKIPPED]` (exit `3`).
+- A **killed test must not leave children behind**: an orphan `restic.exe` writing into the fixture would corrupt the
+  next mutation, hence `taskkill /T`.
+- The mutated source is restored after every mutation even when the build fails. If the harness is killed in the
+  middle, `git checkout -- <file>` restores the source.

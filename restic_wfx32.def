@@ -1,0 +1,39 @@
+; ============================================================================
+; 32-bit export table for the Restic WFX plugin (restic.wfx)
+;
+; A 32-bit Total Commander needs the __stdcall functions under their plain
+; names, but MSVC stores them decorated in the 32-bit object files
+; (_FsInit@16, _FsFindFirst@8, ...). The `name=internal` form of the DEF file
+; exports the undecorated public name and keeps the plugin loadable.
+;
+; The number after @ is the size of the arguments on the stack in bytes
+; (4 bytes per int / pointer, see include\fsplugin.h). The 64-bit build uses
+; restic_wfx.def: x64 has a single calling convention and no decoration.
+;
+; Any change to a prototype in include\fsplugin.h must be mirrored here.
+; tests\test_plugin_dll.c fails if a name is missing from the export table.
+; ============================================================================
+EXPORTS
+    FsInit=_FsInit@16
+    FsInitW=_FsInitW@16
+    FsGetDefRootName=_FsGetDefRootName@8
+    FsSetDefaultParams=_FsSetDefaultParams@4
+    FsFindFirst=_FsFindFirst@8
+    FsFindFirstW=_FsFindFirstW@8
+    FsFindNext=_FsFindNext@8
+    FsFindNextW=_FsFindNextW@8
+    FsFindClose=_FsFindClose@4
+    FsGetFile=_FsGetFile@16
+    FsGetFileW=_FsGetFileW@16
+    FsExecuteFile=_FsExecuteFile@12
+    FsExecuteFileW=_FsExecuteFileW@12
+    FsContentGetSupportedField=_FsContentGetSupportedField@16
+    FsContentGetValue=_FsContentGetValue@24
+    FsContentGetValueW=_FsContentGetValueW@24
+    FsContentGetSupportedFieldFlags=_FsContentGetSupportedFieldFlags@4
+    FsContentGetDefaultSortOrder=_FsContentGetDefaultSortOrder@4
+    FsContentGetDefaultView=_FsContentGetDefaultView@20
+    FsContentGetDefaultViewW=_FsContentGetDefaultViewW@20
+    FsContentStopGetValue=_FsContentStopGetValue@4
+    FsContentStopGetValueW=_FsContentStopGetValueW@4
+    FsContentPluginUnloading=_FsContentPluginUnloading@0

@@ -2,6 +2,20 @@
 
 All notable changes to the Restic WFX plugin.
 
+## [Unreleased]
+
+### Added
+
+- 32-bit plugin (`restic.wfx`) next to the 64-bit one, built from the same sources: a single installation
+  package now serves both the 32-bit and the 64-bit Total Commander.
+- Architecture selection in the build scripts, so one or both targets can be built and tested.
+
+### Changed
+
+- The installation package is no longer 64-bit only: it carries both DLLs and is named
+  `wfx_restic_<version>.zip`. The installer manifest registers the base plugin name, so Total Commander
+  loads the binary that matches its own architecture.
+
 ## [1.3.3] — 2026-11-07
 
 ### Changed
