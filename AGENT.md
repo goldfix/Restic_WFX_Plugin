@@ -553,8 +553,8 @@ from the same sources; only the export table, the `VERSIONINFO` file name and th
   inside (`restic.wfx*`, `pluginst.inf`, `restic_plugin.ini`, `test_*.exe`). Object files of the two
   architectures never mix, so switching architecture needs no `clean` and both builds can coexist.
 - **`ARCH` (`Makefile`):** `x64` (default) or `x86`, selected with `nmake ARCH=x86`. It picks the DLL name,
-  the `.def` file, `/MACHINE`, `/SAFESEH`, the `RC_ARCH_X86` define for the resource script and the
-  `/DARCH_X86` define for the sources; an invalid value is rejected with `!ERROR`.
+  the `.def` file, `/MACHINE`, `/SAFESEH` and the `RC_ARCH_X86` define for the resource script (the C
+  sources are identical for both architectures); an invalid value is rejected with `!ERROR`.
 - **`ARCH` (`build.sh`):** `x64` (default), `x86`, or `all` (every action twice, x64 first; `package`
   always defaults to `all`). The wrapper translates `INCLUDE`/`LIB`/`PATH` of the *active* environment to
   the requested toolset: it rewrites the architecture segment of every `LIB` entry, of the
